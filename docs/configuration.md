@@ -8,6 +8,7 @@ Everything the gate reads from disk lives in `<agentDir>/config/pi-verdict.json`
 {
   "allow": ["^ls\\b", "^git (status|log|diff)\\b"],
   "deny":  ["rm ", "docker ", "^/etc/"],
+  "tools": [],
   "denyPaths": [
     "~/.ssh/",
     "~/.profile",
@@ -25,7 +26,8 @@ Everything the gate reads from disk lives in `<agentDir>/config/pi-verdict.json`
 }
 ```
 
-- `allow`/`deny` are JS regex arrays; **`deny` wins over `allow`**, both beat the classifier. Match targets: bash/powershell = the full command string; file tools = the resolved absolute path (`grep`/`find`/`ls` with an omitted `path` resolve to the cwd — pi's documented default); other tools (e.g. MCP) are not covered by rules and land in the gray zone.
+- `allow`/`deny` are JS regex arrays; **`deny` wins over `allow`**, both beat the classifier. Match targets: bash/powershell = the full command string; file tools = the resolved absolute path (`grep`/`find`/`ls` with an omitted `path` resolve to the cwd — pi's documented default); other tools (e.g. MCP) have no command or path shape to match against `allow`/`deny`, so they land in the gray zone unless named exactly in `tools` (below).
+- `tools: ["ask", "propose_commit"]` is an exact tool-name allowlist for that gray-zone family (MCP/custom tools with no path or command shape, e.g. `ask`, `propose_commit`, `propose_changelog`, `todo`) — a case-sensitive exact match on the tool's registered name bypasses the classifier and returns allow directly. It does not extend to, or interact with, the self-protection layer, the built-in floor, or `denyPaths` (none of those cover this family either, so there is nothing to bypass there). Empty (default) leaves the family entirely classifier-routed, unchanged from before.
 - `denyPaths` are plain paths (not regexes) you declare **protected**: any tool call touching them — file tools via their path (scope tools via their whole search scope: omitted path/cwd, or a parent directory of a declaration), bash via path tokens extracted from the command string — triggers a **terminal ask** you adjudicate (non-interactive sessions degrade to deny). Not affected by `builtinDenyFloor: false`. The first-run template pre-fills a starter list (`~/.ssh/`, `~/.gnupg`, `~/.mc`, shell rc/profile files), active from the first session after the initial run — a pre-filled user declaration you can edit or empty; existing configs are never rewritten.
   The classifier only ever learns that protected paths *exist*; the paths themselves never leave your machine, and a matched path shows **only** in the local confirm dialog.
 - `builtinDenyFloor: false` turns the built-in danger/path floor off entirely (risk accepted by you; the classifier and your rules remain — the self-protection layer always stays on).

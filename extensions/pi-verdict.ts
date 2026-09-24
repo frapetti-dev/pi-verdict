@@ -201,9 +201,11 @@ const pathStartsWith = (child: string, base: string): boolean => fold(child).sta
 // 用户规则:白名单/黑名单(可配置;#12 审计响应)
 //
 // 配置:<agentDir>/config/pi-verdict.json(尊重 PI_CODING_AGENT_DIR 覆盖):
-//   { "allow": ["^ls\\b", "^git (status|log|diff)\\b"], "deny": ["rm ", "^/etc/"] }
+//   { "allow": ["^ls\\b", "^git (status|log|diff)\\b"], "deny": ["rm ", "^/etc/"], "tools": ["ask", "propose_commit"] }
 // 匹配目标:bash/powershell = 完整命令串;read/write/edit/grep/find/ls = 解析后绝对路径;
-// 其余工具(MCP/自定义)不参与用户规则,恒走分类器。
+// 其余工具(MCP/自定义,如 ask/propose_commit/propose_changelog/todo)默认恒走分类器——
+// tools 是这一族的精确 tool 名例外声明:命中即直接 allow,越过分类器(不途经
+// self-protection / built-in floor / denyPaths,这些本就不覆盖这一族)。
 // 优先级:内置 deny floor → 用户 deny → 用户 allow → gray;floor 默认开,可经 builtinDenyFloor:false 关闭。
 // 非法正则跳过并通知(配置错误不导致扩展失效);新会话生效。
 // ============================================================================
@@ -255,6 +257,8 @@ interface UserRules {
 	deny: RegExp[];
 	/** User-declared protected paths (ADR-0002): plain paths, tool-owned normalization; hit → ask */
 	denyPaths: string[];
+	/** [tools allowlist] exact tool-name allowlist for the MCP/custom family (toolKind() === null, e.g. "ask", "propose_commit", "propose_changelog") — a case-sensitive exact match on the tool's registered name bypasses the classifier and returns allow directly. Does not touch self-protection, the built-in floor, or denyPaths (none of those cover this family either). Empty = unchanged default (always classifier). Config key: "tools". */
+	tools: string[];
 	/** 内置 deny floor 开关(危险正则 + 路径敏感度 deny),默认 true;关闭后依赖用户规则与分类器 */
 	builtinDenyFloor: boolean;
 	/** [pi-verdict local patch: autoDeny] false → auto-review denies become interactive asks (headless still denies); never affects the self-protection layer. Default true. */
@@ -281,7 +285,7 @@ interface UserRules {
 	classifierFallbackMode: "shadow" | "enforce";
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], builtinDenyFloor: true, classifierModel: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", autoDeny: true, classifierRules: [] };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, classifierModel: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", autoDeny: true, classifierRules: [] };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -390,6 +394,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk (the self-protection layer always stays on). classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). This file is part of the permission gate: agent-side modification is denied — edit it manually outside pi. Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; the self-protection layer and non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
 	allow: ["^ls\\b"],
 	deny: [],
+	tools: [],
 	denyPaths: [
 		"~/.ssh/",
 		"~/.profile",
@@ -428,7 +433,7 @@ function loadUserRules(cwd: string | null = null): LoadedRules {
 			} catch { /* 只读环境静默跳过 */ }
 			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null, protectPaths: [] };
 		}
-		let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown; trustedProjects?: unknown };
+	let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown; trustedProjects?: unknown };
 		try {
 			raw = JSON.parse(fs.readFileSync(p, "utf8")) as typeof raw;
 		} catch (err) {
@@ -501,6 +506,14 @@ function loadUserRules(cwd: string | null = null): LoadedRules {
 			}
 			return [x.trim()];
 		});
+		if (raw.tools !== undefined && raw.tools !== null && !Array.isArray(raw.tools)) skipped.push(`tools: ${JSON.stringify(raw.tools)} (must be an array of strings)`);
+		const tools = (Array.isArray(raw.tools) ? raw.tools : []).flatMap((x) => {
+			if (typeof x !== "string" || !x.trim()) {
+				if (x !== undefined && x !== null) skipped.push(`tools: ${JSON.stringify(x)}`);
+				return [];
+			}
+			return [x.trim()];
+		});
 		const shortcut = resolveToggleShortcut(raw.toggleShortcut);
 		// #63/#67: confidence-floor keys — invalid values skip into the one-shot warning channel
 		if (raw.classifierFallbackConfidence !== undefined) skipped.push("classifierFallbackConfidence: renamed to classifierMinConfidence (0.11.0) — key ignored");
@@ -514,6 +527,7 @@ function loadUserRules(cwd: string | null = null): LoadedRules {
 				allow: compile(raw.allow),
 				deny: compile(raw.deny),
 				denyPaths,
+				tools,
 				builtinDenyFloor: raw.builtinDenyFloor !== false,
 				classifierModel: typeof raw.classifierModel === "string" && raw.classifierModel.trim() ? raw.classifierModel.trim() : null,
 				toggleShortcut: shortcut.key,
@@ -594,7 +608,7 @@ function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: b
 /** Tool family shared by the three toolName dispatches below (user-rule target,
  *  built-in grading, denyPaths extraction): "command" tools carry a command string,
  *  "file" tools carry a path argument; null = outside both families (MCP/custom →
- *  classifier only). Adding a file tool means extending this one map. The
+ *  classifier only, unless exact-matched by user.tools — see classifyByRules). Adding a file tool means extending this one map. The
  *  self-protection layer is deliberately NOT a consumer: it matches write paths +
  *  bash only (reads pass — its set is not the file family). */
 function toolKind(toolName: string): "command" | "file" | null {
@@ -896,7 +910,8 @@ function selfProtectCheck(toolName: string, input: Record<string, unknown>, cwd:
  *   2. user deny → deny (beats allow)
  *   3. denyPaths hit → terminal ask (ADR-0002: the declaring user adjudicates; before user allow)
  *   4. user allow → allow
- *   5. base (path tools' default allow/gray; everything else gray) → classifier
+ *   5. custom-tool exact match (user.tools) → allow (bypasses classifier for that tool)
+ *   6. base (path tools' default allow/gray; everything else gray) → classifier
  */
 function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: string, user: UserRules, prot: ProtectedSet, denyPathBases: string[]): RuleResult {
 	// 第 0 层:自保护层(ADR-0001)——先于一切,不可经任何配置豁免
@@ -918,6 +933,8 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 		// effective target, so user rules and denyPaths compare against it (#48)
 		const p = typeof input.path === "string" ? input.path : undefined;
 		base = p ? classifyPath(toolName, p, cwd, false, user.builtinDenyFloor) : { verdict: "allow" };
+	} else if (user.tools.includes(toolName)) {
+		base = { verdict: "allow", reason: "user tools allow rule" };
 	} else {
 		base = { verdict: "gray", reason: `tool not covered by built-in rules: ${toolName}` };
 	}
