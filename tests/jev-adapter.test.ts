@@ -392,17 +392,15 @@ describe("typesafe transport (direct v1 API)", () => {
 	});
 });
 
-describe("self-protection coverage (#26 whole-package watch)", () => {
-	test("a colocated jev-adapter.ts joins the tamper baseline of an npm-dir install", () => {
+describe("self-protection coverage (#26 whole-package protection)", () => {
+	test("a colocated jev-adapter.ts joins the write-protected prefix of an npm-dir install", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-verdict-pkg-"));
 		const pkg = path.join(root, "agent", "extensions", "pi-verdict");
 		fs.mkdirSync(path.join(pkg, "extensions"), { recursive: true });
 		fs.writeFileSync(path.join(pkg, "extensions", "pi-verdict.ts"), "gate");
 		fs.writeFileSync(path.join(pkg, "extensions", "jev-adapter.ts"), "adapter");
 		const prot = buildProtectedSet(path.join(root, "agent"), path.join(pkg, "extensions", "pi-verdict.ts"));
-		const watched = prot.watchBases.map((w: { file: string }) => w.file);
-		expect(watched).toContain(path.join(pkg, "extensions", "jev-adapter.ts"));
-		expect(watched).toContain(path.join(pkg, "extensions", "pi-verdict.ts"));
+		expect(prot.prefixes).toContain(fs.realpathSync(pkg));
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 });

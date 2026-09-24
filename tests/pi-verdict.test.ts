@@ -885,34 +885,6 @@ describe("self-protection layer (ADR-0001)", () => {
 });
 
 describe("buildProtectedSet (pure)", () => {
-	// #26: npm dir install form — tamper watch must not lag behind write protection
-	test("npm dir install form: tamper watch covers the whole package dir, excluding node_modules/.git", async () => {
-		await withTempDir(".pv-t26-", async (agent) => {
-				const pkgDir = path.join(agent, "extensions", "pi-verdict");
-				fs.mkdirSync(path.join(pkgDir, "sub"), { recursive: true });
-				fs.mkdirSync(path.join(pkgDir, "node_modules", "dep"), { recursive: true });
-				fs.mkdirSync(path.join(pkgDir, ".git"), { recursive: true });
-				fs.writeFileSync(path.join(pkgDir, "package.json"), "{}");
-				fs.writeFileSync(path.join(pkgDir, "index.ts"), "x");
-				fs.writeFileSync(path.join(pkgDir, "sub", "lib.ts"), "x");
-				fs.writeFileSync(path.join(pkgDir, "node_modules", "dep", "y.js"), "x");
-				fs.writeFileSync(path.join(pkgDir, ".git", "config"), "[core]");
-				// a package file replaced by a symlink to outside content stays watched
-				// (stat follows; the lexical entry is the watched path)
-				fs.writeFileSync(path.join(agent, "outside-payload.ts"), "evil");
-				fs.symlinkSync(path.join(agent, "outside-payload.ts"), path.join(pkgDir, "linked.ts"));
-				const prot = buildProtectedSet(agent, path.join(pkgDir, "index.ts"));
-				const watched = prot.watchBases.filter((w) => w.kind === "extension").map((w) => w.file);
-				expect(watched).toContain(path.join(pkgDir, "package.json"));
-				expect(watched).toContain(path.join(pkgDir, "index.ts"));
-				expect(watched).toContain(path.join(pkgDir, "sub", "lib.ts"));
-				expect(watched).toContain(path.join(pkgDir, "linked.ts"));
-				expect(watched.some((f) => f.includes("node_modules"))).toBe(false);
-				expect(watched.some((f) => f.includes(".git"))).toBe(false);
-				expect(new Set(watched).size).toBe(watched.length); // no duplicate watch entries
-		}, os.homedir());
-	});
-
 	test("single-file install form: exact own file + bash variants", () => {
 		const own = path.join(TMP_AGENT, "extensions", "pi-verdict.ts");
 		fs.mkdirSync(path.dirname(own), { recursive: true });
@@ -922,8 +894,6 @@ describe("buildProtectedSet (pure)", () => {
 		expect(s.exact).toContain(ownReal);
 		expect(s.bashPatterns.some((re) => re.test(`echo x > ${ownReal}`))).toBe(true);
 		expect(s.bashPatterns.some((re) => re.test("cat $PI_CODING_AGENT_DIR/extensions/pi-verdict.ts"))).toBe(true);
-		expect(s.watchBases).toContainEqual({ file: own, kind: "extension" });
-		expect(s.watchBases).toContainEqual({ file: path.join(TMP_AGENT, "config", "pi-verdict.json"), kind: "config" });
 	});
 	test("npm dir install form: whole package dir as prefix", () => {
 		const own = path.join(TMP_AGENT, "extensions", "pi-verdict", "extensions", "pi-verdict.ts");
@@ -949,7 +919,6 @@ describe("buildProtectedSet (pure)", () => {
 				expect(s.prefixes).toContain(fs.realpathSync(pkg));
 				expect(isProtectedWritePath(path.join(pkg, "package.json"), "/proj", s)).toBe(true);
 				expect(isProtectedWritePath(path.join(pkg, "extensions", "pi-verdict.ts"), "/proj", s)).toBe(true);
-				expect(s.watchBases).toContainEqual({ file: path.join(pkg, "package.json"), kind: "extension" });
 				// neighbor packages under the same node_modules stay unprotected
 				expect(isProtectedWritePath(path.join(root, "plugins", "node_modules", "other-pkg", "x.ts"), "/proj", s)).toBe(false);
 		}, os.homedir());
@@ -970,7 +939,6 @@ describe("buildProtectedSet (pure)", () => {
 				expect(s.prefixes).toContain(fs.realpathSync(pkg));
 				expect(isProtectedWritePath(path.join(pkg, "package.json"), "/proj", s)).toBe(true);
 				expect(isProtectedWritePath(path.join(scope, "other-pkg", "x.ts"), "/proj", s)).toBe(false);
-				expect(s.watchBases.some((w) => w.file.includes("other-pkg"))).toBe(false);
 		}, os.homedir());
 	});
 	test("dev checkout (outside agentDir/extensions) → 不保护扩展文件,仅配置", () => {
@@ -978,89 +946,6 @@ describe("buildProtectedSet (pure)", () => {
 		expect(s.exact).not.toContain("/repo/extensions/pi-verdict.ts");
 		expect(s.prefixes.every((p) => !p.startsWith("/repo/"))).toBe(true); // 扩展无前缀;#54 后 verdicts 前缀恒在
 		expect(isProtectedWritePath(path.join(TMP_AGENT, "config", "pi-verdict.json"), "/proj", s)).toBe(true);
-	});
-});
-
-// ── 9. 变更检测(ADR-0001:差分处置 D) ──────────────────
-
-describe("tamper detection (ADR-0001, differential disposal)", () => {
-	const CFG = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
-
-	test("interactive + Accept:用户会话中合法编辑 → 一次双选重建基线,会话照常,编辑保留", async () => {
-		const h = session({});
-		h.selectIndex = 0; // Accept the new version
-		setConfig({ allow: ["^ls\\b"] }); // 模拟用户手工编辑(不经门禁)
-		h.responses = [{ text: "<verdict>allow</verdict> ok" }, { text: "<verdict>allow</verdict> ok" }];
-		const r1 = await toolCall(h, "bash", { command: "cargo build" });
-		expect(h.selects).toBe(1); // 双选:仅一次
-		expect(h.confirms).toBe(0); // 不走 confirm
-		expect(r1).toBeUndefined(); // Accept → 本调用照常走正常管线
-		expect(fs.readFileSync(CFG(), "utf8")).toContain("^ls"); // 编辑未被回滚
-		const r2 = await toolCall(h, "bash", { command: "cargo build" });
-		expect(h.selects).toBe(1); // 基线已重建:不再双选
-		expect(r2).toBeUndefined(); // 会话未被砖
-	});
-	test("interactive + Decline:疑似篡改 → 还原 + 本会话 fail-closed", async () => {
-		const h = session({});
-		h.selectIndex = 1; // Decline — restore the session baseline
-		const before = fs.readFileSync(CFG(), "utf8");
-		fs.writeFileSync(CFG(), JSON.stringify({ allow: [".*"], builtinDenyFloor: false })); // 模拟绕过门禁的篡改
-		const r1 = await toolCall(h, "bash", { command: "ls" });
-		expect(r1?.block).toBe(true);
-		expect(r1.reason).toContain("declined by user");
-		expect(fs.readFileSync(CFG(), "utf8")).toBe(before); // 已从快照还原
-		const r2 = await toolCall(h, "bash", { command: "ls" });
-		expect(r2?.block).toBe(true);
-		expect(r2.reason).toContain("fail-closed");
-	});
-	test("headless config change:无人可问 → 不确认,直接还原 + fail-closed", async () => {
-		const h = session({});
-		h.ctx.hasUI = false;
-		const before = fs.readFileSync(CFG(), "utf8");
-		fs.writeFileSync(CFG(), "{}");
-		const r = await toolCall(h, "bash", { command: "ls" });
-		expect(h.selects).toBe(0); // 无 UI 不弹双选
-		expect(r?.block).toBe(true);
-		expect(r.reason).toContain("tamper");
-		expect(fs.readFileSync(CFG(), "utf8")).toBe(before);
-	});
-	test("clean session: no tamper signal, verdicts flow normally", async () => {
-		const h = session({});
-		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
-		const r = await toolCall(h, "bash", { command: "cargo build" });
-		expect(r).toBeUndefined();
-		expect(h.notifies.some(([m]) => m.includes("TAMPER"))).toBe(false);
-	});
-	test("session_start rebuilds baseline (legit edit between sessions accepted)", async () => {
-		const h = session({});
-		setConfig({ allow: ["^ls\\b"] }); // 会话间隙合法修改(不经门禁)
-		await h.handlers.session_start({}, h.ctx); // 新基线
-		h.responses = [{ text: "<verdict>deny</verdict> x" }];
-		const r = await toolCall(h, "bash", { command: "cargo build" });
-		expect(r?.block).toBe(true); // 正常走分类器,非 fail-closed
-		expect(r.reason).not.toContain("tamper");
-		expect(h.selects).toBe(0); // 无变化不弹双选
-	});
-	test("interactive + Esc 关闭双选:无人背书 → 安全侧同 Decline(还原 + fail-closed)", async () => {
-		const h = session({});
-		h.selectIndex = null; // select 返回 undefined(对话框被关闭)
-		const before = fs.readFileSync(CFG(), "utf8");
-		fs.writeFileSync(CFG(), "{}");
-		const r = await toolCall(h, "bash", { command: "ls" });
-		expect(h.selects).toBe(1);
-		expect(r?.block).toBe(true);
-		expect(r.reason).toContain("dialog dismissed");
-		expect(fs.readFileSync(CFG(), "utf8")).toBe(before); // 已还原
-	});
-	test("headless config deleted mid-session → recreated from snapshot + fail-closed", async () => {
-		const h = session({});
-		h.ctx.hasUI = false;
-		const before = fs.readFileSync(CFG(), "utf8");
-		fs.rmSync(CFG());
-		const r = await toolCall(h, "bash", { command: "ls" });
-		expect(r?.block).toBe(true);
-		expect(fs.existsSync(CFG())).toBe(true); // 删除亦被还原(重建)
-		expect(fs.readFileSync(CFG(), "utf8")).toBe(before);
 	});
 });
 
@@ -1495,20 +1380,6 @@ describe("agent-facing block reason form (#53)", () => {
 		expect(r.reason.startsWith(`[auto-mode protected-path block] ${HEAD}`)).toBe(true);
 		expect(r.reason.endsWith(TAIL)).toBe(true);
 		expect(r.reason).toContain("non-interactive");
-	});
-
-	test("tamper detection and subsequent fail-closed → tamper tag on both paths", async () => {
-		const h = session({});
-		h.selectIndex = 1; // Decline — restore the session baseline
-		const before = fs.readFileSync(CFG(), "utf8");
-		fs.writeFileSync(CFG(), "{}");
-		const r1 = await toolCall(h, "bash", { command: "ls" });
-		expect(r1.reason.startsWith(`[auto-mode tamper block] ${HEAD}`)).toBe(true);
-		expect(r1.reason).toContain("config change declined by user");
-		expect(fs.readFileSync(CFG(), "utf8")).toBe(before);
-		const r2 = await toolCall(h, "bash", { command: "ls" });
-		expect(r2.reason.startsWith(`[auto-mode tamper block] ${HEAD}`)).toBe(true);
-		expect(r2.reason).toContain("self-protection");
 	});
 });
 
@@ -2356,7 +2227,7 @@ describe("omp host forms: S0 floor + self-protection (#35)", () => {
 		expect(r?.block).toBe(true);
 	});
 
-	test("buildProtectedSet omp npm form: whole package dir as write-protected prefix + tamper watch", async () => {
+	test("buildProtectedSet omp npm form: whole package dir as write-protected prefix", async () => {
 		await withTempDir("pv-omp-", async (agent) => {
 				const pkgDir = path.join(agent, "plugins", "node_modules", "pi-verdict");
 				fs.mkdirSync(path.join(pkgDir, "extensions"), { recursive: true });
@@ -2368,11 +2239,7 @@ describe("omp host forms: S0 floor + self-protection (#35)", () => {
 				expect(s.prefixes).toContain(pkgReal);
 				expect(isProtectedWritePath(path.join(pkgDir, "package.json"), "/proj", s)).toBe(true);
 				expect(isProtectedWritePath(path.join(pkgDir, "extensions", "pi-verdict.ts"), "/proj", s)).toBe(true);
-				expect(isProtectedWritePath(path.join(agent, "plugins", "node_modules", "other-pkg", "x.ts"), "/proj", s)).toBe(false); // outside the package
-				const watched = s.watchBases.filter((w) => w.kind === "extension").map((w) => w.file);
-				expect(watched).toContain(path.join(pkgDir, "package.json"));
-				expect(watched).toContain(own);
-		});
+			}, os.homedir());
 	});
 
 	test("omp single-file form under plugins/node_modules is NOT misclassified as single-file exact (dir form wins)", async () => {

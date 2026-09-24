@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ### Fixed
 
 - oh-my-pi 18.3.0 compatibility: agentDir self-anchoring normalizes Windows backslash paths before matching (the gate no longer falls back to `~/.pi/agent` on Windows); the compat completion bridge forwards credentials from `modelRegistry.getApiKeyAndHeaders` (fixes `MissingApiKeyError` on OAuth-backed sessions); the jev adapter registers through omp's `registerProvider(name, config, sourceId)` signature (arity-detected) without `createProvider`, and jev classifier calls on omp go directly through `streamDecisions`.
+- `@earendil-works/pi-ai` `0.84.3` type shape drift (CI typecheck): `createJevProvider` builds `getModels()`/top-level `stream`/`streamSimple` per the current `Provider` interface (no more `models`/`api` wrapper fields); `completeForClassifier`'s direct `streamDecisions()` path narrows the `AssistantMessage` result to the `CompletionFn` text-content contract. Removed stale `watchBases`/tamper-detection test coverage left over from the runtime change-detection backstop removal above (tests never updated when the feature was dropped).
 
 ## [0.11.0] - 2026-09-21
 
