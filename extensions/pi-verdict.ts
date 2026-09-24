@@ -90,6 +90,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Context } from "@earendil-works/pi-ai";
 import { activeTransport, parseJevConfidence, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER } from "./jev-adapter";
 
 // ============================================================================
@@ -1204,7 +1205,12 @@ function completeForClassifier(registry: ClassifierRegistry, deps: AutoModeDeps)
 			apiKey = await registry.getApiKeyForProvider(jevConfig.loginProvider).catch(() => undefined);
 		}
 		apiKey ||= process.env[jevConfig.keyEnv]?.trim();
-		return streamDecisions(transport, m, c, { ...o, apiKey }).result();
+		const result = await streamDecisions(transport, m, c as Context, { ...o, apiKey }).result();
+		return {
+			content: result.content.filter((part): part is { type: "text"; text: string } => part.type === "text"),
+			stopReason: result.stopReason,
+			errorMessage: result.errorMessage,
+		};
 	};
 }
 

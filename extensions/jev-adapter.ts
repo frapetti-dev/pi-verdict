@@ -299,12 +299,7 @@ export function createJevProvider(openRouterKey: OpenRouterKeyResolver | undefin
 	// routing in agreement (no half-switched state).
 	const transport = activeTransport();
 	const config = TRANSPORT_DEFAULTS[transport];
-	// omp compat shim (omp-legacy-pi-bundled:@oh-my-pi/pi-ai) does not export
-	// createProvider() (added in a later @earendil-works/pi-ai release for
-	// dynamic publication/refresh wiring). This provider is fully static
-	// (fixed models[], no refreshModels/publish), so the object literal below
-	// already satisfies the Provider shape createProvider() would normalize —
-	// no wrapper needed. [pi-verdict local patch: omp 18.3.0 / pi-ai 18.2.11 compat]
+	const models = [jevModel(transport)];
 	return {
 		id: PROVIDER_ID,
 		name: config.providerName,
@@ -330,11 +325,9 @@ export function createJevProvider(openRouterKey: OpenRouterKeyResolver | undefin
 				},
 			},
 		},
-		models: [jevModel(transport)],
-		api: {
-			stream: (m, c, o) => streamDecisions(transport, m, c, o, fetcher),
-			streamSimple: (m, c, o) => streamDecisions(transport, m, c, o, fetcher),
-		},
+		getModels: () => models,
+		stream: (m, c, o) => streamDecisions(transport, m, c, o, fetcher),
+		streamSimple: (m, c, o) => streamDecisions(transport, m, c, o, fetcher),
 	};
 }
 
