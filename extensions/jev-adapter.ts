@@ -34,7 +34,6 @@
  */
 import {
 	createAssistantMessageEventStream,
-	createProvider,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type Context,
@@ -210,7 +209,7 @@ function mapUsage(u: unknown): AssistantMessage["usage"] {
 	};
 }
 
-function streamDecisions(transport: Transport, model: Model<string>, context: Context, options: StreamOptions | SimpleStreamOptions | undefined, fetcher: typeof fetch): AssistantMessageEventStream {
+export function streamDecisions(transport: Transport, model: Model<string>, context: Context, options: StreamOptions | SimpleStreamOptions | undefined, fetcher: typeof fetch = fetch): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	void (async () => {
 		const output: AssistantMessage = {
@@ -288,7 +287,13 @@ export function createJevProvider(openRouterKey: OpenRouterKeyResolver | undefin
 	// routing in agreement (no half-switched state).
 	const transport = activeTransport();
 	const config = TRANSPORT_DEFAULTS[transport];
-	return createProvider({
+	// omp compat shim (omp-legacy-pi-bundled:@oh-my-pi/pi-ai) does not export
+	// createProvider() (added in a later @earendil-works/pi-ai release for
+	// dynamic publication/refresh wiring). This provider is fully static
+	// (fixed models[], no refreshModels/publish), so the object literal below
+	// already satisfies the Provider shape createProvider() would normalize —
+	// no wrapper needed. [pi-verdict local patch: omp 18.3.0 / pi-ai 18.2.11 compat]
+	return {
 		id: PROVIDER_ID,
 		name: config.providerName,
 		baseUrl: decisionsUrl(transport),
@@ -318,23 +323,74 @@ export function createJevProvider(openRouterKey: OpenRouterKeyResolver | undefin
 			stream: (m, c, o) => streamDecisions(transport, m, c, o, fetcher),
 			streamSimple: (m, c, o) => streamDecisions(transport, m, c, o, fetcher),
 		},
-	});
+	};
 }
 
+/** omp's registerProvider(name, config: ProviderConfigInput, sourceId?) shape —
+ *  a different, richer API than real pi's single-argument Provider object.
+ *  `streamSimple`/`api` are deliberately omitted: omp throws if `streamSimple`
+ *  is set without a matching `api` string, and omp never actually dispatches
+ *  through this registration anyway (see the comment below) — `models` +
+ *  `apiKey` are all `ctx.modelRegistry.find()`/`hasConfiguredAuth()` need. */
+type OmpProviderConfig = { baseUrl: string; apiKey?: string; models: Model<typeof API_ID>[] };
+type OmpRegisterProvider = (name: string, config: OmpProviderConfig, sourceId?: string) => void;
+
 export default function jevAdapter(pi: ExtensionAPI): void {
-	if (typeof pi.registerProvider !== "function") return; // omp/legacy hosts: inert
+	if (typeof pi.registerProvider !== "function") return; // no provider API at all: inert
 
-	let openRouterKey: OpenRouterKeyResolver | undefined;
-	const provider = createJevProvider(async () => await openRouterKey?.());
-	pi.registerProvider(provider);
+	const transport = activeTransport();
+	const config = TRANSPORT_DEFAULTS[transport];
 
-	pi.on("session_start", (_event, ctx) => {
-		openRouterKey = async () => (await ctx.modelRegistry.getProviderAuth("openrouter"))?.auth?.apiKey;
-		// hasConfiguredAuth reads a sync snapshot built at startup, when the
-		// stashed resolver did not exist yet — re-register to re-run the
-		// availability check with credentials now reachable (ADR-0003).
+	// Arity tells the two same-named APIs apart: real pi's registerProvider is
+	// length 1 (a Provider object); omp's is length 2+ (name, config, sourceId?).
+	// [pi-verdict local patch: omp 18.3.0 registerProvider signature mismatch]
+	if (pi.registerProvider.length < 2) {
+		// Real pi: full Provider registration — the host's own dispatch calls
+		// provider.api.streamSimple directly and resolves auth via
+		// provider.auth.apiKey.resolve on each request.
+		let openRouterKey: OpenRouterKeyResolver | undefined;
+		const provider = createJevProvider(async () => await openRouterKey?.());
 		pi.registerProvider(provider);
-	});
+
+		pi.on("session_start", (_event, ctx) => {
+			openRouterKey = async () => (await ctx.modelRegistry.getProviderAuth("openrouter"))?.auth?.apiKey;
+			// hasConfiguredAuth reads a sync snapshot built at startup, when the
+			// stashed resolver did not exist yet — re-register to re-run the
+			// availability check with credentials now reachable (ADR-0003).
+			pi.registerProvider(provider);
+		});
+	} else {
+		// omp: [pi-verdict local patch: omp 18.3.0 jev/TypeSafe support] registers
+		// "typesafe/jev-latest" only so `classifierModel` selection resolves via
+		// ctx.modelRegistry.find()/hasConfiguredAuth() — the actual completion
+		// call never goes through omp's own dispatch. omp's compat completion
+		// bridge (bindCompletion in pi-verdict.ts) has no visibility into
+		// extension-registered providers (it talks to the bundled pi-ai
+		// package's own, unrelated provider registry), so pi-verdict.ts's
+		// completeForClassifier() calls streamDecisions() directly for jev,
+		// resolving auth fresh via ctx.modelRegistry.getApiKeyForProvider on
+		// every call instead. The registration below only feeds the sync
+		// availability check, so a stale snapshot never causes a wrong denial —
+		// worst case it under- or over-reports availability until session_start
+		// refreshes it, same as the real-pi branch above. omp's registerProvider
+		// itself requires a truthy `apiKey`/`oauth` whenever `models` is given,
+		// so registration is skipped entirely (not attempted with an empty key)
+		// when no credential is resolvable yet — the model simply stays
+		// unfound, and `resolveClassifier`'s existing "unavailable (not found or
+		// no configured auth)" fallback covers it correctly.
+		const register = pi.registerProvider as unknown as OmpRegisterProvider;
+		const baseUrl = decisionsUrl(transport);
+		const envKey = process.env[config.keyEnv]?.trim();
+		if (envKey) register(PROVIDER_ID, { baseUrl, apiKey: envKey, models: [jevModel(transport)] }, "pi-verdict:jev-adapter");
+
+		pi.on("session_start", async (_event, ctx) => {
+			let key = envKey;
+			if (!key && config.loginProvider) {
+				key = await ctx.modelRegistry.getApiKeyForProvider(config.loginProvider).catch(() => undefined);
+			}
+			if (key) register(PROVIDER_ID, { baseUrl, apiKey: key, models: [jevModel(transport)] }, "pi-verdict:jev-adapter");
+		});
+	}
 
 	pi.on("model_select", (event, ctx) => {
 		if (event.model?.provider === PROVIDER_ID) {

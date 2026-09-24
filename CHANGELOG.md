@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Fixed
+
+- oh-my-pi 18.3.0 compatibility: agentDir self-anchoring normalizes Windows backslash paths before matching (the gate no longer falls back to `~/.pi/agent` on Windows); the compat completion bridge forwards credentials from `modelRegistry.getApiKeyAndHeaders` (fixes `MissingApiKeyError` on OAuth-backed sessions); the jev adapter registers through omp's `registerProvider(name, config, sourceId)` signature (arity-detected) without `createProvider`, and jev classifier calls on omp go directly through `streamDecisions`.
+
 ## [0.11.0] - 2026-09-21
 
 ### Changed

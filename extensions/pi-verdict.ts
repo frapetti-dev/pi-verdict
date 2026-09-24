@@ -91,7 +91,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { parseJevConfidence } from "./jev-adapter";
+import { activeTransport, parseJevConfidence, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS } from "./jev-adapter";
 
 // ============================================================================
 // 规则层:bash
@@ -307,9 +307,15 @@ const OWN_FILE_PATH: string | null = (() => {
 export function resolveAgentDir(ownFile: string | null, home: string, envAgentDir: string | undefined): string {
 	if (envAgentDir) return envAgentDir;
 	if (ownFile) {
-		const anchor = new RegExp(`^${escapeRegExp(home)}(/(\\.[^/]+)/(?:agent/)?(?:plugins/node_modules/(?:@[^/]+/)?[^/]+/)?extensions/)`);
+		// [pi-verdict local patch: Windows path-separator compat] fileURLToPath()
+		// and os.homedir() return backslash-separated paths on Windows, but the
+		// anchor regex is written with literal forward slashes — normalize both
+		// sides before matching, or the anchor never matches on Windows and the
+		// gate silently falls back to ~/.pi/agent (wrong host's config tree).
+		const normalizedHome = home.replace(/\\/g, "/");
+		const anchor = new RegExp(`^${escapeRegExp(normalizedHome)}(/(\\.[^/]+)/(?:agent/)?(?:plugins/node_modules/(?:@[^/]+/)?[^/]+/)?extensions/)`);
 		for (const f of baseForms(ownFile)) {
-			const m = f.match(anchor);
+			const m = f.replace(/\\/g, "/").match(anchor);
 			if (m) return path.join(home, m[2], "agent");
 		}
 	}
@@ -1114,6 +1120,11 @@ export type CompletionFn = (
 
 type CompatLoader = () => Promise<{ complete: CompletionFn }>;
 
+/** Shape of omp's `ModelRegistry.getApiKeyAndHeaders` — the "historical Pi extension facade". */
+type ApiKeyAndHeadersResolver = (
+	model: NonNullable<ExtensionContext["model"]>,
+) => Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
+
 /**
  * Bind the host runtime's completion capability (#35): registry.complete when
  * present (pi), else the pi-ai compat module (omp 18). The literal dynamic
@@ -1121,9 +1132,22 @@ type CompatLoader = () => Promise<{ complete: CompletionFn }>;
  * this literal to its bundled pi-ai; the ./compat subpath also exists on pi,
  * so resolution is safe on both hosts. The loader promise is cached; any
  * rejection propagates to the caller (the classifier's fail-closed path owns it).
+ *
+ * [pi-verdict local patch: omp 18.3.0 compat auth gap] The bundled pi-ai
+ * `complete` re-derives credentials from its own internal AuthStorage, which
+ * has no visibility into omp's OAuth-backed session credentials (Claude Code
+ * subscription tokens, etc.) — every call failed closed with
+ * `MissingApiKeyError: No API key for provider: X` even on a fully
+ * authenticated session. `registry.getApiKeyAndHeaders` is omp's own
+ * documented bridge ("Resolve request authentication through the historical
+ * Pi extension facade") returning the exact credential the live session
+ * already uses — forward it explicitly so the compat call skips its broken
+ * internal resolution. Falls through to the unauthenticated call (and its
+ * original fail-closed error) when the registry lacks this method (real pi
+ * never takes this branch) or when auth genuinely isn't configured.
  */
 export function bindCompletion(
-	registry: { complete?: unknown },
+	registry: { complete?: unknown; getApiKeyAndHeaders?: ApiKeyAndHeadersResolver },
 	compatLoader: CompatLoader = () => import("@earendil-works/pi-ai/compat") as Promise<{ complete: CompletionFn }>,
 ): CompletionFn {
 	if (typeof registry.complete === "function") {
@@ -1134,6 +1158,12 @@ export function bindCompletion(
 	return async (m, c, o) => {
 		compat ??= compatLoader();
 		const { complete } = await compat;
+		if (typeof registry.getApiKeyAndHeaders === "function") {
+			const auth = await registry.getApiKeyAndHeaders(m).catch(() => undefined);
+			if (auth?.ok && auth.apiKey) {
+				return complete(m, c, { ...o, apiKey: auth.apiKey, headers: { ...(o?.headers as Record<string, string> | undefined), ...auth.headers } });
+			}
+		}
 		return complete(m, c, o);
 	};
 }
@@ -1147,6 +1177,45 @@ function completionFor(registry: { complete?: unknown }, compatLoader?: CompatLo
 		completionCache.set(registry, fn);
 	}
 	return fn;
+}
+
+/** Minimal shape `completeForClassifier` needs from `ctx.modelRegistry` beyond
+ *  what `bindCompletion` already requires: omp's real `getApiKeyForProvider`,
+ *  used only on the jev/omp branch below (absent on real pi's ModelRegistry,
+ *  which never takes that branch). */
+type ClassifierRegistry = { complete?: unknown; getApiKeyForProvider?: (provider: string) => Promise<string | undefined> };
+
+/**
+ * [pi-verdict local patch: omp 18.3.0 jev/TypeSafe support] omp's compat
+ * completion bridge (`bindCompletion`'s fallback branch) talks to the bundled
+ * pi-ai package's own, unrelated provider registry — it has no visibility
+ * into providers extensions register on `ctx.modelRegistry` (see
+ * jev-adapter.ts's omp registration comment), so a `classifierModel:
+ * "typesafe/jev-latest"` selection would 404 there even though
+ * `ctx.modelRegistry.find()`/`hasConfiguredAuth()` correctly resolve it.
+ * Detect the omp-compat case (`registry.complete` absent) targeting jev's
+ * provider id and call `streamDecisions()` directly, resolving the OpenRouter
+ * (or TypeSafe-direct) API key fresh via `getApiKeyForProvider` on every call
+ * — not the static snapshot `registerProvider` uses only for the sync
+ * `hasConfiguredAuth` check. Real pi never takes this branch: `registry.complete`
+ * exists there, so `generic` already dispatches to jev's registered
+ * `provider.api.streamSimple` (auth via `provider.auth.apiKey.resolve`)
+ * unmodified.
+ */
+function completeForClassifier(registry: ClassifierRegistry, deps: AutoModeDeps): CompletionFn {
+	const generic = completionFor(registry, deps.compatLoader);
+	const isOmpCompat = typeof registry.complete !== "function";
+	return async (m, c, o) => {
+		if (!isOmpCompat || m.provider !== JEV_PROVIDER_ID) return generic(m, c, o);
+		const transport = activeTransport();
+		const jevConfig = TRANSPORT_DEFAULTS[transport];
+		let apiKey: string | undefined;
+		if (jevConfig.loginProvider && typeof registry.getApiKeyForProvider === "function") {
+			apiKey = await registry.getApiKeyForProvider(jevConfig.loginProvider).catch(() => undefined);
+		}
+		apiKey ||= process.env[jevConfig.keyEnv]?.trim();
+		return streamDecisions(transport, m, c, { ...o, apiKey }).result();
+	};
 }
 
 /** 分类器思考级别(pi 原生词表;后缀语法对齐 pi --model provider/id:thinking) */
@@ -2097,7 +2166,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			cwd: ctx.cwd,
 			hasUI: !!ctx.hasUI,
 			getModel: () => resolveClassifier(ctx),
-			complete: completionFor(ctx.modelRegistry, deps.compatLoader),
+			complete: completeForClassifier(ctx.modelRegistry, deps),
 			host: ctx.sessionManager,
 			signal: ctx.signal,
 			getFallbackModel: () => resolveFallbackClassifier(ctx),
