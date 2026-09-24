@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+
+- `autoDeny` config key (default `true`): `false` converts every auto-review deny (danger floor, `deny` rules, classifier deny, fail-closed) into an interactive confirmation; the self-protection layer stays a hard deny and non-interactive sessions still deny. The confirm dialog labels the source (`Rule` / `Fail-closed` / `Classifier opinion`).
+- `rules` config key (default `[]`): user-authored free-text rules appended to the classifier system prompt and forwarded to the jev decisions adapter as extra verdict instructions; applicable rules take precedence over default criteria.
+
 ### Fixed
 
 - oh-my-pi 18.3.0 compatibility: agentDir self-anchoring normalizes Windows backslash paths before matching (the gate no longer falls back to `~/.pi/agent` on Windows); the compat completion bridge forwards credentials from `modelRegistry.getApiKeyAndHeaders` (fixes `MissingApiKeyError` on OAuth-backed sessions); the jev adapter registers through omp's `registerProvider(name, config, sourceId)` signature (arity-detected) without `createProvider`, and jev classifier calls on omp go directly through `streamDecisions`.

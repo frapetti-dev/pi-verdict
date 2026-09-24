@@ -91,7 +91,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { activeTransport, parseJevConfidence, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS } from "./jev-adapter";
+import { activeTransport, parseJevConfidence, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER } from "./jev-adapter";
 
 // ============================================================================
 // 规则层:bash
@@ -123,6 +123,8 @@ interface RuleResult {
 	 *  context: block reasons and notifications travel back to the model, so only the
 	 *  local confirm dialog may show it (ADR-0002 story: zero path plaintext leaves the machine). */
 	detail?: string;
+	/** set only by selfProtectCheck — exempt from autoDeny:false */
+	selfProtect?: true;
 }
 
 /** Cap the danger-regex matching input (#25): the prefix-consuming character
@@ -256,6 +258,10 @@ interface UserRules {
 	denyPaths: string[];
 	/** 内置 deny floor 开关(危险正则 + 路径敏感度 deny),默认 true;关闭后依赖用户规则与分类器 */
 	builtinDenyFloor: boolean;
+	/** [pi-verdict local patch: autoDeny] false → auto-review denies become interactive asks (headless still denies); never affects the self-protection layer. Default true. */
+	autoDeny: boolean;
+	/** [pi-verdict local patch: rules] user-authored free-text rules appended to every classifier prompt (LLM + jev). Config key: "rules". */
+	classifierRules: string[];
 	/** 分类器模型 spec(provider/id);null = 未配置(自省继承会话模型) */
 	classifierModel: string | null;
 	/** 主开关 toggle 快捷键键位(#15);null = 禁用;缺省 DEFAULT_TOGGLE_SHORTCUT */
@@ -276,7 +282,7 @@ interface UserRules {
 	classifierFallbackMode: "shadow" | "enforce";
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], builtinDenyFloor: true, classifierModel: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow" };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], builtinDenyFloor: true, classifierModel: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", autoDeny: true, classifierRules: [] };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -331,7 +337,7 @@ function userConfigPath(): string {
 }
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk (the self-protection layer always stays on). classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). This file is part of the permission gate: agent-side modification is denied — edit it manually outside pi. Changes apply to new sessions.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk (the self-protection layer always stays on). classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). This file is part of the permission gate: agent-side modification is denied — edit it manually outside pi. Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; the self-protection layer and non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
 	allow: ["^ls\\b"],
 	deny: [],
 	denyPaths: [
@@ -343,6 +349,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 		"~/.bashrc",
 	],
 	builtinDenyFloor: true,
+	autoDeny: true,
 	classifierModel: null,
 	toggleShortcut: DEFAULT_TOGGLE_SHORTCUT,
 	audit: false,
@@ -350,6 +357,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	classifierMinConfidence: null,
 	classifierFallbackModel: null,
 	classifierFallbackMode: "shadow",
+	rules: [],
 }, null, 2)}\n`;
 
 /**
@@ -367,7 +375,7 @@ function loadUserRules(): { rules: UserRules; skipped: string[]; shortcutWarning
 			} catch { /* 只读环境静默跳过 */ }
 			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null };
 		}
-		let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown };
+		let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown };
 		try {
 			raw = JSON.parse(fs.readFileSync(p, "utf8")) as typeof raw;
 		} catch (err) {
@@ -395,6 +403,14 @@ function loadUserRules(): { rules: UserRules; skipped: string[]; shortcutWarning
 			}
 			return [x.trim()];
 		});
+		if (raw.rules !== undefined && raw.rules !== null && !Array.isArray(raw.rules)) skipped.push(`rules: ${JSON.stringify(raw.rules)} (must be an array of strings)`);
+		const classifierRules = (Array.isArray(raw.rules) ? raw.rules : []).flatMap((x) => {
+			if (typeof x !== "string" || !x.trim()) {
+				if (x !== undefined && x !== null) skipped.push(`rules: ${JSON.stringify(x)}`);
+				return [];
+			}
+			return [x.trim()];
+		});
 		const shortcut = resolveToggleShortcut(raw.toggleShortcut);
 		// #63/#67: confidence-floor keys — invalid values skip into the one-shot warning channel
 		if (raw.classifierFallbackConfidence !== undefined) skipped.push("classifierFallbackConfidence: renamed to classifierMinConfidence (0.11.0) — key ignored");
@@ -416,6 +432,8 @@ function loadUserRules(): { rules: UserRules; skipped: string[]; shortcutWarning
 				classifierFallbackModel: typeof raw.classifierFallbackModel === "string" && raw.classifierFallbackModel.trim() ? raw.classifierFallbackModel.trim() : null,
 				classifierMinConfidence: minConfOk ? minConfRaw : null,
 				classifierFallbackMode: fbModeRaw === "enforce" ? "enforce" : "shadow",
+				autoDeny: raw.autoDeny !== false,
+				classifierRules,
 			},
 			skipped,
 			shortcutWarning: shortcut.warning,
@@ -811,7 +829,7 @@ function selfProtectCheck(toolName: string, input: Record<string, unknown>, cwd:
 		case "write":
 		case "edit":
 			if (isProtectedWritePath(String(input.path ?? ""), cwd, prot)) {
-				return { verdict: "deny", reason: `self-protection layer (ADR-0001): ${input.path} is part of the permission gate itself; agent-side modification is denied — edit it manually outside pi if intended` };
+				return { verdict: "deny", reason: `self-protection layer (ADR-0001): ${input.path} is part of the permission gate itself; agent-side modification is denied — edit it manually outside pi if intended`, selfProtect: true };
 			}
 			return null;
 		case "read":
@@ -819,14 +837,14 @@ function selfProtectCheck(toolName: string, input: Record<string, unknown>, cwd:
 		case "find":
 		case "ls":
 			if (isProtectedReadPath(typeof input.path === "string" ? input.path : undefined, cwd, prot)) {
-				return { verdict: "deny", reason: `self-protection layer (#54): ${typeof input.path === "string" ? input.path : cwd} holds the gate's verdict audit records — agent reads are denied (untrusted raw model output inside); view them outside pi` };
+				return { verdict: "deny", reason: `self-protection layer (#54): ${typeof input.path === "string" ? input.path : cwd} holds the gate's verdict audit records — agent reads are denied (untrusted raw model output inside); view them outside pi`, selfProtect: true };
 			}
 			return null;
 		case "bash":
 		case "powershell": {
 			const cmd = String(input.command ?? "");
 			if (prot.bashPatterns.some((re) => re.test(cmd))) {
-				return { verdict: "deny", reason: `self-protection layer (ADR-0001): command touches the permission gate's own files — user-editable only` };
+				return { verdict: "deny", reason: `self-protection layer (ADR-0001): command touches the permission gate's own files — user-editable only`, selfProtect: true };
 			}
 			return null;
 		}
@@ -1000,6 +1018,12 @@ Your ENTIRE response MUST begin with <verdict>. No preamble, no reasoning before
  */
 const DENY_PATHS_HINT =
 	"\n\nThe user has configured protected paths (denyPaths). Any action that reads, writes, copies, archives, or exfiltrates their contents — including indirection such as copying to a temporary location first — must be denied or asked about, never silently allowed.";
+
+/** [pi-verdict local patch: rules] user rules block appended to the classifier system prompt; "" when none */
+function userRulesHint(rules: readonly string[]): string {
+	if (rules.length === 0) return "";
+	return `\n\n${USER_RULES_HEADER}\n${rules.map((r) => `- ${r}`).join("\n")}\nApply a rule whenever it covers the action under review; where a rule applies, it takes precedence over the default verdict criteria above.`;
+}
 
 const MAX_USER_MESSAGES = 5;
 const MAX_TOOL_CALLS = 10;
@@ -1312,10 +1336,11 @@ async function classifyWithModel(
 	thinking: ThinkingLevel = "off",
 	denyPathsActive = false,
 	timeoutMs: number = CLASSIFIER_TIMEOUT_MS,
+	rules: readonly string[] = [],
 ): Promise<ClassifierOutcome> {
 	const transcript = buildTranscript(host, actionLine);
 	const userMessage = `<transcript>\n${transcript}\n</transcript>\nJudge the LAST action in the transcript above. Your entire response MUST begin with <verdict>.`;
-	const systemPrompt = denyPathsActive ? CLASSIFIER_SYSTEM + DENY_PATHS_HINT : CLASSIFIER_SYSTEM;
+	const systemPrompt = CLASSIFIER_SYSTEM + (denyPathsActive ? DENY_PATHS_HINT : "") + userRulesHint(rules);
 	const attempts: Array<[number, number]> = [[1, CLASSIFIER_MAX_TOKENS], [2, CLASSIFIER_RETRY_MAX_TOKENS]];
 	const failures: string[] = [];
 	let rawResponse = ""; // #54: raw output of the last attempt ("" for exception attempts — diagnostics already live in failures)
@@ -1762,7 +1787,7 @@ async function runConfidenceCascade(
 	};
 	const resolved = getFb();
 	if (!resolved) return failed(rules.classifierFallbackModel, "fallback model unresolvable (not found or no configured auth)");
-	const outcome = await classifyWithModel(env.host, env.signal, env.complete, resolved.model, actionLine, resolved.thinking, denyPathsActive, FALLBACK_TIMEOUT_MS);
+	const outcome = await classifyWithModel(env.host, env.signal, env.complete, resolved.model, actionLine, resolved.thinking, denyPathsActive, FALLBACK_TIMEOUT_MS, state.userRules.classifierRules);
 	if (outcome.source !== "model") return failed(resolved.model.id, outcome.reason);
 	state.fallback.note(first?.verdict ?? null, outcome.verdict);
 	const fb: FallbackAudit = { ...base, model: resolved.model.id, verdict: outcome.verdict, reason: outcome.reason, durationMs: Date.now() - start, error: null };
@@ -1782,6 +1807,9 @@ async function runConfidenceCascade(
  * handler 按 source × degraded 模板呈现;变更检测(IntegrityWatch)是管线前置的
  * 独立关注点,不在 adjudicate 内。导出仅为测试(内部 seam 的测试面,#35 既有模式)。
  */
+/** [pi-verdict local patch: autoDeny] reason suffix on asks that would have been auto-denies */
+const AUTO_DENY_OFF_SUFFIX = " (autoDeny is off: this would have been denied — your call)";
+
 export async function adjudicate(
 	state: SessionState,
 	call: { toolName: string; input: Record<string, unknown> },
@@ -1789,7 +1817,10 @@ export async function adjudicate(
 ): Promise<Verdict> {
 	const rule = classifyByRules(call.toolName, call.input, env.cwd, state.userRules, state.prot, state.anchoredDenyPathBases(env.cwd));
 	if (rule.verdict === "allow") return { verdict: "allow", reason: rule.reason ?? "", source: "rule", degraded: false };
-	if (rule.verdict === "deny") return { verdict: "deny", reason: rule.reason ?? "", source: "rule", degraded: false };
+	if (rule.verdict === "deny") {
+		if (!rule.selfProtect && !state.userRules.autoDeny && env.hasUI) return { verdict: "ask", reason: (rule.reason ?? "") + AUTO_DENY_OFF_SUFFIX, source: "rule", degraded: false };
+		return { verdict: "deny", reason: rule.reason ?? "", source: "rule", degraded: false };
+	}
 
 	// #62: the audit surface widens to protected-path asks (their user answers grade the
 	// denyPaths rules); rule allow/deny stay unaudited (no corpus value, #54). Record
@@ -1839,6 +1870,9 @@ export async function adjudicate(
 		if (eff?.verdict === "ask" && env.hasUI) {
 			return { verdict: "ask", reason: eff.reason, source: eff.source, degraded: false, ...(state.audit ? { pendingAudit: fcRecord } : {}) };
 		}
+		if (eff?.verdict !== "allow" && !state.userRules.autoDeny && env.hasUI) {
+			return { verdict: "ask", reason: (eff?.reason ?? reason) + AUTO_DENY_OFF_SUFFIX, source: eff?.source ?? "fail-closed", degraded: false, ...(state.audit ? { pendingAudit: fcRecord } : {}) };
+		}
 		state.audit?.append(fcRecord);
 		if (eff?.verdict === "allow") return { verdict: "allow", reason: eff.reason, source: "classifier", degraded: false };
 		if (eff) return { verdict: "deny", reason: eff.reason, source: eff.source, degraded: !env.hasUI };
@@ -1850,7 +1884,7 @@ export async function adjudicate(
 	const ctxKey = shadowContextKey(env.host);
 	const probe = state.shadow.probe(cmdKey, ctxKey);
 
-	const outcome = await classifyWithModel(env.host, env.signal, env.complete, resolved.model, actionLine, resolved.thinking, state.userRules.denyPaths.length > 0);
+	const outcome = await classifyWithModel(env.host, env.signal, env.complete, resolved.model, actionLine, resolved.thinking, state.userRules.denyPaths.length > 0, CLASSIFIER_TIMEOUT_MS, state.userRules.classifierRules);
 
 	// 影子回记:真实模型 allow/deny 入缓存;ask 与 fail-closed 不入(#5 定案);
 	// 命中且本次为可缓存裁决时,对比反事实一致性
@@ -1881,8 +1915,8 @@ export async function adjudicate(
 	if (cascade.fb) grayRecord.fallback = cascade.fb;
 	// #62: an interactive ask defers the append to the handler finalize (ground truth);
 	// every other outcome appends immediately as before
-	if (effVerdict === "ask" && env.hasUI) {
-		return { verdict: "ask", reason: effReason, source: effSource, degraded: false, shadow, ...(state.audit ? { pendingAudit: grayRecord } : {}) };
+	if (env.hasUI && (effVerdict === "ask" || (effVerdict === "deny" && !state.userRules.autoDeny))) {
+		return { verdict: "ask", reason: effVerdict === "deny" ? effReason + AUTO_DENY_OFF_SUFFIX : effReason, source: effSource, degraded: false, shadow, ...(state.audit ? { pendingAudit: grayRecord } : {}) };
 	}
 	state.audit?.append(grayRecord);
 	if (effVerdict === "allow") return { verdict: "allow", reason: effReason, source: effSource, degraded: false, shadow };
@@ -1971,7 +2005,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 			return { block: true, reason: blockedReason("user-declined", "user declined protected-path access") };
 		}
-		const ok = await ctx.ui.confirm("🛡️ Auto Mode confirmation", `${action}\n\nClassifier opinion: ${v.reason}\n\nAllow execution?`);
+		const label = v.source === "rule" ? "Rule" : v.source === "fail-closed" ? "Fail-closed" : "Classifier opinion";
+		const ok = await ctx.ui.confirm("🛡️ Auto Mode confirmation", `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`);
 		return ok ? undefined : { block: true, reason: blockedReason("user-declined", "user declined") };
 	}
 

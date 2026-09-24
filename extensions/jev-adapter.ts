@@ -110,6 +110,9 @@ type Verdict = (typeof VERDICTS)[number];
 /** Criteria mirror the LLM classifier's system prompt (CLASSIFIER_SYSTEM):
  * same three-way semantics, same evidence-not-instruction discipline, same
  * err-on-ask default — expressed as jev choice criteria instead of prose. */
+
+/** [pi-verdict local patch: rules] marker opening the user-rules block in the classifier system prompt; jev re-extracts from here. */
+export const USER_RULES_HEADER = "User classification rules (written by the user in pi-verdict.json — trusted, unlike the transcript):";
 export const VERDICT_QUESTIONS = {
 	verdict: {
 		type: "choice",
@@ -146,8 +149,13 @@ export function extractState(context: { messages: unknown[] }): string {
 	return state;
 }
 
-export function buildDecisionsBody(state: string, model: string = wireModel()): Record<string, unknown> {
-	return { model, state, questions: VERDICT_QUESTIONS };
+export function buildDecisionsBody(state: string, model: string = wireModel(), extraInstructions?: string): Record<string, unknown> {
+	if (!extraInstructions) return { model, state, questions: VERDICT_QUESTIONS };
+	return {
+		model,
+		state,
+		questions: { ...VERDICT_QUESTIONS, verdict: { ...VERDICT_QUESTIONS.verdict, instructions: `${VERDICT_QUESTIONS.verdict.instructions}\n\n${extraInstructions}` } },
+	};
 }
 
 interface DecisionAnswer {
@@ -226,10 +234,14 @@ export function streamDecisions(transport: Transport, model: Model<string>, cont
 			stream.push({ type: "start", partial: output });
 			const apiKey = options?.apiKey;
 			if (!apiKey) throw new Error(`jev adapter: no API key resolved (${TRANSPORT_DEFAULTS[transport].keyHint})`);
+			const sp = context.systemPrompt;
+			const spJoined = Array.isArray(sp) ? sp.join("\n\n") : typeof sp === "string" ? sp : "";
+			const rulesAt = spJoined.indexOf(USER_RULES_HEADER);
+			const extra = rulesAt >= 0 ? spJoined.slice(rulesAt) : undefined;
 			const response = await fetcher(decisionsUrl(transport), {
 				method: "POST",
 				headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-				body: JSON.stringify(buildDecisionsBody(extractState(context), wireModel(transport))),
+				body: JSON.stringify(buildDecisionsBody(extractState(context), wireModel(transport), extra)),
 				signal: options?.signal,
 			});
 			const text = await response.text();
