@@ -9,11 +9,11 @@
  *   0. Self-protection layer (ADR-0001, cannot be exempted by any config): write/edit/bash
  *      touching the gate's own files (pi-verdict.json + the installed extension
  *      copy) → hard deny, reads pass; builtinDenyFloor:false cannot turn it off,
- *      user allow cannot override it. Tamper-detection backstop: watched files are
- *      re-verified before every verdict; if bypassed and modified → differential
- *      handling: extension copy changed / no UI → auto-restore + fail-closed for
- *      the session; config changed + UI → confirm dialog (keep = rebuild baseline,
- *      restore = rollback + fail-closed).
+ *      user allow cannot override it. No runtime tamper-detection backstop: a
+ *      bypass that edits the installed file directly (outside any pi/omp tool
+ *      call) is not detected or reverted — removed because an unrelated session
+ *      sharing the same installed copy would otherwise revert a legitimate
+ *      manual edit and permanently fail-close itself for a file it never touched.
  *   1. Rule layer (built-in deny floor + user declarations):
  *      - built-in floor: bash danger regexes + path sensitivity S0-S5 → hard deny
  *        (on by default; builtinDenyFloor:false turns the whole floor off, at your
@@ -39,8 +39,7 @@
  * Structure: the pipeline is adjudicate() — a zero-UI module returning a Verdict
  * value object (source: rule|protected-path|classifier|fail-closed, plus a
  * `degraded` flag for ask→deny in non-interactive sessions); the tool_call
- * handler maps verdicts to UI (notify/confirm/select) by source × degraded and
- * runs IntegrityWatch (ADR-0001) as a pre-pipeline gate-integrity check.
+ * handler maps verdicts to UI (notify/confirm) by source × degraded.
  *
  * Shadow cache (observe-only, #7): gray-zone verdicts are replayed against a
  * double-key LRU(128) to measure would-be hit rate; recorded, never applied
@@ -336,6 +335,57 @@ function userConfigPath(): string {
 	return path.join(agentDirPath(), "config", "pi-verdict.json");
 }
 
+/** [pi-verdict local patch: project overrides] project dir name mirrors the host tree: ~/.omp/agent → ".omp", ~/.pi/agent → ".pi" */
+function projectDotDir(agentDir: string): string {
+	const d = path.basename(path.dirname(agentDir));
+	return d.startsWith(".") ? d : ".pi";
+}
+
+function samePath(a: string, b: string): boolean {
+	const n = (p: string) => {
+		const r = path.resolve(p);
+		return process.platform === "win32" ? r.toLowerCase() : r;
+	};
+	return n(a) === n(b);
+}
+
+/** Nearest <dir>/<dotDir>/pi-verdict.json walking up from cwd. Stops (exclusive) at the home dir
+ *  and at the agent tree's root parent, so the global tree is never mistaken for a project. */
+function findProjectConfig(cwd: string, agentDir: string): string | null {
+	const dot = projectDotDir(agentDir);
+	const stops = [os.homedir(), path.dirname(path.dirname(agentDir))];
+	let dir = path.resolve(cwd);
+	for (;;) {
+		if (stops.some((s) => samePath(s, dir))) return null;
+		const candidate = path.join(dir, dot, "pi-verdict.json");
+		if (fs.existsSync(candidate)) return candidate;
+		const parent = path.dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
+	}
+}
+
+function parseTrustedProjects(raw: unknown, skipped: string[]): string[] {
+	if (raw === undefined || raw === null) return [];
+	if (!Array.isArray(raw)) {
+		skipped.push(`trustedProjects: ${JSON.stringify(raw)} (must be an array of paths)`);
+		return [];
+	}
+	return raw.flatMap((x) => {
+		if (typeof x !== "string" || !x.trim()) {
+			skipped.push(`trustedProjects: ${JSON.stringify(x)}`);
+			return [];
+		}
+		return [path.resolve(expandHome(x.trim()))];
+	});
+}
+
+/** Exact-root trust (no subtree trust): any lexical/realpath form of root equals any form of an entry */
+function isTrustedRoot(root: string, trusted: string[]): boolean {
+	const rootForms = baseForms(root);
+	return trusted.some((t) => baseForms(t).some((tf) => rootForms.some((rf) => samePath(tf, rf))));
+}
+
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk (the self-protection layer always stays on). classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). This file is part of the permission gate: agent-side modification is denied — edit it manually outside pi. Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; the self-protection layer and non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
 	allow: ["^ls\\b"],
@@ -358,14 +408,17 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	classifierFallbackModel: null,
 	classifierFallbackMode: "shadow",
 	rules: [],
+	trustedProjects: [],
 }, null, 2)}\n`;
+
+interface LoadedRules { rules: UserRules; skipped: string[]; shortcutWarning: string | null; project: { path: string; applied: boolean } | null; protectPaths: string[] }
 
 /**
  * 加载用户规则。首启生成带注释模板(allow 内示例默认仅 ^ls\b 可用,其余为说明占位);
  * 配置缺失/损坏/字段非法一律回退空规则(安全默认,不失效),非法正则收集回报,
  * 非法 toggleShortcut 收集警告文案(与 skipped 同经 session_start 发出)。
  */
-function loadUserRules(): { rules: UserRules; skipped: string[]; shortcutWarning: string | null } {
+function loadUserRules(cwd: string | null = null): LoadedRules {
 	try {
 		const p = userConfigPath();
 		if (!fs.existsSync(p)) {
@@ -373,18 +426,55 @@ function loadUserRules(): { rules: UserRules; skipped: string[]; shortcutWarning
 				fs.mkdirSync(path.dirname(p), { recursive: true });
 				fs.writeFileSync(p, USER_CONFIG_TEMPLATE);
 			} catch { /* 只读环境静默跳过 */ }
-			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null };
+			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null, protectPaths: [] };
 		}
-		let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown };
+		let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown; trustedProjects?: unknown };
 		try {
 			raw = JSON.parse(fs.readFileSync(p, "utf8")) as typeof raw;
 		} catch (err) {
 			// Invalid config never silently disables the gate (#25): a parse failure
 			// loads empty user rules (the floor and self-protection layer stay on)
 			// and reports through the session_start skip channel, same as invalid regexes
-			return { rules: EMPTY_RULES, skipped: [`config parse failed: ${err instanceof Error ? err.message : String(err)} — user rules not loaded (${p})`], shortcutWarning: null };
+			return { rules: EMPTY_RULES, skipped: [`config parse failed: ${err instanceof Error ? err.message : String(err)} — user rules not loaded (${p})`], shortcutWarning: null, project: null, protectPaths: [] };
 		}
 		const skipped: string[] = [];
+		// [pi-verdict local patch: project overrides] replace-merge a trusted project's file over the global raw object
+		const agentDir = agentDirPath();
+		const trusted = parseTrustedProjects(raw.trustedProjects, skipped);
+		const protectPaths = trusted.map((r) => path.join(r, projectDotDir(agentDir), "pi-verdict.json"));
+		let project: LoadedRules["project"] = null;
+		const pp = cwd === null ? null : findProjectConfig(cwd, agentDir);
+		if (pp) {
+			protectPaths.push(pp);
+			project = { path: pp, applied: false };
+			const root = path.dirname(path.dirname(pp));
+			if (!isTrustedRoot(root, trusted)) {
+				skipped.push(`project config ${pp} ignored: ${root} is not listed in trustedProjects of ${p}`);
+			} else {
+				let projRaw: unknown;
+				try {
+					projRaw = JSON.parse(fs.readFileSync(pp, "utf8"));
+				} catch (err) {
+					skipped.push(`project config parse failed: ${err instanceof Error ? err.message : String(err)} — project overrides not loaded (${pp})`);
+				}
+				if (projRaw !== undefined) {
+					if (typeof projRaw !== "object" || projRaw === null || Array.isArray(projRaw)) {
+						skipped.push(`project config ${pp}: top level must be a JSON object — project overrides not loaded`);
+					} else {
+						const over: Record<string, unknown> = { ...(projRaw as Record<string, unknown>) };
+						for (const k of ["trustedProjects", "toggleShortcut"]) {
+							if (k in over) {
+								skipped.push(`${k}: not overridable per project — key ignored (${pp})`);
+								delete over[k];
+							}
+						}
+						delete over._hint;
+						raw = { ...raw, ...over } as typeof raw;
+						project = { path: pp, applied: true };
+					}
+				}
+			}
+		}
 		const compile = (list: unknown): RegExp[] =>
 			(Array.isArray(list) ? list : []).filter((x): x is string => typeof x === "string").flatMap((src) => {
 				try {
@@ -437,9 +527,11 @@ function loadUserRules(): { rules: UserRules; skipped: string[]; shortcutWarning
 			},
 			skipped,
 			shortcutWarning: shortcut.warning,
+			project,
+			protectPaths,
 		};
 	} catch {
-		return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null };
+		return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null, protectPaths: [] };
 	}
 }
 
@@ -625,7 +717,7 @@ function hitDenyPaths(toolName: string, input: Record<string, unknown>, cwd: str
 // 语义:门禁内一切写入按定义均由 agent 发起 → 恒 deny(reason 指引手工编辑);
 // 读放行(读门禁文件无害);用户经编辑器的修改不经门禁,不受影响。
 // bash 侧:命令串正则覆盖字面量/~/\$HOME/\$PI_CODING_AGENT_DIR 变体,可被混淆
-// 绕过(诚实声明,ADR-0001)——由扩展主体的变更检测兜底。
+// 绕过(诚实声明,ADR-0001);无运行时变更检测兜底(该机制已移除)。
 // ============================================================================
 
 interface ProtectedSet {
@@ -637,11 +729,7 @@ interface ProtectedSet {
 	readPrefixes: string[];
 	/** bash/powershell 命令串危险特征(子串匹配,可绕——变更检测兜底) */
 	bashPatterns: RegExp[];
-	/** 变更检测基线(词法路径 + 类别;session_start 时快照全文) */
-	watchBases: Array<{ file: string; kind: WatchKind }>;
 }
-
-type WatchKind = "config" | "extension";
 
 function escapeRegExp(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -659,54 +747,13 @@ export function buildProtectedSet(agentDir: string, ownFile: string | null): Pro
 	const exact = new Set<string>();
 	const prefixes = new Set<string>();
 	const configPath = path.join(agentDir, "config", "pi-verdict.json");
-	const watchBases: Array<{ file: string; kind: WatchKind }> = [{ file: configPath, kind: "config" }];
 	for (const f of baseForms(configPath)) exact.add(f);
 
 	// 安装副本目标:单文件形态 → 文件本体(exact);npm 目录形态 → 包根目录(prefix)。
 	// extRoot 与 ownFile 各取词法/realpath 双形交叉判定,集合同样双形收录——
 	// 避免符号链接目录(如 macOS /var → /private/var)导致传入词法路径与集合错位。
-	/** List every file under a package root (npm dir install form) for the tamper
-	 *  baseline (#26): write protection covers the whole package dir, so the watch
-	 *  scope must not lag behind it — a planted manifest entry must not survive to
-	 *  the next session undetected. node_modules/.git are skipped; depth and file
-	 *  count are bounded so a planted oversized tree cannot blow up the next
-	 *  session's baseline build (defense in depth, requires a prior bypass). */
-	const listPackageFiles = (root: string): string[] => {
-		const out: string[] = [];
-		const walk = (dir: string, depth: number): void => {
-			if (depth > 16 || out.length >= 500) return;
-			let names: string[];
-			try {
-				names = fs.readdirSync(dir);
-			} catch {
-				return;
-			}
-			for (const name of names) {
-				if (name === "node_modules" || name === ".git") continue;
-				const full = path.join(dir, name);
-				// stat (not lstat) follows symlinks: a package file replaced by a
-				// symlink to outside content must not silently drop out of the
-				// baseline — the watched path stays the lexical entry; a symlink
-				// cycle (ELOOP) throws and is skipped (#26 review)
-				let st: fs.Stats;
-				try {
-					st = fs.statSync(full);
-				} catch {
-					continue;
-				}
-				if (st.isDirectory()) walk(full, depth + 1);
-				else if (st.isFile() && out.length < 500) out.push(full);
-			}
-		};
-		walk(root, 0);
-		return out;
-	};
-
 	const extTargets = new Set<string>();
 	if (ownFile) {
-		watchBases.push({ file: ownFile, kind: "extension" });
-		const seenWatch = new Set<string>([ownFile]);
-		let pkgRoot: string | null = null;
 		// Install roots, lexical + realpath forms (#35): <agentDir>/extensions
 		// (pi) and plugins/node_modules under agentDir or its parent dir (the
 		// two omp layouts — see resolveAgentDir for the layout history). The
@@ -735,16 +782,6 @@ export function buildProtectedSet(agentDir: string, ownFile: string | null): Pro
 					(singleFile ? exact : prefixes).add(f);
 					extTargets.add(f);
 				}
-				if (!singleFile && pkgRoot === null) pkgRoot = target;
-			}
-		}
-		// one walk of the package root (lexical form; takeSnapshots' baseForms
-		// expansion picks up real forms per file) — no duplicate entries
-		if (pkgRoot !== null) {
-			for (const f of listPackageFiles(pkgRoot)) {
-				if (seenWatch.has(f)) continue;
-				seenWatch.add(f);
-				watchBases.push({ file: f, kind: "extension" });
 			}
 		}
 	}
@@ -773,9 +810,7 @@ export function buildProtectedSet(agentDir: string, ownFile: string | null): Pro
 
 	// #54 verdicts dir: gate-owned audit storage. Writes ride the normal prefixes;
 	// reads are denied separately — records carry raw model output (including
-	// fail-closed failures) that must not flow back into agent context. Deliberately
-	// NOT added to watchBases: the log legitimately grows every adjudication, so a
-	// snapshot diff would false-positive as tampering.
+	// fail-closed failures) that must not flow back into agent context.
 	const verdictsForms = baseForms(path.join(agentDir, "verdicts"));
 	for (const f of verdictsForms) prefixes.add(f);
 	const home = os.homedir();
@@ -792,7 +827,7 @@ export function buildProtectedSet(agentDir: string, ownFile: string | null): Pro
 	}
 	bashPatterns.push(new RegExp(`(?:${[...vAlts].join("|")})`));
 
-	return { exact: [...exact], prefixes: [...prefixes], readPrefixes: verdictsForms, bashPatterns, watchBases };
+	return { exact: [...exact], prefixes: [...prefixes], readPrefixes: verdictsForms, bashPatterns };
 }
 
 /** Does the resolved write path hit the protected set (realpath guards against
@@ -850,92 +885,6 @@ function selfProtectCheck(toolName: string, input: Record<string, unknown>, cwd:
 		}
 		default:
 			return null; // MCP/自定义工具不经规则层(ADR-0001:由变更检测兜底)
-	}
-}
-
-/** 变更检测双选文案(ADR-0001:选项即动作,消除 Yes/No 映射歧义;按钮惯例用动词原形) */
-const CONFIG_ACCEPT_CHOICE = "Accept the new version — re-baseline and continue (applies to new sessions as usual)";
-const CONFIG_DECLINE_CHOICE = "Decline — restore the session baseline (revert + fail-closed for the rest of this session)";
-
-/** 变更检测基线快照(ADR-0001 一期):全文读入内存;不存在/不可读 → content=null */
-function takeSnapshots(bases: Array<{ file: string; kind: WatchKind }>): Array<{ file: string; kind: WatchKind; content: Buffer | null }> {
-	const out: Array<{ file: string; kind: WatchKind; content: Buffer | null }> = [];
-	const seen = new Set<string>();
-	for (const b of bases) {
-		for (const f of baseForms(b.file)) {
-			if (seen.has(f)) continue;
-			seen.add(f);
-			let content: Buffer | null = null;
-			try {
-				content = fs.readFileSync(f);
-			} catch {
-				/* 不存在/不可读:仍占位(出现即篡改信号) */
-			}
-			out.push({ file: f, kind: b.kind, content });
-		}
-	}
-	return out;
-}
-
-/**
- * 变更检测(ADR-0001 一期)的会话实例:基线快照 + 篡改旗标。处置差分(config-only
- * 且有 UI → select 双选)由扩展 handler 编排——本类零 UI;restoreAndFailClose 只做
- * 还原与置位,通知由调用方按返回的文件清单/原因拼装。
- */
-class IntegrityWatch {
-	private snapshots: Array<{ file: string; kind: WatchKind; content: Buffer | null }>;
-	private _tampered = false;
-
-	constructor(private watchBases: Array<{ file: string; kind: WatchKind }>) {
-		this.snapshots = takeSnapshots(watchBases);
-	}
-
-	get tampered(): boolean {
-		return this._tampered;
-	}
-
-	/** 复核受保护文件,返回变化清单(不处置——处置按 kind 差分,ADR-0001 定稿 D) */
-	detect(): Array<{ file: string; kind: WatchKind }> {
-		const hit: Array<{ file: string; kind: WatchKind }> = [];
-		for (const s of this.snapshots) {
-			let current: Buffer | null = null;
-			try {
-				current = fs.readFileSync(s.file);
-			} catch {
-				/* 不存在 */
-			}
-			const same = (a: Buffer | null, b: Buffer | null): boolean => (a === null || b === null ? a === b : a.equals(b));
-			if (!same(current, s.content)) hit.push({ file: s.file, kind: s.kind });
-		}
-		return hit;
-	}
-
-	/** 重建基线(Accept 路径与 session_start 共用;不动篡改旗标) */
-	rebaseline(): void {
-		this.snapshots = takeSnapshots(this.watchBases);
-	}
-
-	/** 会话重置:重建基线 + 清篡改旗标 */
-	startSession(): void {
-		this.rebaseline();
-		this._tampered = false;
-	}
-
-	/** 从快照回写变化文件(扩展进程自身执行,不经门禁)+ fail-closed 置位 */
-	restoreAndFailClose(changed: Array<{ file: string }>, cause: string): { reason: string; files: string } {
-		for (const c of changed) {
-			const s = this.snapshots.find((x) => x.file === c.file);
-			if (s && s.content !== null) {
-				try {
-					fs.writeFileSync(s.file, s.content);
-				} catch {
-					/* 还原失败:仍 fail-closed */
-				}
-			}
-		}
-		this._tampered = true;
-		const files = [...new Set(changed.map((c) => c.file))].join(", ");
-		return { reason: `[auto-mode] self-protection: tamper detected${cause ? ` (${cause})` : ""} and restored (${files}); fail-closed until restart`, files };
 	}
 }
 
@@ -1654,12 +1603,18 @@ export class SessionState {
 	audit: AuditLog | null;
 	private denyPathBases: string[] | null = null;
 	private readonly agentDir: string | null;
+	/** [pi-verdict local patch: project overrides] global-only length of prot.exact at
+	 *  construction time; reset() truncates back to this before appending the current
+	 *  session's trusted-project entries, so a project left behind by a cwd change does
+	 *  not linger protected. */
+	private readonly baseExactLen: number;
 
 	constructor(prot: ProtectedSet, userRules: UserRules = loadUserRules().rules, agentDir: string | null = null) {
 		this.prot = prot;
 		this.userRules = userRules;
 		this.agentDir = agentDir;
 		this.audit = this.makeAudit(userRules);
+		this.baseExactLen = prot.exact.length;
 	}
 
 	/** #54: the audit flag follows the rules (applies to new sessions); the dir is anchored to the install path */
@@ -1668,15 +1623,24 @@ export class SessionState {
 	}
 
 	/** 会话重置:重载用户规则(配置改动新会话生效)+ 按会话 cwd 重锚 denyPaths
-	 *  (ADR-0002: 每会话锚定一次)+ 清影子缓存;返回加载报告供表现层通知 */
-	reset(cwd: string): { skipped: string[]; shortcutWarning: string | null } {
-		const loaded = loadUserRules();
+	 *  (ADR-0002: 每会话锚定一次)+ 清影子缓存;返回加载报告供表现层通知
+	 *  [pi-verdict local patch: project overrides] also loads a trusted project override for
+	 *  cwd and re-derives the write-protected set: truncate back to the global-only base,
+	 *  then add this session's trustedProjects candidates + resolved project file (if any) */
+	reset(cwd: string): { skipped: string[]; shortcutWarning: string | null; project: { path: string; applied: boolean } | null } {
+		const loaded = loadUserRules(cwd);
 		this.userRules = loaded.rules;
 		this.denyPathBases = anchorDenyPaths(loaded.rules.denyPaths, cwd); // anchored to the session cwd, once (ADR-0002)
 		this.shadow.reset();
 		this.fallback.reset();
 		this.audit = this.makeAudit(loaded.rules);
-		return { skipped: loaded.skipped, shortcutWarning: loaded.shortcutWarning };
+		this.prot.exact.length = this.baseExactLen;
+		for (const f of loaded.protectPaths) {
+			for (const form of baseForms(f)) {
+				if (!this.prot.exact.includes(form)) this.prot.exact.push(form);
+			}
+		}
+		return { skipped: loaded.skipped, shortcutWarning: loaded.shortcutWarning, project: loaded.project };
 	}
 
 	/** denyPaths 基址:session_start 已锚定;此惰性回退仅守护乱序的首次 tool_call
@@ -1803,9 +1767,8 @@ async function runConfidenceCascade(
 /**
  * 判定管线(CONTEXT.md「判定管线」词条的实现):自保护 → 内置 floor → 用户 deny →
  * denyPaths ask → 用户 allow → 灰区分类器;ask 降级(无 UI → deny)与 fail-closed
- * 内建于此,两处重复的降级实现自此唯一。零 UI:表现(notify/confirm/select)由扩展
- * handler 按 source × degraded 模板呈现;变更检测(IntegrityWatch)是管线前置的
- * 独立关注点,不在 adjudicate 内。导出仅为测试(内部 seam 的测试面,#35 既有模式)。
+ * 内建于此,两处重复的降级实现自此唯一。零 UI:表现(notify/confirm)由扩展
+ * handler 按 source × degraded 模板呈现。导出仅为测试(内部 seam 的测试面,#35 既有模式)。
  */
 /** [pi-verdict local patch: autoDeny] reason suffix on asks that would have been auto-denies */
 const AUTO_DENY_OFF_SUFFIX = " (autoDeny is off: this would have been denied — your call)";
@@ -1949,16 +1912,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	let enabled = pi.getFlag("auto-mode") !== false;
 	const debug = pi.getFlag("auto-mode-debug") === true || process.env.PI_AUTO_MODE_DEBUG === "1";
-	// 会话态与门禁完整性监视:复位清单各归 SessionState.reset / IntegrityWatch.startSession
+	// 会话态:复位清单归 SessionState.reset(自保护写保护常驻 prot.exact/prefixes/bashPatterns,不依赖 tamper watch)
 	const state = new SessionState(buildProtectedSet(agentDirPath(), OWN_FILE_PATH), undefined, agentDirPath());
-	const integrity = new IntegrityWatch(state.prot.watchBases);
-
-	/** 篡改处置呈现:还原 + fail-closed 的本地通知(含文件清单与原因) */
-	function presentTamper(changed: Array<{ file: string; kind: WatchKind }>, ctx: ExtensionContext, cause: string): { block: true; reason: string } {
-		const r = integrity.restoreAndFailClose(changed, cause);
-		ctx.ui.notify(`🛡️ pi-verdict TAMPER DETECTED${cause ? ` (${cause})` : ""}: ${r.files} modified bypassing the gate; restored from session snapshot where possible. Fail-closed for the rest of this session — review the file(s) and restart the session.`, "warning");
-		return { block: true, reason: blockedReason("tamper", r.reason) };
-	}
 
 	/** Verdict → UI(本扩展唯一的裁决呈现点):按 source × degraded 查模板,文案与
 	 *  重构前逐字节一致。受保护路径分支的通知永不携带路径明文与 action 行
@@ -2023,15 +1978,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 
 	// session_start:重置影子缓存(会话内存态,#5 定案)+ 重载用户规则(配置改动新会话生效)
-	// + 重建自保护基线(ADR-0001:受保护文件的会话启动快照)
 	pi.on("session_start", async (_event, ctx) => {
 		const report = state.reset(ctx.cwd);
-		integrity.startSession();
 		state.audit?.prune(); // #54: converge to the AUDIT_KEEP_SESSIONS most recent files at session start
 		if (report.skipped.length > 0) {
-			ctx.ui.notify(`pi-verdict: skipped ${report.skipped.length} invalid config value(s) in config (${userConfigPath()}): ${report.skipped.join(", ")}`, "warning");
+			ctx.ui.notify(`pi-verdict: skipped ${report.skipped.length} invalid config value(s) in config (${userConfigPath()}${report.project?.applied ? ` + ${report.project.path}` : ""}): ${report.skipped.join(", ")}`, "warning");
 		}
 		if (report.shortcutWarning) ctx.ui.notify(`pi-verdict: ${report.shortcutWarning}`, "warning");
+		if (report.project?.applied) ctx.ui.notify(`pi-verdict: project overrides applied from ${report.project.path}`, "info");
 		refreshStatus(ctx);
 	});
 
@@ -2165,36 +2119,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 		const input = event.input as Record<string, unknown>;
 		const action = describeAction(event.toolName, input);
-
-		// 第 0 层前置:变更检测(ADR-0001)——篡改后本会话恒 deny(fail-closed)
-		if (integrity.tampered) {
-			ctx.ui.notify(`🛡️ Auto Mode blocked: self-protection fail-closed (tamper detected this session; restart to reset)\n  ${action}`, "warning");
-			return { block: true, reason: blockedReason("tamper", "self-protection: fail-closed until session restart (protected file was tampered with)") };
-		}
-		const changed = integrity.detect();
-		if (changed.length > 0) {
-			// 差分处置(ADR-0001 定稿 D):仅 config 变化且有 UI → select 双选(选项即动作);
-			// 扩展副本被改 / 无 UI → 一律还原 + fail-closed。
-			// 用户合法的会话中手工编辑经「保留」一次确认即重建基线、会话照常
-		// (新配置照旧下一会话生效);无条件自动还原会把长驻会话变成
-		// 「用户永远无法修改配置」,与「仅用户可改」的设计初衷相悖。
-			if (ctx.hasUI && changed.every((c) => c.kind === "config")) {
-				// select 双选:选项文案即按钮(避免 confirm 固定 Yes/No 的映射歧义);
-				// 关闭对话框(Esc → undefined)无人背书,取安全侧同 Decline
-				const choice = await ctx.ui.select(
-					"🛡️ pi-verdict: PROTECTED CONFIG CHANGED",
-					[CONFIG_ACCEPT_CHOICE, CONFIG_DECLINE_CHOICE],
-				);
-				if (choice === CONFIG_ACCEPT_CHOICE) {
-					integrity.rebaseline(); // 重建基线
-					ctx.ui.notify("pi-verdict: config change accepted — new baseline taken; applies to new sessions as usual", "info");
-				} else {
-					return presentTamper(changed, ctx, choice === undefined ? "config dialog dismissed" : "config change declined by user");
-				}
-			} else {
-				return presentTamper(changed, ctx, "");
-			}
-		}
 
 		// 判定管线(零 UI)→ 呈现(source × degraded 模板)
 		const verdict = await adjudicate(state, { toolName: event.toolName, input }, {

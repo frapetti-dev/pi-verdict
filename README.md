@@ -12,7 +12,7 @@
 - Built-in danger rules and your own allow/deny rules settle the clear cases first, at zero latency
 - Everything else goes to a model classifier that sees the conversation context
 - Any uncertainty or failure fails closed; nothing ever runs silently
-- Self-protection: the gate guards itself against snooping and tampering
+- Self-protection: the gate's own config and installed copy are agent-write-denied — edit them yourself, outside the gate
 
 ## The problem
 
@@ -141,7 +141,7 @@ jev's calibrated confidence is exactly what the confidence floor keys on — pai
 The gate's own files — the config and the installed extension copy — are **user-editable only**: writes from inside the gate hard-deny (reads pass); your editor never passes through the gate, the sudoers/visudo precedent.
 
 - **Not disableable by any config** — `builtinDenyFloor: false` and user `allow` rules cannot touch this layer
-- **Tamper detection** as the backstop: watched files are snapshotted at `session_start` and re-verified before every verdict — a changed extension copy is auto-restored and the session goes fail-closed; a changed config gets one explicit keep/restore confirm ([ADR-0001](docs/adr/0001-self-protection-layer.md) for the differential-disposal rationale)
+- No runtime tamper-detection backstop: a bypass that edits the installed file directly (outside any pi/omp tool call) is not detected or reverted. Removed (local patch) because a shared installed copy across concurrent sessions made the in-memory snapshot backstop revert a legitimate manual edit and permanently fail-close a session that never touched the file itself; write-deny (above) remains the actual guarantee.
 
 Requires pi ≥ 0.84. Works in interactive and non-interactive (`-p`/json/rpc) sessions; in non-interactive modes `ask` degrades to `deny`.
 
@@ -164,9 +164,7 @@ Honest framing: pi-automode and pi-verdict have **converged on the same architec
 tool_call
   │
   ├─ 0. Self-protection layer (ADR-0001; not disableable by any config)
-  │     ├─ write/edit/bash touching the gate's own files → deny; reads pass
-  │     └─ tamper detection: re-verify before every verdict →
-  │         auto-restore + fail-closed, or one keep/restore confirm
+  │     └─ write/edit/bash touching the gate's own files → deny; reads pass
   │
   ├─ 1. Rule layer (deterministic, zero latency)
   │     ├─ built-in deny floor: bash danger regexes + path sensitivity S0–S5
@@ -213,7 +211,7 @@ Design decisions here are settled by measurement, and the lab notes ship with th
 - shadow cache is observe-only by decision; the serving switch is a one-line change once measured hit rates justify it
 - `denyPaths` bash extraction is token-level ([ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md)): command substitution, base64-embedded paths and external script contents produce no hit signal — those calls fall back to the classifier's existence-hint vigilance. MCP and custom tools bypass the extractor entirely (their gray-zone adjudication still carries the hint). Path normalization is base-tier only (ADR-0002): a nonexistent target written through a symlinked directory rebuilds no real form and produces no hit — that indirection falls to the hint vigilance too (the ancestor-rebuilding tier applies to the self-protection layer and the sensitivity floor, not denyPaths). Honest framing, same as the self-protection substring precedent: the deterministic layer is obfuscatable, which is exactly why a hit routes to *you* rather than silently deciding
 - `denyPaths` bash tokens contain no spaces: a *declared* path containing spaces cannot be spelled in a bash command in a way the extractor sees — `cat "/path with space/x"` splits into two tokens and never hits (file tools still hit, their path is not tokenized). A glob covering the final segment of a base (`cat /proj/pers*` against `denyPaths: ["/proj/personal"]`) also misses — the base's own name never appears literally. A recursive search issued from a shell misses in both spellings — no path argument (defaults to the cwd, e.g. a bare `rg foo`) or a parent-directory argument (`rg foo <parent-of-a-declared-path>`): an argument-less command contributes no token at all and bash tokens otherwise compare one-directionally, while the file tools' bidirectional subtree compare covers the same shapes issued through `grep`/`find`/`ls`. All three holes fall back to the classifier's existence hint, alongside substitution/base64 above
-- self-protection bash matching is substring regex — obfuscatable; the tamper-detection backstop catches within-session bypasses, but a cross-session baseline (hash + change confirmation at startup, incl. upgrade UX) is phase 2 per [ADR-0001](docs/adr/0001-self-protection-layer.md)
+- self-protection bash matching is substring regex — obfuscatable, with no runtime tamper-detection backstop (removed, see [ADR-0001](docs/adr/0001-self-protection-layer.md) amendment); write-deny on the gate's own files is the actual guarantee against agent-initiated edits
 - dev checkouts (running the extension from a repo, not `<agentDir>/extensions/`) are not self-protected — the installed copy the *next* normal session loads is only covered by its own sessions' gate
 
 **verdict is not a sandbox.** It runs inside the pi process and adjudicates tool calls; it does not contain malicious code, protect against a compromised process, or guard manual `!` shell escapes. For isolation, use an OS-level sandbox.

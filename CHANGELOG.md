@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 - `autoDeny` config key (default `true`): `false` converts every auto-review deny (danger floor, `deny` rules, classifier deny, fail-closed) into an interactive confirmation; the self-protection layer stays a hard deny and non-interactive sessions still deny. The confirm dialog labels the source (`Rule` / `Fail-closed` / `Classifier opinion`).
 - `rules` config key (default `[]`): user-authored free-text rules appended to the classifier system prompt and forwarded to the jev decisions adapter as extra verdict instructions; applicable rules take precedence over default criteria.
+- `trustedProjects` config key (default `[]`): lists project roots allowed to override the global config per-session. A trusted root's `<root>/.pi/pi-verdict.json` (`.omp/…` on omp) is discovered by walking up from cwd and shallow-merged over the global config (all keys except `trustedProjects`/`toggleShortcut`); both the candidate and resolved project files join the self-protection write-deny set for the session, and untrusted project files are ignored with a skip warning.
+
+### Removed
+
+- Runtime change-detection backstop (ADR-0001 §4, `IntegrityWatch`): the session-start snapshot + per-verdict re-verification that auto-restored a tampered extension copy or asked to keep/restore a changed config is gone. A shared installed copy across concurrent sessions made the in-memory snapshot revert a legitimate manual edit made by another session and permanently fail-close a session that never touched the file — the hard write-deny (agent writes to the gate's own files always deny; ADR-0001 §1–3) remains and is unaffected. See the ADR-0001 amendment for the full rationale.
 
 ### Fixed
 

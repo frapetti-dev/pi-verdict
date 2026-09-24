@@ -42,7 +42,7 @@ Path decisions use canonical filesystem identity, not lexical strings: lexical +
 
 ### 8. The gate guards itself
 
-The agent must not be able to rewrite the gate and immediately benefit from the rewrite. The self-protection layer ([ADR-0001](./adr/0001-self-protection-layer.md)) — not disableable by any configuration — protects the user-rules config and the extension's own installed copies (pi and omp install forms), with tamper detection as the backstop for rule-layer bypasses (#26, #35).
+The agent must not be able to rewrite the gate and immediately benefit from the rewrite. The self-protection layer ([ADR-0001](./adr/0001-self-protection-layer.md)) — not disableable by any configuration — protects the user-rules config and the extension's own installed copies (pi and omp install forms) with a hard write-deny; there is no runtime tamper-detection backstop (removed, see the ADR-0001 amendment — a shared installed copy across concurrent sessions made the in-memory snapshot backstop revert legitimate manual edits).
 
 ### 9. User policy may restrict, and may only weaken by explicit opt-in
 

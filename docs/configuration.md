@@ -20,7 +20,8 @@ Everything the gate reads from disk lives in `<agentDir>/config/pi-verdict.json`
   "autoDeny": true,
   "classifierModel": null,
   "toggleShortcut": "ctrl+shift+a",
-  "rules": []
+  "rules": [],
+  "trustedProjects": []
 }
 ```
 
@@ -39,6 +40,7 @@ Everything the gate reads from disk lives in `<agentDir>/config/pi-verdict.json`
 - `classifierFallbackModel: "provider/model-id"` adds an opt-in **second-layer classifier** consulted on exactly two occasions: a **demotion** (confidence below `classifierMinConfidence`) and a **fail-closed** first layer. It gets its own 15s-per-attempt budget (the two-tier retry can double it, mirroring the first layer's per-attempt 25s) and, unlike jev, receives the denyPaths existence hint. Resolution is config-only and never falls back to the session model; an unresolvable model warns once per session. High-confidence asks no longer consult it — a confident ask goes straight to you.
 - `classifierFallbackMode: "shadow"` (default) — the second layer **records its opinion** (audit `fallback` sub-object + `/automode` counters: `triggered · agreed · would-overrule · errored`) and never changes any verdict: a demoted call is asked of you, a fail-closed deny stands. `"enforce"` — the second layer **adjudicates de novo**, with exactly one carve-out: a demoted first-layer **deny** that the second layer would allow is asked of you instead (never an automatic allow; headless degrades to deny). A failed or unresolvable fallback on a cascaded call falls to you as well — the tier that was to adjudicate is down (headless → deny, one-time warning). Audit reading: the top level keeps **first-layer semantics** (records of non-interactive asks — native, demoted, escalated — carry their effective deny, per the standing convention), `demoted: true` marks floor fires, and the applied verdict lives in `fallback.effective` (enforce rows, failure rows carry the `"ask"` you got). Shadow→enforce flip is a human decision after shadow data ([criteria](adr/0004-classifier-fallback-cascade.md)); config-only, new-session semantics.
 - `rules: ["…"]` are free-text classification rules appended to every classifier prompt (LLM classifiers and the jev adapter, where they extend the verdict question's instructions). Where a rule applies, it takes precedence over the classifier's default criteria. Non-string or empty entries are skipped with a warning.
+- `trustedProjects: ["/abs/path", "~/repo"]` lists project roots (absolute or `~`-relative) allowed to override this config per-session. When a session's cwd sits under a listed root, the gate walks up from cwd looking for `<root>/.pi/pi-verdict.json` (`.omp/pi-verdict.json` on omp — the dot-dir matches whichever host tree this config lives in), stopping before your home dir and before the agent tree's own root. A found file is shallow-merged over the global config for that session — every key except `trustedProjects` and `toggleShortcut` (never per-project overridable) and `_hint`. A project file outside `trustedProjects` is ignored with a skip warning naming the file; both the trusted-root candidate files and any resolved project file are added to the self-protection set for the session (agent writes denied, same as the global config).
 
 ## Why no built-in allowlist?
 
