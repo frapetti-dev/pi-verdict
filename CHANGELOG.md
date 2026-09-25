@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Fixed
+
+- README / README.zh-CN.md install instructions: `pi install`/`omp plugin install` now reference the scoped `@frapetti-dev/pi-verdict` package, and note that GitHub Packages requires an authenticated npm client (`.npmrc` scope mapping + a `read:packages` token) even for public packages, unlike npmjs.com.
+
 ## [0.12.1] - 2026-09-25
 
 ### Changed

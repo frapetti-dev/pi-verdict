@@ -46,12 +46,21 @@ Full statement in [docs/security-principles.md](docs/security-principles.md).
 
 ## Quick start
 
-```bash
-# install from npm (pi):
-pi install npm:pi-verdict
+Published on the GitHub Package Registry as `@frapetti-dev/pi-verdict` (not npmjs.com). GitHub Packages requires an authenticated npm client even for public packages, so first point the scope at it and supply a token with `read:packages` — add to `~/.npmrc`:
 
-# install from npm (oh-my-pi / omp):
-omp plugin install npm:pi-verdict
+```
+@frapetti-dev:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
+
+(`GITHUB_TOKEN` here is a personal access token — classic or fine-grained with `read:packages` — exported in your shell, or hardcode it in `~/.npmrc` instead of the env-var form.)
+
+```bash
+# install from GitHub Packages (pi):
+pi install npm:@frapetti-dev/pi-verdict
+
+# install from GitHub Packages (oh-my-pi / omp):
+omp plugin install npm:@frapetti-dev/pi-verdict
 
 # or directly from git — try it once
 pi --extension ./extensions/pi-verdict.ts
@@ -64,7 +73,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 
 | | pi | omp |
 |---|---|---|
-| install | `pi install npm:pi-verdict` | `omp plugin install npm:pi-verdict` |
+| install | `pi install npm:@frapetti-dev/pi-verdict` | `omp plugin install npm:@frapetti-dev/pi-verdict` |
 | extension copy | `~/.pi/agent/extensions/` | `~/.omp/plugins/node_modules/pi-verdict/` (omp 18.1+; ≤18.0: under `agent/`) |
 | user rules | `~/.pi/agent/config/pi-verdict.json` | `~/.omp/agent/config/pi-verdict.json` |
 | credential file (S0 hard deny) | `~/.pi/agent/auth.json` | `~/.omp/agent/auth.json` |
@@ -121,7 +130,7 @@ No built-in allowlist — every "always allow" claim is yours ([why](docs/config
 
 ### Jev decisions backend (experimental — [ADR-0003](docs/adr/0003-jev-decisions-adapter.md))
 
-1. Install a version that ships the adapter (v0.8+): `pi install npm:pi-verdict`
+1. Install a version that ships the adapter (v0.8+): `pi install npm:@frapetti-dev/pi-verdict`
 2. Pick a transport (both serve the same decisions wire contract):
    - **OpenRouter (default)**: run `/login openrouter` inside pi, or `export OPENROUTER_API_KEY=sk-or-v1...` in your shell
    - **TypeSafe direct (official v1 API)**: grab a self-service key at console.typesafe.ai, then `export TYPESAFE_API_KEY=apikey_...` and `export PI_VERDICT_JEV_TRANSPORT=typesafe`

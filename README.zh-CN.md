@@ -47,12 +47,21 @@ pi-verdict 补上这道缺失的门禁, 由模型基于上下文和你的意图�
 
 ## 快速开始
 
-```bash
-# 从 npm 安装(pi):
-pi install npm:pi-verdict
+已发布到 GitHub Package Registry,包名为 `@frapetti-dev/pi-verdict`(不在 npmjs.com 上)。GitHub Packages 即使对公开包也要求 npm 客户端携带身份验证,先在 `~/.npmrc` 中把该 scope 指向它并提供一个具备 `read:packages` 权限的 token:
 
-# 从 npm 安装(oh-my-pi / omp):
-omp plugin install npm:pi-verdict
+```
+@frapetti-dev:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
+
+(`GITHUB_TOKEN` 是一个 personal access token——classic 或 fine-grained 均可,需要 `read:packages` 权限——可导出到 shell 环境变量,或直接把 token 明文写进 `~/.npmrc` 代替环境变量写法。)
+
+```bash
+# 从 GitHub Packages 安装(pi):
+pi install npm:@frapetti-dev/pi-verdict
+
+# 从 GitHub Packages 安装(oh-my-pi / omp):
+omp plugin install npm:@frapetti-dev/pi-verdict
 
 # 或直接从源码 —— 试用一次
 pi --extension ./extensions/pi-verdict.ts
@@ -65,7 +74,7 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
 
 | | pi | omp |
 |---|---|---|
-| 安装 | `pi install npm:pi-verdict` | `omp plugin install npm:pi-verdict` |
+| 安装 | `pi install npm:@frapetti-dev/pi-verdict` | `omp plugin install npm:@frapetti-dev/pi-verdict` |
 | 扩展副本 | `~/.pi/agent/extensions/` | `~/.omp/plugins/node_modules/pi-verdict/`(omp 18.1+;≤18.0 在 `agent/` 下) |
 | 用户规则 | `~/.pi/agent/config/pi-verdict.json` | `~/.omp/agent/config/pi-verdict.json` |
 | 凭据文件(S0 硬 deny) | `~/.pi/agent/auth.json` | `~/.omp/agent/auth.json` |
@@ -123,7 +132,7 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
 
 ### Jev 决策后端(实验性——[ADR-0003](docs/adr/0003-jev-decisions-adapter.md))
 
-1. 安装含适配器的版本( v0.8 及以上):  `pi install npm:pi-verdict`
+1. 安装含适配器的版本( v0.8 及以上):  `pi install npm:@frapetti-dev/pi-verdict`
 2. 选一条 transport(两条走同一 decisions wire 契约):
   - **OpenRouter(默认)**: pi 内执行 `/login openrouter`,或 shell 里 `export OPENROUTER_API_KEY=sk-or-v1...`
   - **TypeSafe 直连(官方 v1 API)**: 在 console.typesafe.ai 自助发 key,然后 `export TYPESAFE_API_KEY=apikey_...` 并 `export PI_VERDICT_JEV_TRANSPORT=typesafe`
