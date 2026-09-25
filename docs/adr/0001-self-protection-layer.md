@@ -1,46 +1,54 @@
-# 0001 - 自保护层:门禁完整性优先于配置豁免
+# 0001 - Self-protection layer: gate integrity over configuration exemption
 
 ---
-status: accepted
+status: superseded (2026-09-25: self-protection layer fully removed — see final revision below)
 date: 2025-08-27
 ---
 
-## 背景
+## Background
 
-pi-verdict 的安全边界(规则层 + 分类器)由运行在 agent 进程内的扩展构成,而其配置文件 `config/pi-verdict.json` 与扩展安装副本都落在被守护的 agent 写权限之内。当前两者写入均为灰区 → 分类器判定:提示注入只需说服分类器放行一次写入,即可清空 `deny`、翻转 `builtinDenyFloor`,甚至改写门禁源码自身——下一会话门禁即空门或归攻击者所有。一个能被其守护对象关闭或改写的门禁,其「风险自担」声明本身不可信。
+pi-verdict's security boundary (rule layer + classifier) is implemented by an extension running inside the agent process, and both its config file `config/pi-verdict.json` and the extension's own installed copy sit within the agent write permissions that boundary is meant to guard. With both writes classified as gray-zone → classifier judgment, a prompt injection needs only to convince the classifier to allow one write to clear `deny`, flip `builtinDenyFloor`, or rewrite the gate's own source — the next session's gate is then empty or owned by the attacker. A gate that can be turned off or rewritten by what it is guarding cannot credibly claim "risk accepted by the user."
 
-## 决策
+## Decision
 
-1. 引入**自保护层**(self-protection layer):不可经任何配置豁免的内置 deny 规则集;`builtinDenyFloor: false` 的语义收窄为只关闭危险正则与路径敏感度,**不能**关闭自保护层。
-2. 保护范围:`pi-verdict.json` + 扩展安装副本。副本以运行时自锚定(`import.meta.url`)定位,覆盖单文件与 npm 目录两种安装形态,随 `PI_CODING_AGENT_DIR` 重定向自动跟随。
-3. 处置语义:**硬 deny**,reason 指引用户手工编辑;读取放行。依据:门禁内一切写入按定义均由 agent 发起,故 deny 即等价于「仅用户可改」(用户经编辑器的修改不经门禁)。
-4. 纵深(变更检测):一期做会话内检测——启动快照全文,每次裁决前复核;处置按文件差分:
-   - **扩展副本**被改:一律从快照自动还原 + 本会话 fail-closed;
-   - **`pi-verdict.json`** 被改:交互模式经 `ctx.ui.select` 双选(选项文案即动作,消除 Yes/No 映射歧义)由用户裁决——「Accept」= 重建基线、会话照常(新配置照旧下一会话生效),「Decline」= 回滚 + fail-closed,关闭对话框等同 Decline(安全侧);无 UI(headless)无人可问,取安全侧同副本处置。
-   跨会话基线(持久哈希、启动比对与确认 UX)二期。
+1. Introduce a **self-protection layer**: a built-in deny rule set not exemptable by any configuration; `builtinDenyFloor: false` narrows to only turning off the danger regexes and path sensitivity grading, and **cannot** turn off the self-protection layer.
+2. Protected scope: `pi-verdict.json` + the extension's installed copy. The copy is located via runtime self-anchoring (`import.meta.url`), covering both single-file and npm-directory install forms, and follows `PI_CODING_AGENT_DIR` redirection automatically.
+3. Disposition semantics: **hard deny**, with the reason pointing the user to manual edits; reads pass. Rationale: any write inside the gate is by definition agent-initiated, so deny is equivalent to "user-editable only" (the user's own editor edits never go through the gate).
+4. Depth (tamper detection): phase one does in-session detection — a full snapshot at startup, re-checked before every verdict; disposition is per-file diff:
+   - **Extension copy** changed: always auto-restored from the snapshot + this session fail-closes;
+   - **`pi-verdict.json`** changed: in interactive mode, a `ctx.ui.select` two-choice prompt (the option text is the action, removing Yes/No mapping ambiguity) lets the user adjudicate — "Accept" = rebuild the baseline and continue the session as usual (the new config still applies from the next session), "Decline" = roll back + fail-close, closing the dialog counts as Decline (the safe side); headless (no UI) has no one to ask, so it takes the safe side, same disposition as the extension copy.
+   Cross-session baselining (persistent hash, startup comparison and confirm UX) is phase two.
 
-## 考虑过的替代方案
+## Alternatives considered
 
-- **挂在 `builtinDenyFloor` 开关下(可关)**:自指失败——注入一步改配置关 floor,下一步任意妄为;「用户主权」变成「攻击者主权」。用户主权豁免的对象应是「我的系统的风险」,不是门禁自身的完整性。
-- **ask 而非 deny**:交互确认在注入场景下依赖用户逐条火眼金睛,橡皮图章风险真实;配置本就新会话生效、`_hint` 引导手工编辑,agent 代改收益小。sudoers 必须经 visudo 是同构先例。
-- **OS 级加固(chflags / 独立 uid)**:同 uid 可解 immutable 旗标;独立 uid 过重;且两者都无法干净表达「用户可改、agent 不可改」——该区分只存在于门禁层。
-- **仅规则层、不做检测**：命令串正则可被混淆绕过，MCP/自定义工具不经规则层，纯 deny 只是「提高门槛」而非「保证」，故检测兜底为必要组成。
-- **config 篡改无条件自动还原(初版实现)**:运行中的 pi 会把用户的合法手工编辑也回滚并砖掉会话——长驻会话下等于「用户永远无法修改配置」,与「仅用户可改」的设计初衷相悖。
-- **config 篡改纯警告不还原**:警告可能被刷走/忽略,被篡改配置(如 `allow:[".*"]` + `builtinDenyFloor:false`)静默接管下一会话,无强制注意机制——故采用确认式:一次罕见且语义严重的弹窗兼作强制注意与用户裁决。
-- **将 `~/.pi/agent/` 全域（mcp.json、settings.json、skills/、git/ 等）纳入保护**：显式否决。该面是 pi 宿主与用户的代理配置面，agent 代装 skill、代改 MCP 配置是合法日常操作，门禁扩展越权保护即替用户做主权决定；需要该层保护的用户应经用户规则自配 deny 正则表达，不属本扩展的完整性边界。
+- **Gate it behind the `builtinDenyFloor` switch (disableable)**: self-defeating — an injection turns the floor off in one config change and does whatever it wants next; "user sovereignty" becomes "attacker sovereignty." User-sovereignty exemptions should apply to "risk to my own system," not to the gate's own integrity.
+- **ask instead of deny**: interactive confirmation under an injection scenario depends on the user catching every prompt with perfect vigilance — rubber-stamping risk is real; the config already applies to new sessions and the `_hint` guides manual edits, so letting the agent edit it on the user's behalf buys little. sudoers requiring visudo is the isomorphic precedent.
+- **OS-level hardening (chflags / a separate uid)**: the same uid can clear an immutable flag; a separate uid is too heavyweight; and neither cleanly expresses "user can change it, agent cannot" — that distinction only exists at the gate layer.
+- **Rule layer only, no detection**: command-string regexes are obfuscatable, MCP/custom tools never go through the rule layer, and a pure deny only "raises the bar" rather than "guaranteeing" it — so a detection backstop is a necessary component.
+- **Unconditional auto-restore on config tampering (initial implementation)**: a running pi would also roll back and brick the session on the user's own legitimate manual edits — under a long-lived session this amounts to "the user can never modify the config," contradicting the "user-editable only" design intent.
+- **Warn-only on config tampering, no restore**: a warning can be scrolled past or ignored; a tampered config (e.g. `allow:[".*"]` + `builtinDenyFloor:false`) silently takes over the next session with no forced-attention mechanism — hence the confirm-style approach: one rare, semantically serious dialog doubles as forced attention and user adjudication.
+- **Bring the whole `~/.pi/agent/` tree (mcp.json, settings.json, skills/, git/, etc.) into scope**: explicitly rejected. That surface is the pi host's and the user's own agent-configuration surface; the agent installing skills or editing MCP config on the user's behalf is legitimate day-to-day work, and the gate extension overreaching into it would substitute the extension's judgment for the user's own sovereignty. A user who wants that surface protected should express it through their own user-rules deny regex — it is not this extension's integrity boundary.
 
-## 后果
+## Consequences
 
-- `builtinDenyFloor` 语义收窄,README/模板 `_hint`/代码头注释需同步。
-- agent 永远不能代管该配置(含「帮我改下 classifierModel」类请求);用户需手工编辑。
-- 会话中手工修改 `pi-verdict.json` 会触发一次确认:保留即重建基线(会话照常),拒绝则还原;headless 下修改一律还原——请避免在有 headless 会话运行时编辑该文件;扩展副本的会话中变更(无论来源)一律还原 + fail-closed。
-- 扩展升级等合法变更依赖「新会话生效」流程;二期的跨会话基线将补上隔会话篡改盲区与升级确认 UX。
-- 检测非实时保证(复核窗口外的异步修改最迟在下一次复核或二期基线发现),文档须诚实标注。
+- `builtinDenyFloor` semantics narrow — the README, the config template `_hint`, and the code header comment must stay in sync.
+- The agent can never manage this config on the user's behalf (including requests like "update classifierModel for me"); the user must edit it manually.
+- A manual mid-session edit to `pi-verdict.json` triggers one confirmation: keep it and the baseline is rebuilt (session continues as usual), decline and it is rolled back; headless always rolls back on a change — avoid editing this file while a headless session is running; mid-session changes to the extension copy (regardless of source) always roll back + fail-close.
+- Legitimate changes such as extension upgrades rely on the "applies from the next session" flow; the phase-two cross-session baseline will close the cross-session tampering blind spot and add an upgrade-confirmation UX.
+- Detection is not a real-time guarantee (an asynchronous modification outside the re-check window is caught no later than the next re-check, or in phase two's baseline) — documentation must state this honestly.
 
-## 修订(local patch,2026-09-24):移除运行时变更检测
+## Revision (local patch, 2026-09-24): removed runtime tamper detection
 
-第 4 条的会话内变更检测(`IntegrityWatch`:启动快照 + 每次裁决前复核 + 扩展副本自动还原/配置双选)已移除,不再随扩展运行。原因:检测基线是进程内存态,同一安装副本被多个并发会话共享时,一个会话在快照之后对配置/副本的任何写入(包括用户经编辑器的合法手工修改)都会被另一个会话判定为「篡改」,触发自动还原或 fail-closed——把「仅用户可改」的设计意图,在多会话场景下变成了「用户的修改会被另一个不知情的会话撤销」。
+Item 4's in-session tamper detection (`IntegrityWatch`: full snapshot at startup + re-check before every verdict + auto-restore of the extension copy / two-choice config prompt) has been removed and no longer runs with the extension. Reason: the detection baseline is in-process memory state; when the same installed copy is shared across concurrent sessions, any write to the config/copy by one session after its snapshot (including the user's own legitimate manual edit through an editor) would be judged "tampering" by another session, triggering an auto-restore or fail-close — turning the "user-editable only" design intent, under multi-session use, into "the user's edit gets reverted by another session that never touched the file."
 
-第 1–3 条(自保护层本体:硬 deny、`builtinDenyFloor: false` 不可关闭、读放行)不受影响,继续常驻。写保护集合(`prot.exact`)现由 `SessionState` 每次 `reset()` 时按当前会话 `trustedProjects` 候选文件与已解析的项目覆盖文件重新派生(截断回构造期的全局基线长度后追加),不再依赖内存快照差分。
+Items 1–3 (the self-protection layer itself: hard deny, `builtinDenyFloor: false` cannot turn it off, reads pass) are unaffected and remain in effect. The write-protected set (`prot.exact`) is now re-derived by `SessionState` on every `reset()` from the current session's `trustedProjects` candidate files and any resolved project override file (truncated back to the construction-time global baseline length, then appended), no longer relying on in-memory snapshot diffing.
 
-本条修订记录的是**已发生的行为变更**,不追加二期跨会话基线计划——原第 20 条"跨会话基线二期"的动机(检测持久化绕过)随检测机制整体移除一并搁置。
+This revision records a **behavior change that has already happened** and does not add a phase-two cross-session baseline plan — the original item 20's "cross-session baseline, phase two" motivation (catching detection-persistence bypasses) is shelved along with the detection mechanism it was meant to back up.
+
+## Revision (2026-09-25): self-protection layer fully removed
+
+Items 1–3 (the self-protection layer itself: hard deny on the gate's own files, `builtinDenyFloor: false` unable to turn off this layer, reads passing) are now removed as well — this ADR's decision no longer runs with the extension. There is no longer any rule-layer disposition specifically protecting `pi-verdict.json` or the installed extension copy; agent writes to these files are now graded like any other file, through the ordinary rule layer + classifier, with no special exemption and no special block. Item 6 (the `#54` verdicts audit directory's read/write blocking) is removed along with it — it shared the same module.
+
+Reason for removal: the self-protection layer's value was already weakened once item 4's runtime tamper detection was removed (2026-09-24) — without a detection backstop, "hard deny on writes inside the gate" only stops paths that go through a pi/omp tool call; a direct rewrite of the installed file that bypasses tool calls entirely was already unaffected, and the bash-side substring-regex matching was already obfuscatable (see the original text above). Once the boundary had narrowed to "only blocking direct writes made through a tool call," the layer's actual security increment no longer justified the complexity it added to the development workflow (see AGENTS.md's now-historical "Gate self-reference" entry) and to multi-session/multi-project use (`trustedProjects`).
+
+Consequences: the gate's own files no longer carry runtime protection — a user who wants these paths protected can still declare them via `denyPaths` (ADR-0002's ask-terminal semantics, not this ADR's former hard deny). README, README.zh-CN.md, docs/configuration.md, docs/security-principles.md, and AGENTS.md have been updated to remove self-protection references accordingly. This ADR is kept as a historical record and is not deleted.

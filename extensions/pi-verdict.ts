@@ -6,14 +6,6 @@
  * inverted: pi defaults to allowing → this extension intercepts.
  *
  * Pipeline (tool_call hook):
- *   0. Self-protection layer (ADR-0001, cannot be exempted by any config): write/edit/bash
- *      touching the gate's own files (pi-verdict.json + the installed extension
- *      copy) → hard deny, reads pass; builtinDenyFloor:false cannot turn it off,
- *      user allow cannot override it. No runtime tamper-detection backstop: a
- *      bypass that edits the installed file directly (outside any pi/omp tool
- *      call) is not detected or reverted — removed because an unrelated session
- *      sharing the same installed copy would otherwise revert a legitimate
- *      manual edit and permanently fail-close itself for a file it never touched.
  *   1. Rule layer (built-in deny floor + user declarations):
  *      - built-in floor: bash danger regexes + path sensitivity S0-S5 → hard deny
  *        (on by default; builtinDenyFloor:false turns the whole floor off, at your
@@ -66,9 +58,7 @@
  *                                   denyPaths: [path], builtinDenyFloor,
  *                                   classifierModel, toggleShortcut }
  *                                   match target: bash = full command string /
- *                                   file tools = absolute path; new session applies;
- *                                   protected by the self-protection layer (the
- *                                   agent cannot edit it, only the user by hand)
+ *                                   file tools = absolute path; new session applies
  *
  * Known prototype simplifications (see README "Status & limitations"):
  *   - no built-in bash allowlist; danger detection is regex floor (no AST parsing)
@@ -123,8 +113,6 @@ interface RuleResult {
 	 *  context: block reasons and notifications travel back to the model, so only the
 	 *  local confirm dialog may show it (ADR-0002 story: zero path plaintext leaves the machine). */
 	detail?: string;
-	/** set only by selfProtectCheck — exempt from autoDeny:false */
-	selfProtect?: true;
 }
 
 /** Cap the danger-regex matching input (#25): the prefix-consuming character
@@ -152,7 +140,7 @@ function classifyBash(command: string, floorOn: boolean): RuleResult {
 /**
  * 基础档(ADR-0002):词法绝对形 + 整路径 realpath 形(realpath 解析 symlink
  * 间接;失败——目标不存在、glob token——降级为仅词法形)。denyPaths 与一切
- * 「基址侧」双形集合(cwd 基址、agentDir、安装根、受保护集合、基线快照)走这一档。
+ * 「基址侧」双形集合(cwd 基址、agentDir、安装根)走这一档。
  */
 function baseForms(p: string): string[] {
 	const out = [p];
@@ -168,7 +156,7 @@ function baseForms(p: string): string[] {
 /**
  * 祖先重建档(#20):基础形之外,目标尚不存在时自最近存在祖先的 realpath 逐级
  * 重建真实形——symlink 别名即使最终段不存在也暴露其真实位置。误放行代价高的
- * 判定(自保护层、路径敏感度 floor)走这一档;denyPaths 不升档(ADR-0002)。
+ * 判定(路径敏感度 floor)走这一档;denyPaths 不升档(ADR-0002)。
  */
 function rebuiltForms(abs: string): string[] {
 	const out = new Set<string>([abs]);
@@ -191,7 +179,7 @@ function rebuiltForms(abs: string): string[] {
 /** Case-insensitive filesystems (default macOS APFS, Windows) compare path strings
  *  case-folded; realpath already normalizes case whenever it resolves, this covers
  *  the lexical-only forms of nonexistent targets (#21). Linux stays case-sensitive.
- *  折叠比较仅 denyPaths 消费(S-rules 的比较纪律在正则 /i、自保护层在精确匹配
+ *  折叠比较仅 denyPaths 消费(S-rules 的比较纪律在正则 /i
  *  ——各自持有,不因本模块统一,见双形匹配词条)。 */
 const CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
 const fold = (s: string): string => (CASE_INSENSITIVE_FS ? s.toLowerCase() : s);
@@ -206,7 +194,7 @@ const pathStartsWith = (child: string, base: string): boolean => fold(child).sta
 // 匹配目标:bash/powershell = 完整命令串;read/write/edit/grep/find/ls = 解析后绝对路径;
 // 其余工具(MCP/自定义,如 ask/propose_commit/propose_changelog/todo)默认恒走分类器——
 // tools 是这一族的精确 tool 名例外声明:命中即直接 allow,越过分类器(不途经
-// self-protection / built-in floor / denyPaths,这些本就不覆盖这一族)。
+// built-in floor / denyPaths,这些本就不覆盖这一族)。
 // 优先级:内置 deny floor → 用户 deny → 用户 allow → gray;floor 默认开,可经 builtinDenyFloor:false 关闭。
 // 非法正则跳过并通知(配置错误不导致扩展失效);新会话生效。
 // ============================================================================
@@ -215,7 +203,7 @@ const pathStartsWith = (child: string, base: string): boolean => fold(child).sta
 // 主开关 toggle 快捷键(#15)
 //
 // 与 /automode 命令语义等价:同一翻转入口,不因操作面引入额外规则
-// (运行中生效 / 无确认弹窗 / 无持久化写回——写回会模糊 ADR-0001 的「仅用户手编」边界)。
+// (运行中生效 / 无确认弹窗 / 无持久化写回——写回会模糊「仅用户手编」边界)。
 // 反馈静默:footer 始终显示(auto-mode 双态)是唯一反馈,不 notify。
 // 键位:config 的 toggleShortcut 字段,缺省 ctrl+shift+a(与 pi 全部默认键位无冲突,
 // 双修饰降误触,避开依赖 Kitty 协议的 super);null/空串禁用;新会话生效。
@@ -258,11 +246,11 @@ interface UserRules {
 	deny: RegExp[];
 	/** User-declared protected paths (ADR-0002): plain paths, tool-owned normalization; hit → ask */
 	denyPaths: string[];
-	/** [tools allowlist] exact tool-name allowlist for the MCP/custom family (toolKind() === null, e.g. "ask", "propose_commit", "propose_changelog") — a case-sensitive exact match on the tool's registered name bypasses the classifier and returns allow directly. Does not touch self-protection, the built-in floor, or denyPaths (none of those cover this family either). Empty = unchanged default (always classifier). Config key: "tools". */
+	/** [tools allowlist] exact tool-name allowlist for the MCP/custom family (toolKind() === null, e.g. "ask", "propose_commit", "propose_changelog") — a case-sensitive exact match on the tool's registered name bypasses the classifier and returns allow directly. Does not touch the built-in floor or denyPaths (none of those cover this family either). Empty = unchanged default (always classifier). Config key: "tools". */
 	tools: string[];
 	/** 内置 deny floor 开关(危险正则 + 路径敏感度 deny),默认 true;关闭后依赖用户规则与分类器 */
 	builtinDenyFloor: boolean;
-	/** [pi-verdict local patch: autoDeny] false → auto-review denies become interactive asks (headless still denies); never affects the self-protection layer. Default true. */
+	/** [pi-verdict local patch: autoDeny] false → auto-review denies become interactive asks (headless still denies). Default true. */
 	autoDeny: boolean;
 	/** [pi-verdict local patch: rules] user-authored free-text rules appended to every classifier prompt (LLM + jev). Config key: "rules". */
 	classifierRules: string[];
@@ -314,6 +302,10 @@ const OWN_FILE_PATH: string | null = (() => {
  * Both the lexical and the realpath form of ownFile are tried (symlinked
  * agent trees, macOS firmlink homes).
  */
+function escapeRegExp(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export function resolveAgentDir(ownFile: string | null, home: string, envAgentDir: string | undefined): string {
 	if (envAgentDir) return envAgentDir;
 	if (ownFile) {
@@ -392,7 +384,7 @@ function isTrustedRoot(root: string, trusted: string[]): boolean {
 }
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk (the self-protection layer always stays on). classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). This file is part of the permission gate: agent-side modification is denied — edit it manually outside pi. Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; the self-protection layer and non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
 	allow: ["^ls\\b"],
 	deny: [],
 	tools: [],
@@ -417,7 +409,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	trustedProjects: [],
 }, null, 2)}\n`;
 
-interface LoadedRules { rules: UserRules; skipped: string[]; shortcutWarning: string | null; project: { path: string; applied: boolean } | null; protectPaths: string[] }
+interface LoadedRules { rules: UserRules; skipped: string[]; shortcutWarning: string | null; project: { path: string; applied: boolean } | null }
 
 /**
  * 加载用户规则。首启生成带注释模板(allow 内示例默认仅 ^ls\b 可用,其余为说明占位);
@@ -432,26 +424,24 @@ function loadUserRules(cwd: string | null = null): LoadedRules {
 				fs.mkdirSync(path.dirname(p), { recursive: true });
 				fs.writeFileSync(p, USER_CONFIG_TEMPLATE);
 			} catch { /* 只读环境静默跳过 */ }
-			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null, protectPaths: [] };
+			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null };
 		}
 	let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown; trustedProjects?: unknown };
 		try {
 			raw = JSON.parse(fs.readFileSync(p, "utf8")) as typeof raw;
 		} catch (err) {
 			// Invalid config never silently disables the gate (#25): a parse failure
-			// loads empty user rules (the floor and self-protection layer stay on)
-			// and reports through the session_start skip channel, same as invalid regexes
-			return { rules: EMPTY_RULES, skipped: [`config parse failed: ${err instanceof Error ? err.message : String(err)} — user rules not loaded (${p})`], shortcutWarning: null, project: null, protectPaths: [] };
+			// loads empty user rules (the floor stays on) and reports through the
+			// session_start skip channel, same as invalid regexes
+			return { rules: EMPTY_RULES, skipped: [`config parse failed: ${err instanceof Error ? err.message : String(err)} — user rules not loaded (${p})`], shortcutWarning: null, project: null };
 		}
 		const skipped: string[] = [];
 		// [pi-verdict local patch: project overrides] replace-merge a trusted project's file over the global raw object
 		const agentDir = agentDirPath();
 		const trusted = parseTrustedProjects(raw.trustedProjects, skipped);
-		const protectPaths = trusted.map((r) => path.join(r, projectDotDir(agentDir), "pi-verdict.json"));
 		let project: LoadedRules["project"] = null;
 		const pp = cwd === null ? null : findProjectConfig(cwd, agentDir);
 		if (pp) {
-			protectPaths.push(pp);
 			project = { path: pp, applied: false };
 			const root = path.dirname(path.dirname(pp));
 			if (!isTrustedRoot(root, trusted)) {
@@ -543,10 +533,9 @@ function loadUserRules(cwd: string | null = null): LoadedRules {
 			skipped,
 			shortcutWarning: shortcut.warning,
 			project,
-			protectPaths,
 		};
 	} catch {
-		return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null, protectPaths: [] };
+		return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null };
 	}
 }
 
@@ -609,9 +598,7 @@ function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: b
 /** Tool family shared by the three toolName dispatches below (user-rule target,
  *  built-in grading, denyPaths extraction): "command" tools carry a command string,
  *  "file" tools carry a path argument; null = outside both families (MCP/custom →
- *  classifier only, unless exact-matched by user.tools — see classifyByRules). Adding a file tool means extending this one map. The
- *  self-protection layer is deliberately NOT a consumer: it matches write paths +
- *  bash only (reads pass — its set is not the file family). */
+ *  classifier only, unless exact-matched by user.tools — see classifyByRules). Adding a file tool means extending this one map. */
 function toolKind(toolName: string): "command" | "file" | null {
 	switch (toolName) {
 		case "bash":
@@ -720,192 +707,8 @@ function hitDenyPaths(toolName: string, input: Record<string, unknown>, cwd: str
 	return null;
 }
 
-// ============================================================================
-// 自保护层(self-protection layer,ADR-0001)
-//
-// 门禁自身的完整性不受任何配置豁免:builtinDenyFloor:false 只关危险正则与路径
-// 敏感度,关不掉本层;用户 allow 规则亦不可越过。保护对象:
-//   - <agentDir>/config/pi-verdict.json(用户规则 = 门禁的判定输入)
-//   - 本扩展的安装副本(pi under <agentDir>/extensions/, omp under
-//     plugins/node_modules/<pkg>/ in its config root — install forms listed
-//     with resolveAgentDir; dev checkouts are not in scope)
-// 语义:门禁内一切写入按定义均由 agent 发起 → 恒 deny(reason 指引手工编辑);
-// 读放行(读门禁文件无害);用户经编辑器的修改不经门禁,不受影响。
-// bash 侧:命令串正则覆盖字面量/~/\$HOME/\$PI_CODING_AGENT_DIR 变体,可被混淆
-// 绕过(诚实声明,ADR-0001);无运行时变更检测兜底(该机制已移除)。
-// ============================================================================
-
-interface ProtectedSet {
-	/** 精确受保护文件(词法绝对路径 + realpath 双形) */
-	exact: string[];
-	/** 受保护目录前缀(npm 包安装形态:整个包目录) */
-	prefixes: string[];
-	/** 读拒绝前缀(#54):verdicts 审计目录——记录含不可信原始输出,禁回流 agent context */
-	readPrefixes: string[];
-	/** bash/powershell 命令串危险特征(子串匹配,可绕——变更检测兜底) */
-	bashPatterns: RegExp[];
-}
-
-function escapeRegExp(s: string): string {
-	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 /**
- * 构建受保护集合。
- * ownFile:本模块文件路径(import.meta.url 解析;null = 不可解析,仅保护配置)。
- * The installed copy is protected only when ownFile sits under one of the
- * install roots (forms listed with resolveAgentDir; #35). Dev checkouts
- * (source inside the cwd) are NOT protected — in-project development writes
- * are legitimate daily work (ADR-0001).
- */
-export function buildProtectedSet(agentDir: string, ownFile: string | null): ProtectedSet {
-	const exact = new Set<string>();
-	const prefixes = new Set<string>();
-	const configPath = path.join(agentDir, "config", "pi-verdict.json");
-	for (const f of baseForms(configPath)) exact.add(f);
-
-	// 安装副本目标:单文件形态 → 文件本体(exact);npm 目录形态 → 包根目录(prefix)。
-	// extRoot 与 ownFile 各取词法/realpath 双形交叉判定,集合同样双形收录——
-	// 避免符号链接目录(如 macOS /var → /private/var)导致传入词法路径与集合错位。
-	const extTargets = new Set<string>();
-	if (ownFile) {
-		// Install roots, lexical + realpath forms (#35): <agentDir>/extensions
-		// (pi) and plugins/node_modules under agentDir or its parent dir (the
-		// two omp layouts — see resolveAgentDir for the layout history). The
-		// path segments under the matched root name the install target: a file
-		// → exact, a package dir (`@scope/pkg` or `pkg`) → prefix, so every
-		// npm form gets whole-package-dir protection (#26).
-		const extRoots = new Set<string>();
-		const agentBases = new Set(baseForms(agentDir));
-		const configRootBases = new Set([...agentBases].map((b) => path.dirname(b)));
-		for (const seg of [["extensions"], ["plugins", "node_modules"]]) {
-			const bases = seg.length === 2 ? new Set([...agentBases, ...configRootBases]) : agentBases;
-			for (const base of bases) {
-				for (const root of baseForms(path.join(base, ...seg))) extRoots.add(root);
-			}
-		}
-		const ownForms = new Set(baseForms(ownFile));
-		for (const extRoot of extRoots) {
-			for (const own of ownForms) {
-				if (!own.startsWith(extRoot + path.sep)) continue;
-				const segs = path.relative(extRoot, own).split(path.sep);
-				const singleFile = segs.length === 1;
-				// npm scopes are two-segment dirs (@scope/pkg): the install
-				// target is the package, not the whole scope dir
-				const target = singleFile ? own : path.join(extRoot, ...segs.slice(0, segs[0].startsWith("@") ? 2 : 1));
-				for (const f of baseForms(target)) {
-					(singleFile ? exact : prefixes).add(f);
-					extTargets.add(f);
-				}
-			}
-		}
-	}
-	const extForms = [...extTargets];
-
-	// bash 命令串特征:文件名字面量(任何拼写变体都含它)+ 安装副本路径变体
-	const bashPatterns: RegExp[] = [/pi-verdict\.json/];
-	if (extForms.length > 0) {
-		const home = os.homedir();
-		const alts = new Set<string>(extForms.map(escapeRegExp));
-		for (const f of extForms) {
-			if (f.startsWith(home + path.sep)) {
-				const rel = f.slice(home.length + 1);
-				alts.add(escapeRegExp("~/" + rel));
-				alts.add("\\$HOME/" + escapeRegExp(rel));
-			}
-			// $PI_CODING_AGENT_DIR 变体:词法与 realpath 两种基名列举(符号链接目录容忍)
-			for (const base of new Set(baseForms(agentDir))) {
-				if (f.startsWith(base + path.sep)) {
-					alts.add("\\$PI_CODING_AGENT_DIR/" + escapeRegExp(f.slice(base.length + 1)));
-				}
-			}
-		}
-		bashPatterns.push(new RegExp(`(?:${[...alts].join("|")})`));
-	}
-
-	// #54 verdicts dir: gate-owned audit storage. Writes ride the normal prefixes;
-	// reads are denied separately — records carry raw model output (including
-	// fail-closed failures) that must not flow back into agent context.
-	const verdictsForms = baseForms(path.join(agentDir, "verdicts"));
-	for (const f of verdictsForms) prefixes.add(f);
-	const home = os.homedir();
-	const vAlts = new Set<string>(verdictsForms.map(escapeRegExp));
-	for (const f of verdictsForms) {
-		if (f.startsWith(home + path.sep)) {
-			const rel = f.slice(home.length + 1);
-			vAlts.add(escapeRegExp("~/" + rel));
-			vAlts.add("\\$HOME/" + escapeRegExp(rel));
-		}
-		for (const base of baseForms(agentDir)) {
-			if (f.startsWith(base + path.sep)) vAlts.add("\\$PI_CODING_AGENT_DIR/" + escapeRegExp(f.slice(base.length + 1)));
-		}
-	}
-	bashPatterns.push(new RegExp(`(?:${[...vAlts].join("|")})`));
-
-	return { exact: [...exact], prefixes: [...prefixes], readPrefixes: verdictsForms, bashPatterns };
-}
-
-/** Does the resolved write path hit the protected set (realpath guards against
- *  symlink bypass; nonexistent targets rebuild their real form from the
- *  nearest existing ancestor, #20) */
-export function isProtectedWritePath(rawPath: string, cwd: string, prot: ProtectedSet): boolean {
-	if (!rawPath) return false;
-	for (const c of rebuiltForms(path.resolve(cwd, expandHome(rawPath)))) {
-		if (prot.exact.includes(c)) return true;
-		for (const p of prot.prefixes) {
-			if (c === p || c.startsWith(p + path.sep)) return true;
-		}
-	}
-	return false;
-}
-
-/** Read-deny for the verdicts dir (#54): audit records contain raw fail-closed
- *  model output — untrusted text that must not flow back into agent context.
- *  Unlike write protection (prefixes) this is read semantics, hence a separate set. */
-export function isProtectedReadPath(rawPath: string | undefined, cwd: string, prot: ProtectedSet): boolean {
-	if (prot.readPrefixes.length === 0) return false;
-	const target = rawPath ?? cwd; // #48: absent path → cwd is the effective target
-	for (const c of rebuiltForms(path.resolve(cwd, expandHome(target)))) {
-		for (const p of prot.readPrefixes) {
-			if (c === p || c.startsWith(p + path.sep)) return true;
-		}
-	}
-	return false;
-}
-
-/** 自保护层裁决(第 0 层,先于一切):触碰门禁自身文件 → 不可豁免的 deny;其余 null 交后续层 */
-function selfProtectCheck(toolName: string, input: Record<string, unknown>, cwd: string, prot: ProtectedSet): RuleResult | null {
-	switch (toolName) {
-		case "write":
-		case "edit":
-			if (isProtectedWritePath(String(input.path ?? ""), cwd, prot)) {
-				return { verdict: "deny", reason: `self-protection layer (ADR-0001): ${input.path} is part of the permission gate itself; agent-side modification is denied — edit it manually outside pi if intended`, selfProtect: true };
-			}
-			return null;
-		case "read":
-		case "grep":
-		case "find":
-		case "ls":
-			if (isProtectedReadPath(typeof input.path === "string" ? input.path : undefined, cwd, prot)) {
-				return { verdict: "deny", reason: `self-protection layer (#54): ${typeof input.path === "string" ? input.path : cwd} holds the gate's verdict audit records — agent reads are denied (untrusted raw model output inside); view them outside pi`, selfProtect: true };
-			}
-			return null;
-		case "bash":
-		case "powershell": {
-			const cmd = String(input.command ?? "");
-			if (prot.bashPatterns.some((re) => re.test(cmd))) {
-				return { verdict: "deny", reason: `self-protection layer (ADR-0001): command touches the permission gate's own files — user-editable only`, selfProtect: true };
-			}
-			return null;
-		}
-		default:
-			return null; // MCP/自定义工具不经规则层(ADR-0001:由变更检测兜底)
-	}
-}
-
-/**
- * Tool call → rule-layer verdict. Order (#12; ADR-0001 adds layer 0; ADR-0002 inserts denyPaths):
- *   0. self-protection — deny is terminal (no config exempts it, not even builtinDenyFloor:false)
+ * Tool call → rule-layer verdict. Order (#12; ADR-0002 inserts denyPaths):
  *   1. built-in base (bash danger regex floor / path sensitivity grading) — deny is terminal
  *      (the floor can be turned off via builtinDenyFloor)
  *   2. user deny → deny (beats allow)
@@ -914,11 +717,7 @@ function selfProtectCheck(toolName: string, input: Record<string, unknown>, cwd:
  *   5. custom-tool exact match (user.tools) → allow (bypasses classifier for that tool)
  *   6. base (path tools' default allow/gray; everything else gray) → classifier
  */
-function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: string, user: UserRules, prot: ProtectedSet, denyPathBases: string[]): RuleResult {
-	// 第 0 层:自保护层(ADR-0001)——先于一切,不可经任何配置豁免
-	const sp = selfProtectCheck(toolName, input, cwd, prot);
-	if (sp) return sp;
-
+function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: string, user: UserRules, denyPathBases: string[]): RuleResult {
 	let base: RuleResult;
 	const kind = toolKind(toolName);
 	if (kind === "command") {
@@ -1615,29 +1414,21 @@ export class AuditLog {
 
 /**
  * 判定管线的会话期状态。session_start 的复位清单归 reset() 拥有——新增会话态只改
- * 这里,install 与 session_start 不再各持一份初始化点。prot 源自安装路径而非配置,
- * 构造期定,不参与 reset。导出仅为测试(内部 seam 的测试面,与 adjudicate 同组)。
+ * 这里,install 与 session_start 不再各持一份初始化点。导出仅为测试(内部 seam 的
+ * 测试面,与 adjudicate 同组)。
  */
 export class SessionState {
-	readonly prot: ProtectedSet;
 	readonly shadow = new ShadowCache();
 	readonly fallback = new FallbackCascade();
 	userRules: UserRules;
 	audit: AuditLog | null;
 	private denyPathBases: string[] | null = null;
 	private readonly agentDir: string | null;
-	/** [pi-verdict local patch: project overrides] global-only length of prot.exact at
-	 *  construction time; reset() truncates back to this before appending the current
-	 *  session's trusted-project entries, so a project left behind by a cwd change does
-	 *  not linger protected. */
-	private readonly baseExactLen: number;
 
-	constructor(prot: ProtectedSet, userRules: UserRules = loadUserRules().rules, agentDir: string | null = null) {
-		this.prot = prot;
+	constructor(userRules: UserRules = loadUserRules().rules, agentDir: string | null = null) {
 		this.userRules = userRules;
 		this.agentDir = agentDir;
 		this.audit = this.makeAudit(userRules);
-		this.baseExactLen = prot.exact.length;
 	}
 
 	/** #54: the audit flag follows the rules (applies to new sessions); the dir is anchored to the install path */
@@ -1646,10 +1437,7 @@ export class SessionState {
 	}
 
 	/** 会话重置:重载用户规则(配置改动新会话生效)+ 按会话 cwd 重锚 denyPaths
-	 *  (ADR-0002: 每会话锚定一次)+ 清影子缓存;返回加载报告供表现层通知
-	 *  [pi-verdict local patch: project overrides] also loads a trusted project override for
-	 *  cwd and re-derives the write-protected set: truncate back to the global-only base,
-	 *  then add this session's trustedProjects candidates + resolved project file (if any) */
+	 *  (ADR-0002: 每会话锚定一次)+ 清影子缓存;返回加载报告供表现层通知 */
 	reset(cwd: string): { skipped: string[]; shortcutWarning: string | null; project: { path: string; applied: boolean } | null } {
 		const loaded = loadUserRules(cwd);
 		this.userRules = loaded.rules;
@@ -1657,12 +1445,6 @@ export class SessionState {
 		this.shadow.reset();
 		this.fallback.reset();
 		this.audit = this.makeAudit(loaded.rules);
-		this.prot.exact.length = this.baseExactLen;
-		for (const f of loaded.protectPaths) {
-			for (const form of baseForms(f)) {
-				if (!this.prot.exact.includes(form)) this.prot.exact.push(form);
-			}
-		}
 		return { skipped: loaded.skipped, shortcutWarning: loaded.shortcutWarning, project: loaded.project };
 	}
 
@@ -1678,8 +1460,8 @@ export class SessionState {
 // 判定管线(adjudicate):tool_call → Verdict 的唯一裁决入口,零 UI 依赖
 // ============================================================================
 
-/** 裁决来源:呈现模板的键之一(与 degraded 正交分解)。rule = 规则层(含自保护层
- *  ——同走规则呈现模板);protected-path = denyPaths 命中;classifier = 灰区分类器
+/** 裁决来源:呈现模板的键之一(与 degraded 正交分解)。rule = 规则层;
+ *  protected-path = denyPaths 命中;classifier = 灰区分类器
  *  结果(含其 fail-closed——呈现模板相同);fail-closed = 无可用分类器模型 */
 export type VerdictSource = "rule" | "protected-path" | "classifier" | "fail-closed";
 
@@ -1788,7 +1570,7 @@ async function runConfidenceCascade(
 }
 
 /**
- * 判定管线(CONTEXT.md「判定管线」词条的实现):自保护 → 内置 floor → 用户 deny →
+ * 判定管线(CONTEXT.md「判定管线」词条的实现):内置 floor → 用户 deny →
  * denyPaths ask → 用户 allow → 灰区分类器;ask 降级(无 UI → deny)与 fail-closed
  * 内建于此,两处重复的降级实现自此唯一。零 UI:表现(notify/confirm)由扩展
  * handler 按 source × degraded 模板呈现。导出仅为测试(内部 seam 的测试面,#35 既有模式)。
@@ -1801,10 +1583,10 @@ export async function adjudicate(
 	call: { toolName: string; input: Record<string, unknown> },
 	env: AdjudicateEnv,
 ): Promise<Verdict> {
-	const rule = classifyByRules(call.toolName, call.input, env.cwd, state.userRules, state.prot, state.anchoredDenyPathBases(env.cwd));
+	const rule = classifyByRules(call.toolName, call.input, env.cwd, state.userRules, state.anchoredDenyPathBases(env.cwd));
 	if (rule.verdict === "allow") return { verdict: "allow", reason: rule.reason ?? "", source: "rule", degraded: false };
 	if (rule.verdict === "deny") {
-		if (!rule.selfProtect && !state.userRules.autoDeny && env.hasUI) return { verdict: "ask", reason: (rule.reason ?? "") + AUTO_DENY_OFF_SUFFIX, source: "rule", degraded: false };
+		if (!state.userRules.autoDeny && env.hasUI) return { verdict: "ask", reason: (rule.reason ?? "") + AUTO_DENY_OFF_SUFFIX, source: "rule", degraded: false };
 		return { verdict: "deny", reason: rule.reason ?? "", source: "rule", degraded: false };
 	}
 
@@ -1935,8 +1717,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	let enabled = pi.getFlag("auto-mode") !== false;
 	const debug = pi.getFlag("auto-mode-debug") === true || process.env.PI_AUTO_MODE_DEBUG === "1";
-	// 会话态:复位清单归 SessionState.reset(自保护写保护常驻 prot.exact/prefixes/bashPatterns,不依赖 tamper watch)
-	const state = new SessionState(buildProtectedSet(agentDirPath(), OWN_FILE_PATH), undefined, agentDirPath());
+	// 会话态:复位清单归 SessionState.reset
+	const state = new SessionState(undefined, agentDirPath());
 
 	/** Verdict → UI(本扩展唯一的裁决呈现点):按 source × degraded 查模板,文案与
 	 *  重构前逐字节一致。受保护路径分支的通知永不携带路径明文与 action 行

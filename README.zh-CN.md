@@ -12,7 +12,6 @@
 - 内置危险规则与你的 allow/deny 规则以零延迟先行裁决明确情形
 - 其余交给携带会话上下文的模型分类器
 - 任何不确定或失败一律 fail-closed, 绝不静默放行
-- 自我保护: 门禁自身的配置与安装副本对 agent 写入硬 deny——请在门禁之外自行编辑
 
 ## 问题
 
@@ -32,7 +31,6 @@ pi-verdict 补上这道缺失的门禁, 由模型基于上下文和你的意图�
 - **是判断,不是证明**——分类器的 `allow` 是有依据的判断;floor 的存在正因为它仅此而已。
 - **最小化可信输入**——transcript 不含工具结果(#22),分类器零路径明文(ADR-0002)。
 - **规范化身份**——词法 + realpath 双形匹配;「看起来在项目内」的路径不因此被信任(#20/#21)。
-- **门禁守护自身**——任何配置都关不掉的自保护层(ADR-0001)。
 - **是权限门禁,不是沙箱**——请在上面叠加 OS 级隔离;本门禁不替代它。
 
 完整表述见 [docs/security-principles.md](docs/security-principles.md):
@@ -121,7 +119,7 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
 
 - `allow`/`deny` 为 JS 正则数组;**`deny` 优先于 `allow`**,两者都优先于分类器
 - `denyPaths` 是你声明**受保护**的普通路径列表:触碰触发**终局 ask** 由你裁决(非交互降级 deny);分类器只被告知路径**存在**,路径明文永不出本机。`grep`/`find`/`ls` 按**整个搜索范围**比较:省略 `path`(pi 默认:当前目录)或传入位于声明路径之上的父目录,同样触发 ask。全新安装会预填一份**入门列表**(`~/.ssh/`、`~/.gnupg`、`~/.mc`、shell rc/profile 文件),自初次运行后的第一个会话起生效(一切配置变更均自新会话生效)——它是预填的*用户声明*而非内置 floor:可随意增删清空,也可与自己的路径(`~/Documents/private`、……)并列;既有配置永不被改写
-- `builtinDenyFloor: false` 整体关闭内置危险/路径拦截(风险自担;下方自保护层永远开启)
+- `builtinDenyFloor: false` 整体关闭内置危险/路径拦截(风险自担)
 - `classifierModel` 指定分类器模型,如 `"zai/glm-5.3-flash:low"`(支持思考后缀;缺省 = 会话模型且显式关思考)
 - `classifierModel: "typesafe/jev-latest"` 启用随包的 **jev 决策适配器**——灰区裁决经 TypeSafe jev 完成(默认 OpenRouter,或 `PI_VERDICT_JEV_TRANSPORT=typesafe` 直连官方 API);实验性质,详见 [ADR-0003](docs/adr/0003-jev-decisions-adapter.md)
 - `audit: true` 把每次**灰区裁决**(发给分类器的完整转录、其原始响应、解析出的裁决)以 JSONL 记录到 `~/.pi/agent/verdicts/<sessionId>.jsonl`——按会话一分文件,保留最近 20 个。交互式 ask 还会记录你的应答(`userAnswer` ground truth,确认结束后落盘),protected-path ask 也入审计(#62);规则 allow/deny 仍不入。仅存本机且全保真(受保护路径明文可能出现——永不出本机;[ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md) 边界注);agent 对该目录读写双拒。开启时 `/automode` 会显示审计状态与路径
@@ -147,13 +145,6 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
 
 jev 的校准 confidence 正是置信地板的判定依据——搭配第二层使用(`"classifierMinConfidence": 50, "classifierFallbackModel": "anthropic/claude-haiku-4-5"`),让低置信调用交给更深的模型而非直接生效([ADR-0004](docs/adr/0004-classifier-fallback-cascade.md))。
 
-### 自保护(门禁守护自身——[ADR-0001](docs/adr/0001-self-protection-layer.md))
-
-门禁自身的文件——配置与扩展安装副本——**仅用户可改**:门禁之内的写入一律硬 deny(读放行);你的编辑器修改不经门禁,最近的同构先例是 sudoers 必须经 visudo。
-
-- **不可经任何配置关闭**——`builtinDenyFloor: false` 与用户 `allow` 规则都动不了这一层
-- 无运行时变更检测兜底:绕过门禁直接改写安装文件(不经任何 pi/omp 工具调用)不会被检测或还原。移除原因(local patch):同一安装副本被多个并发会话共享时,内存快照式兜底会把一个会话对配置/副本的合法手工修改判定为另一会话的「篡改」并自动还原/fail-close——上面的写保护(硬 deny)才是实际保证。
-
 需要 pi ≥ 0.84。交互与非交互(`-p`/json/rpc)会话均支持;非交互模式下 `ask` 降级为 `deny`。
 
 ## 与品类对比
@@ -167,15 +158,12 @@ jev 的校准 confidence 正是置信地板的判定依据——搭配第二层�
 
 完整全景:[`research/pi-permission-landscape.md`](research/pi-permission-landscape.md) · 与最近架构亲缘的收敛分析:[`research/pi-automode-convergence.md`](research/pi-automode-convergence.md)。
 
-诚实地说:pi-automode 与 pi-verdict 在**架构上已收敛**(deny floor → 用户规则 → 分类器,fail-closed——见收敛分析)。这里仍然不同的是:分类器能说 `ask`(运行时人工介入,而非仅由规则预声明)、内置 floor 可以关(`builtinDenyFloor`——用户主权)、任何配置都关不掉的自保护层([ADR-0001](docs/adr/0001-self-protection-layer.md)——门禁完整性)、零依赖的[可通读单文件](extensions/pi-verdict.ts)(仍刻意单文件)、以及测量的习惯——本仓库每个设计决策都有随库研究背书。
+诚实地说:pi-automode 与 pi-verdict 在**架构上已收敛**(deny floor → 用户规则 → 分类器,fail-closed——见收敛分析)。这里仍然不同的是:分类器能说 `ask`(运行时人工介入,而非仅由规则预声明)、内置 floor 可以关(`builtinDenyFloor`——用户主权)、零依赖的[可通读单文件](extensions/pi-verdict.ts)(仍刻意单文件)、以及测量的习惯——本仓库每个设计决策都有随库研究背书。
 
 ## 管线
 
 ```
 tool_call
-  │
-  ├─ 0. 自保护层(ADR-0001;不可经任何配置关闭)
-  │     └─ write/edit/bash 触碰门禁自身文件 → deny;读放行
   │
   ├─ 1. 规则层(确定性,零延迟)
   │     ├─ 内置 deny floor:bash 危险正则 + 路径敏感度 S0–S5
@@ -220,10 +208,9 @@ tool_call
 - 并行灰区调用串行裁决
 - 自省意味着会话模型亲自裁决 —— 若延迟/成本敏感,用 `--auto-mode-model` 指向轻量模型(开放问题见 issue tracker)
 - 影子缓存按决议仅观察不生效;实测命中率达标后,生效开关是一行改动
-- `denyPaths` 的 bash 提取是 token 级([ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md)):命令替换、base64 内嵌路径、外部脚本内容不产生命中信号——这些调用回落到分类器的存在性话术警戒。MCP 与自定义工具完全绕过提取器(其灰区裁决仍带话术)。路径归一化亦为基础档(ADR-0002):经符号链接目录写入尚不存在的目标不重建真实形、不产生命中——该间接路径同样由话术警戒覆盖(祖先重建档只适用于自保护层与路径敏感度 floor,不适用 denyPaths)。诚实表述,与自保护子串正则同例:确定性层可被混淆——这正是命中交由**你**裁决而非静默决定的原因
+- `denyPaths` 的 bash 提取是 token 级([ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md)):命令替换、base64 内嵌路径、外部脚本内容不产生命中信号——这些调用回落到分类器的存在性话术警戒。MCP 与自定义工具完全绕过提取器(其灰区裁决仍带话术)。路径归一化亦为基础档(ADR-0002):经符号链接目录写入尚不存在的目标不重建真实形、不产生命中——该间接路径同样由话术警戒覆盖。诚实表述:确定性层可被混淆——这正是命中交由**你**裁决而非静默决定的原因
 - `denyPaths` 的 bash token 不含空格:**声明路径本身含空格时**,bash 拼写无法被提取器识别——`cat "/path with space/x"` 被拆成两个 token 永不命中(文件类工具仍命中,其路径不经 token 化)。glob 覆盖基名末段(`denyPaths: ["/proj/personal"]` 时 `cat /proj/pers*`)同样漏过——基名自身从未字面出现。经 shell 发起的递归搜索在两种拼写下都漏过——不带路径参数(默认搜 cwd,如裸 `rg foo`)或带父目录参数(`rg foo <声明路径的父目录>`):无参命令根本不产生 token,带参时 bash token 只做单向比较;同一形状经 `grep`/`find`/`ls` 工具发起则由双向子树比较覆盖。三个洞与上述替换/base64 一样回落到分类器的存在性话术
-- 自保护 bash 匹配是子串正则——可被混淆绕过,且无运行时变更检测兜底(已移除,详见 [ADR-0001](docs/adr/0001-self-protection-layer.md) 修订);对 agent 发起的编辑,写保护(硬 deny)才是实际保证
-- dev checkout(从仓库而非 `<agentDir>/extensions/` 运行扩展)不受自保护——下一个正常会话加载的安装副本只在其自身会话的门禁内受保护
+- 门禁自身的配置与安装副本不再受特殊保护——agent 对它们的写入与任何其他文件走同一套规则层与分类器裁决(自保护已移除,详见 [ADR-0001](docs/adr/0001-self-protection-layer.md))
 
 **verdict 不是沙箱。** 它在 pi 进程内裁决工具调用;不能遏制恶意代码、不能防护被攻陷的进程、不守护手工 `!` shell 逃逸。需要隔离请用操作系统级沙箱。
 
@@ -234,7 +221,7 @@ tool_call
 ```bash
 bun install
 bun run typecheck
-bun test          # 离线桩测试:自保护 / 变更检测 / deny floor / 用户规则 / denyPaths / 绕过回归 / 分类器重试 / 影子缓存 / 命令 / toggle 快捷键
+bun test          # 离线桩测试:deny floor / 用户规则 / denyPaths / 绕过回归 / 分类器重试 / 影子缓存 / 命令 / toggle 快捷键
 ```
 
 Issue tracker 与决策记录在 GitHub issues(「地图」issue #1 为索引)。

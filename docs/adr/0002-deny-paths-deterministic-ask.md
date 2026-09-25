@@ -168,3 +168,18 @@ and it is deliberately **not** part of the IntegrityWatch baseline: the log
 legitimately grows with every adjudication, so a snapshot diff would
 false-positive as tampering; write-deny on the directory is the actual
 bypass prevention.
+
+## Amendment (2026-09-25): self-protection layer removed (ADR-0001)
+
+ADR-0001's self-protection layer — referenced above as the shared
+realpath-normalization helper (story 2), as the first link in the priority
+chain (story 4: "self-protection deny → built-in floor deny → user deny →
+denyPaths hit → ask → user allow → gray/classifier"), as the read/write-deny
+on `<agentDir>/verdicts/` (the boundary note above), and as the obfuscatable
+substring-matching precedent cited in the consequences — has been removed in
+full (see the ADR-0001 final revision). The priority chain today starts at
+built-in floor deny; there is no self-protection deny ahead of it, and the
+verdicts directory carries no special read/write protection. This ADR's own
+decisions (deterministic ask on a denyPaths hit, the existence hint,
+bidirectional scope-tool matching) are unaffected — only the passages above
+that assumed the now-removed layer's existence are stale.

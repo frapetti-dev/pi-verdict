@@ -8,12 +8,12 @@
 
 This repository is **pi-verdict**: a minimal permission-gate extension for Pi (rule layer + model classifier). For domain terminology or design decisions, read `CONTEXT.md` (glossary) and `docs/adr/` first; design conclusions are backed by in-repo measurements under `research/` (a measurement habit).
 
-### Gate self-reference (ADR-0001)
+### Installed copies (historical: ADR-0001)
 
-This extension's security boundary is guarded by itself, which constrains its own development workflow:
+ADR-0001's self-protection layer (a runtime rule-layer deny on agent writes to `<agentDir>/config/pi-verdict.json` and the installed copies under `<agentDir>/extensions/`) was removed (see the ADR's final revision) — there is no longer a mechanism in the gate itself that blocks this. The manual-only workflow remains project convention regardless:
 
-- The agent must not write `<agentDir>/config/pi-verdict.json` or the installed copies under `<agentDir>/extensions/` — the self-protection layer always denies this, with no config-based exemption.
-- To test a new build: the user runs `cp extensions/pi-verdict.ts extensions/jev-adapter.ts ~/.pi/agent/extensions/` in a terminal and restarts pi (an agent doing this on the user's behalf gets blocked; `jev-adapter.ts` is optional, needed only for the jev classifier backend). The same applies to editing user rules — manual edit only.
+- The agent should not write `<agentDir>/config/pi-verdict.json` or the installed copies under `<agentDir>/extensions/` — these are the user's live, installed gate; changes to them belong to the user, by hand, outside the repo.
+- To test a new build: the user runs `cp extensions/pi-verdict.ts extensions/jev-adapter.ts ~/.pi/agent/extensions/` in a terminal and restarts pi (`jev-adapter.ts` is optional, needed only for the jev classifier backend). The same applies to editing user rules — manual edit only.
 
 ### Release
 
