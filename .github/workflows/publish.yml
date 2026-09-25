@@ -1,7 +1,7 @@
-# 发布触发:GitHub Release 发布(published)或手动 workflow_dispatch(输入 tag)。
-# 借鉴 czottmann/pi-automode 的 publish 设计:双验证 + npm@11 trusted publishing。
-# 一次性配置(npmjs.com → pi-verdict → Settings → Trusted Publisher):
-#   Repository: jesset/pi-verdict / Workflow: publish.yml / Environment: 留空
+# Publish trigger: GitHub Release (published) or manual workflow_dispatch (tag input).
+# Publishes @frapetti-dev/pi-verdict to the GitHub Package Registry (npm.pkg.github.com),
+# authenticated with the workflow's own GITHUB_TOKEN (packages: write) — no external
+# registry account or trusted-publisher setup required.
 
 name: Publish
 
@@ -17,10 +17,10 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm OIDC provenance
+  packages: write
 
 concurrency:
-  group: npm-publish
+  group: gpr-publish
   cancel-in-progress: false
 
 jobs:
@@ -66,15 +66,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      - name: Use npm with trusted publishing support
-        run: npm install --global npm@11
+          registry-url: https://npm.pkg.github.com
+          scope: "@frapetti-dev"
 
       - name: Validate package contents
         run: npm pack --dry-run
 
-      - name: Publish
-        run: npm publish --provenance --access public
-
-# trigger re-registration: touch v2
+      - name: Publish to GitHub Packages
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

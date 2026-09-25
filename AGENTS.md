@@ -1,25 +1,24 @@
-## 通用
+## General
 
-- YOU MUST: 始终使用简体中文回复
-- Language convention: code comments, docs, CHANGELOG entries and release notes are written in English; Chinese only in README.zh-CN.md. Do not mass-rewrite existing Chinese content — convert when a file is touched anyway
-- 技术表述必须使用规范的书面化术语，不要自造口语化隐喻（如"盲窗"）；若概念需要简称，用标准术语或首次出现时在括号中标注规范语义
-- YOU MUST: 功能变更须同步文档:README.md / README.zh-CN.md / CHANGELOG.md(`[Unreleased]`)/ 术语变化时 CONTEXT.md / 架构决策时 docs/adr/ / 配置模板 `_hint` 文案
+- Language convention: code comments, docs, CHANGELOG entries, and release notes are written in English; Chinese only in README.zh-CN.md. Do not mass-rewrite existing Chinese content — convert when a file is touched anyway.
+- Technical writing must use precise, standard terminology; don't invent colloquial metaphors. If a concept needs a short form, use the standard term, or annotate its precise meaning in parentheses on first use.
+- YOU MUST: keep docs in sync with functional changes — README.md / README.zh-CN.md / CHANGELOG.md (`[Unreleased]`) / CONTEXT.md when terminology changes / docs/adr/ for architectural decisions / config template `_hint` copy.
 
-## 项目
+## Project
 
-本仓库是 **pi-verdict**:pi 的极简权限门禁扩展(规则层 + 模型分类器)。涉及领域术语或设计决策时,先读 `CONTEXT.md`(术语表)与 `docs/adr/`;设计结论优先以 `research/` 的随库实测背书(测量习惯)。
+This repository is **pi-verdict**: a minimal permission-gate extension for Pi (rule layer + model classifier). For domain terminology or design decisions, read `CONTEXT.md` (glossary) and `docs/adr/` first; design conclusions are backed by in-repo measurements under `research/` (a measurement habit).
 
-### 门禁自指(ADR-0001)
+### Gate self-reference (ADR-0001)
 
-本扩展的安全边界由它自己守护,开发工作流随之受限:
+This extension's security boundary is guarded by itself, which constrains its own development workflow:
 
-- agent 不可写 `<agentDir>/config/pi-verdict.json` 与 `<agentDir>/extensions/` 下的安装副本——自保护层恒 deny,不可经任何配置豁免
-- 实测新版本 = 用户在终端 `cp extensions/pi-verdict.ts extensions/jev-adapter.ts ~/.pi/agent/extensions/` 后重启 pi(agent 代劳会被拦;jev-adapter.ts 可选,仅 jev 分类器后端需要);改用户规则同理,仅用户手工编辑
+- The agent must not write `<agentDir>/config/pi-verdict.json` or the installed copies under `<agentDir>/extensions/` — the self-protection layer always denies this, with no config-based exemption.
+- To test a new build: the user runs `cp extensions/pi-verdict.ts extensions/jev-adapter.ts ~/.pi/agent/extensions/` in a terminal and restarts pi (an agent doing this on the user's behalf gets blocked; `jev-adapter.ts` is optional, needed only for the jev classifier backend). The same applies to editing user rules — manual edit only.
 
-### 发布
+### Release
 
-- 发布序列:`chore(release): bump version` 提交 + 附注 tag + GitHub Release;`gh release` 命令被内置 deny floor 终局拦截,由用户在终端执行
-- npm 上架全自动:GitHub Release published → `.github/workflows/publish.yml`(tag/版本双验证 + typecheck + 测试 + npm@11 trusted publishing)
+- Release sequence: a `chore(release): bump version` commit + annotated tag + GitHub Release; `gh release` commands are blocked by the built-in deny floor as a final backstop, so the user runs them from their own terminal.
+- Package publishing is automated: GitHub Release published → `.github/workflows/publish.yml` (tag/version double-check + typecheck + tests + publish to the GitHub Package Registry).
 
 ## Agent skills
 
@@ -35,14 +34,14 @@ Five default triage labels — `needs-triage`, `needs-info`, `ready-for-agent`, 
 
 Single-context: a root `CONTEXT.md` plus `docs/adr/`. See `docs/agents/domain.md`.
 
-## Git 规范
+## Git conventions
 
-- 功能分支命名: feat/description-with-dash-separated-and-MAY-contains-issue-number
-- YOU MUST: 在git commit时,总是使用 [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) 的方式
-- YOU MUST: 合并到main分支前更新 CHANGELOG, 使用 <https://keepachangelog.com/> 的方式
-- YOU MUST: 除非被许可, 不要未经用户允许执行 git commit 提交代码变更
+- Feature branch naming: feat/description-with-dash-separated-and-MAY-contains-issue-number
+- YOU MUST: use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for git commit messages.
+- YOU MUST: update CHANGELOG before merging to main, following [Keep a Changelog](https://keepachangelog.com/).
+- YOU MUST: do not run `git commit` without the user's permission.
 
-## 工具
+## Tools
 
-- 当需要查看 github 上一些项目的源码的时候, 你总是可以使用本地已经安装了的 github 的cli 工具查看(bash: gh api)
-- 当需要临时 git clone 开源项目代码时, 总是使用 /Volumes/RamDisk 代替 /tmp 作为临时目录
+- When you need to look at another GitHub project's source, you can always use the locally installed GitHub CLI (bash: `gh api`).
+- When you need to temporarily `git clone` an open-source project, always use `/Volumes/RamDisk` instead of `/tmp` as the temp directory.
