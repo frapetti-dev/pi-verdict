@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Changed
+
+- Package renamed to `@frapetti-dev/pi-verdict` and publish target switched from the npm registry to the GitHub Package Registry (`npm.pkg.github.com`), authenticated via the workflow's own `GITHUB_TOKEN` instead of npm trusted publishing. The npm package name `pi-verdict` is owned by a separate, unrelated account (upstream `jesset/pi-verdict`); this repository is not a fork of it and has no publish rights there, which made every release fail at the `npm publish` step (`404` on `PUT .../pi-verdict`). `repository`/`homepage`/`bugs` in `package.json` now point at this repository.
+
+## [0.12.0] - 2026-09-25
+
 ### Added
 
 - `autoDeny` config key (default `true`): `false` converts every auto-review deny (danger floor, `deny` rules, classifier deny, fail-closed) into an interactive confirmation; the self-protection layer stays a hard deny and non-interactive sessions still deny. The confirm dialog labels the source (`Rule` / `Fail-closed` / `Classifier opinion`).
