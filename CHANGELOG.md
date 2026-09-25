@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-25
+
 ### Changed
 
 - Package renamed to `@frapetti-dev/pi-verdict` and publish target switched from the npm registry to the GitHub Package Registry (`npm.pkg.github.com`), authenticated via the workflow's own `GITHUB_TOKEN` instead of npm trusted publishing. The npm package name `pi-verdict` is owned by a separate, unrelated account (upstream `jesset/pi-verdict`); this repository is not a fork of it and has no publish rights there, which made every release fail at the `npm publish` step (`404` on `PUT .../pi-verdict`). `repository`/`homepage`/`bugs` in `package.json` now point at this repository.
+- `v0.12.0`'s tag is protected and could not be moved to carry this fix, so it ships as `v0.12.1` instead; `v0.12.0` remains tagged but was never actually published anywhere.
 
 ## [0.12.0] - 2026-09-25
 
