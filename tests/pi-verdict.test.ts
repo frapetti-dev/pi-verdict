@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, BASH_MAX_MATCH_LEN, bindCompletion, buildProtectedSet, isProtectedWritePath, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, BASH_MAX_MATCH_LEN, bindCompletion, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
 
 // ── 桩设施 ──────────────────────────────────────────────
 
@@ -219,7 +219,7 @@ describe("user rules (deny > allow > gray)", () => {
 		expect(h.calls.length).toBe(0); // 合法条目仍生效
 	});
 	// #25 (F6): a malformed config must not silently disarm the user's rules
-	test("malformed config JSON warns at session_start; floor and self-protection unaffected", async () => {
+	test("malformed config JSON warns at session_start; floor unaffected", async () => {
 		const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
 		fs.writeFileSync(p, '{"allow": ["^ls\\b",}');
 		const h = makeHarness(); h.install();
@@ -375,20 +375,6 @@ describe("path floor dual-form matching (#20)", () => {
 		expect(r3?.block).toBe(true);
 	});
 
-	test("isProtectedWritePath: symlink alias onto a nonexistent target inside a protected package dir hits via ancestor-realpath form", async () => {
-		await withTempDir(".pv-t20-agent-", async (agent) => {
-				// npm package-directory install shape: <agentDir>/extensions/pi-verdict/index.ts
-				const pkgDir = path.join(agent, "extensions", "pi-verdict");
-				fs.mkdirSync(pkgDir, { recursive: true });
-				fs.writeFileSync(path.join(pkgDir, "index.ts"), "x");
-				const prot = buildProtectedSet(agent, path.join(pkgDir, "index.ts"));
-				await withTempDir(".pv-t20-p2-", async (proj2) => {
-					fs.symlinkSync(pkgDir, path.join(proj2, "ext-link"));
-					// target does not exist yet; only the ancestor-realpath form reveals it
-					expect(isProtectedWritePath(path.join(proj2, "ext-link", "sub", "new.ts"), proj2, prot)).toBe(true);
-				}, os.homedir());
-		}, os.homedir());
-	});
 });
 
 // ── 3.45 S-rule case folding + macOS firmlink prefixes (#21) ──
@@ -805,147 +791,6 @@ describe("debug annotations", () => {
 		const allowNotifies = h.notifies.filter(([m]) => m.includes("allow (classifier)"));
 		expect(allowNotifies.length).toBe(2);
 		expect(allowNotifies[1][0]).toContain("would-hit");
-	});
-});
-
-// ── 8. 自保护层(ADR-0001:不可豁免的 deny) ─────────────
-
-describe("self-protection layer (ADR-0001)", () => {
-	const CFG = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
-
-	test("write to pi-verdict.json → deny, zero model calls", async () => {
-		const h = session({});
-		const r = await toolCall(h, "write", { path: CFG(), content: "{\"deny\":[],\"allow\":[\".*\"]}" });
-		expect(r?.block).toBe(true);
-		expect(r.reason).toContain("self-protection");
-		expect(h.calls.length).toBe(0);
-	});
-	test("edit to pi-verdict.json → deny", async () => {
-		const h = session({});
-		const r = await toolCall(h, "edit", { path: CFG(), oldText: "a", newText: "b" });
-		expect(r?.block).toBe(true);
-		expect(r.reason).toContain("self-protection");
-	});
-	test("write via symlink to pi-verdict.json → deny (realpath 归一)", async () => {
-		const link = path.join(TMP_AGENT, "link-to-config.json");
-		try { fs.rmSync(link); } catch { /* 不存在 */ }
-		fs.symlinkSync(CFG(), link);
-		const h = session({});
-		const r = await toolCall(h, "write", { path: link, content: "x" });
-		expect(r?.block).toBe(true);
-		expect(r.reason).toContain("self-protection");
-	});
-	test("relative path from a cwd whose file resolves onto config → deny", async () => {
-		const h = session({});
-		// cwd 指向 config 所在目录,相对路径直接命中
-		h.ctx.cwd = path.join(TMP_AGENT, "config");
-		const r = await toolCall(h, "write", { path: "pi-verdict.json", content: "x" });
-		expect(r?.block).toBe(true);
-		expect(r.reason).toContain("self-protection");
-	});
-	test("builtinDenyFloor:false does NOT disable self-protection", async () => {
-		const h = session({ builtinDenyFloor: false });
-		const r = await toolCall(h, "write", { path: CFG(), content: "x" });
-		expect(r?.block).toBe(true);
-		expect(h.calls.length).toBe(0);
-	});
-	test("user allow rule cannot override self-protection", async () => {
-		const h = session({ allow: ["pi-verdict", ".*"] });
-		const r = await toolCall(h, "write", { path: CFG(), content: "x" });
-		expect(r?.block).toBe(true);
-		expect(h.calls.length).toBe(0);
-	});
-	test("read of pi-verdict.json passes self-protection (读放行,走正常管线)", async () => {
-		const h = session({});
-		h.responses = [{ text: "<verdict>allow</verdict> ok" }]; // TMP 在 /var 下 → S1 读灰区,交分类器
-		const r = await toolCall(h, "read", { path: CFG() });
-		expect(r).toBeUndefined();
-		expect(h.notifies.some(([m]) => m.includes("self-protection"))).toBe(false);
-	});
-	test("bash touching config filename → deny (any spelling)", async () => {
-		const h = session({});
-		const r = await toolCall(h, "bash", { command: "echo '{\"allow\":[\".*\"]}' > " + CFG() });
-		expect(r?.block).toBe(true);
-		expect(r.reason).toContain("self-protection");
-		expect(h.calls.length).toBe(0);
-	});
-	test("bash with $PI_CODING_AGENT_DIR spelling → deny", async () => {
-		const h = session({});
-		const r = await toolCall(h, "bash", { command: "cat $PI_CODING_AGENT_DIR/config/pi-verdict.json" });
-		expect(r?.block).toBe(true);
-		expect(r.reason).toContain("self-protection");
-	});
-	test("ordinary commands unaffected (回归:无谈拦)", async () => {
-		const h = session({});
-		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
-		const r = await toolCall(h, "bash", { command: "ls -la /tmp" });
-		expect(r).toBeUndefined();
-		expect(h.calls.length).toBe(1);
-	});
-});
-
-describe("buildProtectedSet (pure)", () => {
-	test("single-file install form: exact own file + bash variants", () => {
-		const own = path.join(TMP_AGENT, "extensions", "pi-verdict.ts");
-		fs.mkdirSync(path.dirname(own), { recursive: true });
-		fs.writeFileSync(own, "// stub");
-		const s = buildProtectedSet(TMP_AGENT, own);
-		const ownReal = fs.realpathSync(own); // macOS TMP 在 /var → realpath 为 /private/var
-		expect(s.exact).toContain(ownReal);
-		expect(s.bashPatterns.some((re) => re.test(`echo x > ${ownReal}`))).toBe(true);
-		expect(s.bashPatterns.some((re) => re.test("cat $PI_CODING_AGENT_DIR/extensions/pi-verdict.ts"))).toBe(true);
-	});
-	test("npm dir install form: whole package dir as prefix", () => {
-		const own = path.join(TMP_AGENT, "extensions", "pi-verdict", "extensions", "pi-verdict.ts");
-		fs.mkdirSync(path.dirname(own), { recursive: true });
-		fs.writeFileSync(own, "// stub");
-		const s = buildProtectedSet(TMP_AGENT, own);
-		const pkg = path.join(TMP_AGENT, "extensions", "pi-verdict");
-		expect(s.prefixes).toContain(fs.realpathSync(pkg));
-		expect(isProtectedWritePath(path.join(pkg, "package.json"), "/proj", s)).toBe(true);
-		expect(isProtectedWritePath(path.join(pkg, "sub/dir/x.ts"), "/proj", s)).toBe(true);
-		expect(isProtectedWritePath(path.join(TMP_AGENT, "extensions", "other.ts"), "/proj", s)).toBe(false); // 包外不拦
-	});
-	test("omp 18.1+ layout: package dir under <configRoot>/plugins/node_modules is protected", async () => {
-		// omp 18.1+: plugins/ is a sibling of agent/ in the config root —
-		// agentDir (<root>/agent) must still shield <root>/plugins/node_modules/<pkg>
-		await withTempDir(".pv-omp181-", async (root) => {
-				const agent = path.join(root, "agent");
-				const pkg = path.join(root, "plugins", "node_modules", "pi-verdict");
-				fs.mkdirSync(path.join(pkg, "extensions"), { recursive: true });
-				fs.writeFileSync(path.join(pkg, "package.json"), "{}");
-				fs.writeFileSync(path.join(pkg, "extensions", "pi-verdict.ts"), "// stub");
-				const s = buildProtectedSet(agent, path.join(pkg, "extensions", "pi-verdict.ts"));
-				expect(s.prefixes).toContain(fs.realpathSync(pkg));
-				expect(isProtectedWritePath(path.join(pkg, "package.json"), "/proj", s)).toBe(true);
-				expect(isProtectedWritePath(path.join(pkg, "extensions", "pi-verdict.ts"), "/proj", s)).toBe(true);
-				// neighbor packages under the same node_modules stay unprotected
-				expect(isProtectedWritePath(path.join(root, "plugins", "node_modules", "other-pkg", "x.ts"), "/proj", s)).toBe(false);
-		}, os.homedir());
-	});
-	test("scoped npm package: protection covers @scope/pkg, not the whole scope dir", async () => {
-		// npm scopes are two-segment dirs — the install target is the package;
-		// over-protecting @scope/* neighbors would deny unrelated user packages
-		await withTempDir(".pv-omp181s-", async (root) => {
-				const agent = path.join(root, "agent");
-				const scope = path.join(root, "plugins", "node_modules", "@jesset");
-				const pkg = path.join(scope, "pi-verdict");
-				fs.mkdirSync(path.join(pkg, "extensions"), { recursive: true });
-				fs.mkdirSync(path.join(scope, "other-pkg"), { recursive: true });
-				fs.writeFileSync(path.join(pkg, "package.json"), "{}");
-				fs.writeFileSync(path.join(pkg, "extensions", "pi-verdict.ts"), "// stub");
-				fs.writeFileSync(path.join(scope, "other-pkg", "x.ts"), "x");
-				const s = buildProtectedSet(agent, path.join(pkg, "extensions", "pi-verdict.ts"));
-				expect(s.prefixes).toContain(fs.realpathSync(pkg));
-				expect(isProtectedWritePath(path.join(pkg, "package.json"), "/proj", s)).toBe(true);
-				expect(isProtectedWritePath(path.join(scope, "other-pkg", "x.ts"), "/proj", s)).toBe(false);
-		}, os.homedir());
-	});
-	test("dev checkout (outside agentDir/extensions) → 不保护扩展文件,仅配置", () => {
-		const s = buildProtectedSet(TMP_AGENT, "/repo/extensions/pi-verdict.ts");
-		expect(s.exact).not.toContain("/repo/extensions/pi-verdict.ts");
-		expect(s.prefixes.every((p) => !p.startsWith("/repo/"))).toBe(true); // 扩展无前缀;#54 后 verdicts 前缀恒在
-		expect(isProtectedWritePath(path.join(TMP_AGENT, "config", "pi-verdict.json"), "/proj", s)).toBe(true);
 	});
 });
 
@@ -1483,25 +1328,6 @@ describe("audit verdict records (#54)", () => {
 		expect(typeof recs[0].answeredAt).toBe("string");
 	});
 
-	test("agent reads and writes under verdicts/ are denied (file tools and bash)", async () => {
-		clearAudit();
-		const h = session({ audit: true });
-		const inVerdicts = { path: path.join(VERDICTS(), "s1.jsonl") };
-		const wr = await toolCall(h, "write", { ...inVerdicts, content: "laundered" });
-		expect(wr?.block).toBe(true);
-		expect(wr.reason).toContain("self-protection");
-		const rd = await toolCall(h, "read", inVerdicts);
-		expect(rd?.block).toBe(true);
-		expect(rd.reason).toContain("self-protection");
-		const gr = await toolCall(h, "grep", { pattern: "verdict", path: VERDICTS() });
-		expect(gr?.block).toBe(true);
-		expect(gr.reason).toContain("self-protection");
-		const bs = await toolCall(h, "bash", { command: `cat ${path.join(VERDICTS(), "s1.jsonl")}` });
-		expect(bs?.block).toBe(true);
-		expect(bs.reason).toContain("self-protection");
-		expect(h.calls.length).toBe(0); // deterministic layer 0, classifier never reached
-	});
-
 	test("audit write failure never alters the verdict; warns exactly once", async () => {
 		clearAudit();
 		fs.writeFileSync(VERDICTS(), "not a directory"); // occupy the path with a file
@@ -1635,7 +1461,7 @@ describe("audit user answers (#62)", () => {
 	test("adjudicate returns pendingAudit for interactive asks instead of appending (both flavors)", async () => {
 		clearAudit();
 		setConfig({ audit: true, denyPaths: ["/proj/secret-project"] });
-		const state = new SessionState(buildProtectedSet(TMP_AGENT, null), undefined, TMP_AGENT);
+		const state = new SessionState(undefined, TMP_AGENT);
 		const v1 = await adjudicate(state, { toolName: "write", input: { path: "/proj/secret-project/n.md", content: "x" } }, adjudicateEnv());
 		expect(v1.verdict).toBe("ask");
 		expect(v1.source).toBe("protected-path");
@@ -1892,7 +1718,7 @@ describe("confidence floor + cascade (#67)", () => {
 	test("aborted signal aborts the fallback attempt; both modes fall to the human", async () => {
 		const run = async (mode: "shadow" | "enforce") => {
 			setConfig({ classifierMinConfidence: 50, classifierFallbackModel: "mock/fb", classifierFallbackMode: mode });
-			const state = new SessionState(buildProtectedSet(TMP_AGENT, null));
+			const state = new SessionState();
 			const ctrl = new AbortController();
 			const env = {
 				cwd: "/proj",
@@ -2202,7 +2028,7 @@ describe("agentDir self-anchoring (#35)", () => {
 	});
 });
 
-describe("omp host forms: S0 floor + self-protection (#35)", () => {
+describe("omp host forms: S0 floor (#35)", () => {
 	const HOME = os.homedir();
 	const OMP_AUTH = path.join(HOME, ".omp", "agent", "auth.json");
 	const PI_AUTH = path.join(HOME, ".pi", "agent", "auth.json");
@@ -2227,47 +2053,6 @@ describe("omp host forms: S0 floor + self-protection (#35)", () => {
 		expect(r?.block).toBe(true);
 	});
 
-	test("buildProtectedSet omp npm form: whole package dir as write-protected prefix", async () => {
-		await withTempDir("pv-omp-", async (agent) => {
-				const pkgDir = path.join(agent, "plugins", "node_modules", "pi-verdict");
-				fs.mkdirSync(path.join(pkgDir, "extensions"), { recursive: true });
-				fs.writeFileSync(path.join(pkgDir, "package.json"), "{}");
-				const own = path.join(pkgDir, "extensions", "pi-verdict.ts");
-				fs.writeFileSync(own, "// stub");
-				const s = buildProtectedSet(agent, own);
-				const pkgReal = fs.realpathSync(pkgDir);
-				expect(s.prefixes).toContain(pkgReal);
-				expect(isProtectedWritePath(path.join(pkgDir, "package.json"), "/proj", s)).toBe(true);
-				expect(isProtectedWritePath(path.join(pkgDir, "extensions", "pi-verdict.ts"), "/proj", s)).toBe(true);
-			}, os.homedir());
-	});
-
-	test("omp single-file form under plugins/node_modules is NOT misclassified as single-file exact (dir form wins)", async () => {
-		// ownFile deeper than <pkgRoot>/extensions must still protect the whole package dir,
-		// mirroring the pi npm-dir semantics (first segment under the install root)
-		await withTempDir("pv-omp2-", async (agent) => {
-				const pkgDir = path.join(agent, "plugins", "node_modules", "pi-verdict");
-				fs.mkdirSync(path.join(pkgDir, "extensions"), { recursive: true });
-				const own = path.join(pkgDir, "extensions", "pi-verdict.ts");
-				fs.writeFileSync(own, "// stub");
-				fs.writeFileSync(path.join(pkgDir, "package.json"), "{}");
-				const s = buildProtectedSet(agent, own);
-				expect(s.prefixes).toContain(fs.realpathSync(pkgDir));
-				expect(s.exact).not.toContain(fs.realpathSync(own)); // package-dir prefix, not per-file exact
-		});
-	});
-
-	test("bash variant: $PI_CODING_AGENT_DIR spelling covers the omp install copy", async () => {
-		await withTempDir("pv-omp3-", async (agent) => {
-				const pkgDir = path.join(agent, "plugins", "node_modules", "pi-verdict");
-				fs.mkdirSync(path.join(pkgDir, "extensions"), { recursive: true });
-				const own = path.join(pkgDir, "extensions", "pi-verdict.ts");
-				fs.writeFileSync(own, "// stub");
-				const s = buildProtectedSet(agent, own);
-				const rel = path.join("plugins", "node_modules", "pi-verdict", "extensions", "pi-verdict.ts");
-				expect(s.bashPatterns.some((re) => re.test(`cat $PI_CODING_AGENT_DIR/${rel}`))).toBe(true);
-		});
-	});
 });
 
 // ── 20. 判定管线 interface 级(adjudicate):ask 降级统一 / source × degraded / 明文零泄漏 ──
@@ -2293,7 +2078,7 @@ describe("adjudicate pipeline (interface level)", () => {
 
 	test("ask degradation is unified: protected-path ask degrades to deny without UI", async () => {
 		setConfig({ denyPaths: [secret] });
-		const state = new SessionState(buildProtectedSet(TMP_AGENT, null));
+		const state = new SessionState();
 		const v = await adjudicate(state, { toolName: "write", input: { path: path.join(secret, "notes.md"), content: "x" } }, adjudicateEnv({ hasUI: false }));
 		expect(v.verdict).toBe("deny");
 		expect(v.source).toBe("protected-path");
@@ -2303,7 +2088,7 @@ describe("adjudicate pipeline (interface level)", () => {
 
 	test("ask degradation is unified: classifier ask degrades to deny without UI", async () => {
 		setConfig({});
-		const state = new SessionState(buildProtectedSet(TMP_AGENT, null));
+		const state = new SessionState();
 		const v = await adjudicate(state, { toolName: "bash", input: { command: "echo hello" } }, adjudicateEnv({ hasUI: false, text: "<verdict>ask</verdict> maybe" }));
 		expect(v.verdict).toBe("deny");
 		expect(v.source).toBe("classifier");
@@ -2312,7 +2097,7 @@ describe("adjudicate pipeline (interface level)", () => {
 
 	test("with UI the same calls stay terminal asks (degradation is UI-conditional, not verdict-conditional)", async () => {
 		setConfig({ denyPaths: [secret] });
-		const state = new SessionState(buildProtectedSet(TMP_AGENT, null));
+		const state = new SessionState();
 		const v = await adjudicate(state, { toolName: "write", input: { path: path.join(secret, "notes.md"), content: "x" } }, adjudicateEnv({ hasUI: true }));
 		expect(v.verdict).toBe("ask");
 		expect(v.degraded).toBe(false);
@@ -2324,7 +2109,7 @@ describe("adjudicate pipeline (interface level)", () => {
 	test("source × degraded covers every template key the presenter can encounter", async () => {
 		const run = async (cfg: Parameters<typeof setConfig>[0], tool: string, input: any, env: any) => {
 			setConfig(cfg);
-			return adjudicate(new SessionState(buildProtectedSet(TMP_AGENT, null)), { toolName: tool, input }, env);
+			return adjudicate(new SessionState(), { toolName: tool, input }, env);
 		};
 		expect(await run({ allow: ["^ls\\b"] }, "bash", { command: "ls -la" }, adjudicateEnv())).toMatchObject({ verdict: "allow", source: "rule", degraded: false });
 		expect(await run({}, "bash", { command: "rm " + "-rf /tmp/x" }, adjudicateEnv())).toMatchObject({ verdict: "deny", source: "rule", degraded: false });
@@ -2341,7 +2126,7 @@ describe("adjudicate pipeline (interface level)", () => {
 		const protectedPath = path.join(secret, "notes.md");
 		// Verdict 面:ask 与降级 deny 的 reason 都不得含路径明文
 		setConfig({ denyPaths: [secret] });
-		const state = new SessionState(buildProtectedSet(TMP_AGENT, null));
+		const state = new SessionState();
 		const vAsk = await adjudicate(state, { toolName: "write", input: { path: protectedPath, content: "x" } }, adjudicateEnv());
 		expect(vAsk.verdict).toBe("ask");
 		expect(vAsk.reason).not.toContain("secret-project");

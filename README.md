@@ -12,7 +12,6 @@
 - Built-in danger rules and your own allow/deny rules settle the clear cases first, at zero latency
 - Everything else goes to a model classifier that sees the conversation context
 - Any uncertainty or failure fails closed; nothing ever runs silently
-- Self-protection: the gate's own config and installed copy are agent-write-denied — edit them yourself, outside the gate
 
 ## The problem
 
@@ -32,7 +31,6 @@ pi-verdict adds the missing gate: a model decides whether each call should run, 
 - **Judgments, not proofs** — a classifier `allow` is an informed opinion; the floor exists because that is all it is.
 - **Minimal trusted input** — no tool results in the transcript (#22), zero path plaintext to the classifier (ADR-0002).
 - **Canonical identity** — lexical + realpath dual-form matching; a workspace-*looking* path is not trusted as one (#20/#21).
-- **The gate guards itself** — self-protection that no configuration can disable (ADR-0001).
 - **A permission gate, not a sandbox** — stack OS isolation on top; this gate never replaces it.
 
 Full statement in [docs/security-principles.md](docs/security-principles.md).
@@ -119,7 +117,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 
 - `allow`/`deny` are JS regex arrays; **`deny` wins over `allow`**, both beat the classifier
 - `denyPaths` are plain paths you declare **protected** — touches trigger a terminal ask you adjudicate (non-interactive → deny); the classifier never learns the paths themselves, only that they exist. `grep`/`find`/`ls` compare their whole **search scope**: an omitted `path` (pi's default: the current directory) or a parent directory of a declared path triggers the ask as well. A fresh install pre-fills a **starter list** (`~/.ssh/`, `~/.gnupg`, `~/.mc`, shell rc/profile files), active from the first session after the initial run (any config change applies to new sessions) — a pre-filled *user declaration*, not a built-in floor: edit or empty it freely, add your own (`~/Documents/private`, …) alongside; existing configs are never rewritten
-- `builtinDenyFloor: false` turns off the built-in danger/path floor (your risk; the self-protection layer below always stays on)
+- `builtinDenyFloor: false` turns off the built-in danger/path floor (your risk)
 - `classifierModel` pins the classifier model, e.g. `"zai/glm-5.3-flash:low"` (thinking suffix supported; default: session model with thinking off)
 - `classifierModel: "typesafe/jev-latest"` opts into the bundled **jev decisions adapter** — gray-zone verdicts via TypeSafe's jev (OpenRouter by default, or TypeSafe's official API directly with `PI_VERDICT_JEV_TRANSPORT=typesafe`); experimental, see [ADR-0003](docs/adr/0003-jev-decisions-adapter.md)
 - `audit: true` records every **gray-zone adjudication** (the full transcript sent to the classifier, its raw response, the parsed verdict) as JSONL under `~/.pi/agent/verdicts/<sessionId>.jsonl` — one file per session, the 20 most recent kept. Interactive asks also record your answer (`userAnswer` ground truth, written after the confirm resolves), and protected-path asks are recorded too (#62); rule allow/deny stays unaudited. Local-only and full-fidelity (protected-path plaintext may appear — it never leaves your machine; [ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md) boundary note); the agent can neither read nor write the directory. `/automode` shows the audit state and path while on
@@ -145,13 +143,6 @@ No built-in allowlist — every "always allow" claim is yours ([why](docs/config
 
 jev's calibrated confidence is exactly what the confidence floor keys on — pair it with a second layer (`"classifierMinConfidence": 50, "classifierFallbackModel": "anthropic/claude-haiku-4-5"`) so its low-confidence calls go to a deeper model instead of standing ([ADR-0004](docs/adr/0004-classifier-fallback-cascade.md)).
 
-### Self-protection (the gate guards itself — [ADR-0001](docs/adr/0001-self-protection-layer.md))
-
-The gate's own files — the config and the installed extension copy — are **user-editable only**: writes from inside the gate hard-deny (reads pass); your editor never passes through the gate, the sudoers/visudo precedent.
-
-- **Not disableable by any config** — `builtinDenyFloor: false` and user `allow` rules cannot touch this layer
-- No runtime tamper-detection backstop: a bypass that edits the installed file directly (outside any pi/omp tool call) is not detected or reverted. Removed (local patch) because a shared installed copy across concurrent sessions made the in-memory snapshot backstop revert a legitimate manual edit and permanently fail-close a session that never touched the file itself; write-deny (above) remains the actual guarantee.
-
 Requires pi ≥ 0.84. Works in interactive and non-interactive (`-p`/json/rpc) sessions; in non-interactive modes `ask` degrades to `deny`.
 
 ## How it compares
@@ -165,15 +156,12 @@ Requires pi ≥ 0.84. Works in interactive and non-interactive (`-p`/json/rpc) s
 
 Full landscape: [`research/pi-permission-landscape.md`](research/pi-permission-landscape.md) · convergence analysis with the closest architectural relative: [`research/pi-automode-convergence.md`](research/pi-automode-convergence.md).
 
-Honest framing: pi-automode and pi-verdict have **converged on the same architecture** (deny floor → user rules → classifier, fail-closed — see the convergence analysis). What remains distinct here: a classifier that can say `ask` (runtime human-in-the-loop, not just rule-declared), a built-in floor you can turn off (`builtinDenyFloor` — user sovereignty), a self-protection layer that no config can turn off ([ADR-0001](docs/adr/0001-self-protection-layer.md) — gate integrity), a zero-dependency single file ([one readable file](extensions/pi-verdict.ts), still one file on purpose), and the measurement habit — every design decision in this repo is backed by shipped research.
+Honest framing: pi-automode and pi-verdict have **converged on the same architecture** (deny floor → user rules → classifier, fail-closed — see the convergence analysis). What remains distinct here: a classifier that can say `ask` (runtime human-in-the-loop, not just rule-declared), a built-in floor you can turn off (`builtinDenyFloor` — user sovereignty), a zero-dependency single file ([one readable file](extensions/pi-verdict.ts), still one file on purpose), and the measurement habit — every design decision in this repo is backed by shipped research.
 
 ## Pipeline
 
 ```
 tool_call
-  │
-  ├─ 0. Self-protection layer (ADR-0001; not disableable by any config)
-  │     └─ write/edit/bash touching the gate's own files → deny; reads pass
   │
   ├─ 1. Rule layer (deterministic, zero latency)
   │     ├─ built-in deny floor: bash danger regexes + path sensitivity S0–S5
@@ -218,10 +206,9 @@ Design decisions here are settled by measurement, and the lab notes ship with th
 - parallel gray-zone calls are adjudicated serially
 - self-reflection means the session model adjudicates — point `--auto-mode-model` at a lighter model if verdict latency/cost matters (open question tracked in the issue tracker)
 - shadow cache is observe-only by decision; the serving switch is a one-line change once measured hit rates justify it
-- `denyPaths` bash extraction is token-level ([ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md)): command substitution, base64-embedded paths and external script contents produce no hit signal — those calls fall back to the classifier's existence-hint vigilance. MCP and custom tools bypass the extractor entirely (their gray-zone adjudication still carries the hint). Path normalization is base-tier only (ADR-0002): a nonexistent target written through a symlinked directory rebuilds no real form and produces no hit — that indirection falls to the hint vigilance too (the ancestor-rebuilding tier applies to the self-protection layer and the sensitivity floor, not denyPaths). Honest framing, same as the self-protection substring precedent: the deterministic layer is obfuscatable, which is exactly why a hit routes to *you* rather than silently deciding
+- `denyPaths` bash extraction is token-level ([ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md)): command substitution, base64-embedded paths and external script contents produce no hit signal — those calls fall back to the classifier's existence-hint vigilance. MCP and custom tools bypass the extractor entirely (their gray-zone adjudication still carries the hint). Path normalization is base-tier only (ADR-0002): a nonexistent target written through a symlinked directory rebuilds no real form and produces no hit — that indirection falls to the hint vigilance too. Honest framing: the deterministic layer is obfuscatable, which is exactly why a hit routes to *you* rather than silently deciding
 - `denyPaths` bash tokens contain no spaces: a *declared* path containing spaces cannot be spelled in a bash command in a way the extractor sees — `cat "/path with space/x"` splits into two tokens and never hits (file tools still hit, their path is not tokenized). A glob covering the final segment of a base (`cat /proj/pers*` against `denyPaths: ["/proj/personal"]`) also misses — the base's own name never appears literally. A recursive search issued from a shell misses in both spellings — no path argument (defaults to the cwd, e.g. a bare `rg foo`) or a parent-directory argument (`rg foo <parent-of-a-declared-path>`): an argument-less command contributes no token at all and bash tokens otherwise compare one-directionally, while the file tools' bidirectional subtree compare covers the same shapes issued through `grep`/`find`/`ls`. All three holes fall back to the classifier's existence hint, alongside substitution/base64 above
-- self-protection bash matching is substring regex — obfuscatable, with no runtime tamper-detection backstop (removed, see [ADR-0001](docs/adr/0001-self-protection-layer.md) amendment); write-deny on the gate's own files is the actual guarantee against agent-initiated edits
-- dev checkouts (running the extension from a repo, not `<agentDir>/extensions/`) are not self-protected — the installed copy the *next* normal session loads is only covered by its own sessions' gate
+- the gate's own config and installed extension copy carry no special protection — agent-side writes to them are graded like any other file, by the same rule layer and classifier as everything else (self-protection removed, see [ADR-0001](docs/adr/0001-self-protection-layer.md))
 
 **verdict is not a sandbox.** It runs inside the pi process and adjudicates tool calls; it does not contain malicious code, protect against a compromised process, or guard manual `!` shell escapes. For isolation, use an OS-level sandbox.
 
@@ -232,7 +219,7 @@ The name: the three-state **verdict** is the core concept. The UX keeps `/automo
 ```bash
 bun install
 bun run typecheck
-bun test          # offline stub tests: self-protection, tamper detection, deny floor, user rules, denyPaths, bypass regression, classifier retry, shadow cache, commands, toggle shortcut
+bun test          # offline stub tests: deny floor, user rules, denyPaths, bypass regression, classifier retry, shadow cache, commands, toggle shortcut
 ```
 
 Issue tracker and decision records live in the GitHub issues ("map" issue #1 indexes them).

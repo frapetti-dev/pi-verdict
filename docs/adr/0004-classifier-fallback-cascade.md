@@ -59,7 +59,7 @@ The literature's answer to exactly this tradeoff is the LLM cascade (FrugalGPT, 
 
 ## Known limitations
 
-- A cascade raises *resolution*; it is not an injection defense — both layers read the same transcript, and jev "does not treat state as hostile". The rule floor and self-protection layer remain the deterministic backbone.
+- A cascade raises *resolution*; it is not an injection defense — both layers read the same transcript, and jev "does not treat state as hostile". The rule floor remains the deterministic backbone (the self-protection layer this line originally also named was removed in full, see ADR-0001's final revision).
 - Shadow data is only evaluable with the #62 ground-truth fields; without `userAnswer`, agreement rates say nothing about correctness.
 - Enforce rows must be read via `fallback.effective` (the top-level verdict is the first layer's) — a documented trap for analysis scripts. On non-interactive records, an `effective` of `ask` was applied as its deny degradation (the usual ask-degradation rule); the top-level `degraded` flag reflects the first layer only.
 - Sequential latency: a triggered call may spend the first layer's budget plus up to 15s of fallback budget *per attempt* (the two-tier retry mirrors the first layer's per-attempt 25s, so worst case ≈30s).

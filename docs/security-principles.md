@@ -16,7 +16,7 @@ uncertainty → friction     (never: uncertainty → permission)
 
 ### 2. Deterministic floors come before AI
 
-Some security properties must never depend on an LLM. The built-in deny floor (bash danger regexes + path sensitivity grades) and the self-protection layer adjudicate before the classifier is ever consulted. The classifier may interpret ambiguity; it must not override a hard deny — and neither can user allow rules.
+Some security properties must never depend on an LLM. The built-in deny floor (bash danger regexes + path sensitivity grades) adjudicates before the classifier is ever consulted. The classifier may interpret ambiguity; it must not override a hard deny — and neither can user allow rules.
 
 ### 3. The classifier judges semantics, not syntax
 
@@ -40,23 +40,19 @@ The classifier receives only what it needs to judge: a condensed transcript (use
 
 Path decisions use canonical filesystem identity, not lexical strings: lexical + realpath dual-form matching (#20), case folding on case-insensitive filesystems, macOS firmlink prefixes (#21), relative/`~`/`$HOME`/env-var spellings, and ancestor-realpath reconstruction for not-yet-existing targets. A path that merely *looks* workspace-local is not trusted as workspace-local.
 
-### 8. The gate guards itself
+### 8. User policy may restrict, and may only weaken by explicit opt-in
 
-The agent must not be able to rewrite the gate and immediately benefit from the rewrite. The self-protection layer ([ADR-0001](./adr/0001-self-protection-layer.md)) — not disableable by any configuration — protects the user-rules config and the extension's own installed copies (pi and omp install forms) with a hard write-deny; there is no runtime tamper-detection backstop (removed, see the ADR-0001 amendment — a shared installed copy across concurrent sessions made the in-memory snapshot backstop revert legitimate manual edits).
+User rules are the user's own security declarations (deny beats allow; denyPaths are the stronger declaration channel). The built-in deny floor *can* be turned off — but only by an explicit, documented `builtinDenyFloor: false` in the user's own config file, i.e. a deliberate downgrade the user owns, never a silent or accidental weakening.
 
-### 9. User policy may restrict, and may only weaken by explicit opt-in
-
-User rules are the user's own security declarations (deny beats allow; denyPaths are the stronger declaration channel). The self-protection layer cannot be weakened by anything. The built-in deny floor *can* be turned off — but only by an explicit, documented `builtinDenyFloor: false` in the user's own config file, i.e. a deliberate downgrade the user owns, never a silent or accidental weakening.
-
-### 10. Platform differences are documented, not silently weaker
+### 9. Platform differences are documented, not silently weaker
 
 Security semantics must not silently degrade just because an action is expressed differently. Where full parity is not shipped, the gap is documented instead: on Windows the built-in floor covers bash-shaped patterns only — PowerShell-native dangerous commands rely on the classifier, which fails closed (see [Status & limitations](../README.md#status--limitations)).
 
-### 11. Optimize for safe automation, not maximum automation
+### 10. Optimize for safe automation, not maximum automation
 
 The objective is to maximize useful automation while minimizing unsafe automatic execution. Both extremes lose: "everything → ask" breeds approval fatigue and blind approvals; "everything ambiguous → allow" breeds silent unsafe execution. The three-state verdict exists for exactly this reason — auto-approve clearly low-impact actions, escalate the ambiguous ones, deny what violates hard policy.
 
-### 12. A permission gate, not a sandbox
+### 11. A permission gate, not a sandbox
 
 pi-verdict makes tool authorization safer and more explainable; it provides no OS-level isolation. For strong guarantees, stack it with what it deliberately is not: OS sandboxing, container isolation, filesystem/network restrictions, least-privilege execution. The strongest model is a *policy gate + semantic adjudication + technical isolation* — never any single mechanism.
 
@@ -71,8 +67,7 @@ pi-verdict makes tool authorization safer and more explainable; it provides no O
                          │
                          ▼
               ┌─────────────────────┐
-              │ Self-protection +   │
-              │ deterministic floor │   (regexes, path grades, denyPaths — no LLM)
+              │ Deterministic floor │   (regexes, path grades, denyPaths — no LLM)
               └──────────┬──────────┘
                  deny ◄──┼──► clearly safe → allow
                          │

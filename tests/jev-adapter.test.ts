@@ -23,7 +23,7 @@ import jevAdapter, {
 	verdictText,
 	wireModel,
 } from "../extensions/jev-adapter.ts";
-import { adjudicate, buildProtectedSet, SessionState } from "../extensions/pi-verdict.ts";
+import { adjudicate, SessionState } from "../extensions/pi-verdict.ts";
 
 const TMP_AGENT = fs.mkdtempSync(path.join(os.tmpdir(), "pi-verdict-jev-test-"));
 const SAVED_OR_KEY = process.env.OPENROUTER_API_KEY;
@@ -149,7 +149,7 @@ describe("parseJevConfidence (#63)", () => {
 });
 
 describe("verdict prefix contract (real adjudicate pipeline)", () => {
-	const state = new SessionState(buildProtectedSet(TMP_AGENT, null));
+	const state = new SessionState();
 	const envFor = (text: string) => ({
 		cwd: "/proj",
 		hasUI: true,
@@ -389,18 +389,5 @@ describe("typesafe transport (direct v1 API)", () => {
 		const message = await provider.streamSimple(provider.getModels()[0], { messages: [{ role: "user", content: "x" }] } as any, {}).result();
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("TYPESAFE_API_KEY");
-	});
-});
-
-describe("self-protection coverage (#26 whole-package protection)", () => {
-	test("a colocated jev-adapter.ts joins the write-protected prefix of an npm-dir install", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-verdict-pkg-"));
-		const pkg = path.join(root, "agent", "extensions", "pi-verdict");
-		fs.mkdirSync(path.join(pkg, "extensions"), { recursive: true });
-		fs.writeFileSync(path.join(pkg, "extensions", "pi-verdict.ts"), "gate");
-		fs.writeFileSync(path.join(pkg, "extensions", "jev-adapter.ts"), "adapter");
-		const prot = buildProtectedSet(path.join(root, "agent"), path.join(pkg, "extensions", "pi-verdict.ts"));
-		expect(prot.prefixes).toContain(fs.realpathSync(pkg));
-		fs.rmSync(root, { recursive: true, force: true });
 	});
 });
