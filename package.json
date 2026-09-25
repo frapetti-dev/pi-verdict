@@ -1,6 +1,6 @@
 {
 	"name": "@frapetti-dev/pi-verdict",
-	"version": "0.12.1",
+	"version": "0.13.0",
 	"description": "A minimal permission gate for Pi in the style of Claude Code's auto mode",
 	"author": "frapetti-dev (https://github.com/frapetti-dev)",
 	"type": "module",

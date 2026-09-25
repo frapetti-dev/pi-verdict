@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-25
+
 ### Removed
 
-- Self-protection layer (ADR-0001, superseded — see its final revision): the rule-layer hard deny on agent writes to `<agentDir>/config/pi-verdict.json` and the installed extension copies is gone, along with the `#54` verdicts audit directory's read/write blocking that shared the same module. Agent-initiated writes to the gate's own files and to `<agentDir>/verdicts/` are now graded like any other path, by the ordinary rule layer and classifier — no special exemption and no special block. Removal followed the 2026-09-24 removal of the layer's runtime tamper-detection backstop, which had already narrowed the layer's real guarantee to "blocks writes made through a tool call" (a direct rewrite of the installed file outside any tool call was already unaffected). Users who want these paths protected can declare them via `denyPaths` (ask-terminal, not hard deny). `trustedProjects` project-override config loading is unaffected; only the write-protection wiring on its candidate files is gone.
+- **BREAKING**: Self-protection layer (ADR-0001, superseded — see its final revision): the rule-layer hard deny on agent writes to `<agentDir>/config/pi-verdict.json` and the installed extension copies is gone, along with the `#54` verdicts audit directory's read/write blocking that shared the same module. Agent-initiated writes to the gate's own files and to `<agentDir>/verdicts/` are now graded like any other path, by the ordinary rule layer and classifier — no special exemption and no special block. Removal followed the 2026-09-24 removal of the layer's runtime tamper-detection backstop, which had already narrowed the layer's real guarantee to "blocks writes made through a tool call" (a direct rewrite of the installed file outside any tool call was already unaffected). Users who want these paths protected can declare them via `denyPaths` (ask-terminal, not hard deny). `trustedProjects` project-override config loading is unaffected; only the write-protection wiring on its candidate files is gone.
 
 ### Fixed
 
