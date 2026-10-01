@@ -80,7 +80,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `/automode on`
 - `/automode off`
 - `ctrl+shift+a` — toggle the master switch silently (the always-on footer is the only feedback; rebind or disable via `toggleShortcut`)
-- `/verdict [user|local]` — edit the list rules (`allow`, `deny`, `denyPaths`, `tools`, `rules`) of the global (`user`) or project (`local`) config interactively: add / edit / remove entries, saved to disk and applied to the running session at once. Scalar keys stay hand-edited
+- `/verdict [user|local]` — edit the list rules (`allow`, `deny`, `denyPaths`, `tools`, `rules`) of the global (`user`) or project (`local`) config interactively: add / edit / remove entries, saved to disk and applied to the running session at once; also hosts the `gateOmpDir` on/off switch. Other scalar keys stay hand-edited
 - footer always shows `auto mode on` (green) / `auto mode off` (yellow)
 
 | Option | Default | Description |
@@ -106,6 +106,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
     "~/.bashrc"
   ],
   "builtinDenyFloor": true,
+  "gateOmpDir": true,
   "classifierModel": null,
   "toggleShortcut": "ctrl+shift+a",
   "audit": false,
@@ -119,6 +120,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `allow`/`deny` are JS regex arrays; **`deny` wins over `allow`**, both beat the classifier
 - `denyPaths` are plain paths you declare **protected** — touches trigger a terminal ask you adjudicate (non-interactive → deny); the classifier never learns the paths themselves, only that they exist. `grep`/`find`/`ls` compare their whole **search scope**: an omitted `path` (pi's default: the current directory) or a parent directory of a declared path triggers the ask as well. A fresh install pre-fills a **starter list** (`~/.ssh/`, `~/.gnupg`, `~/.mc`, shell rc/profile files), active from the first session after the initial run (any config change applies to new sessions) — a pre-filled *user declaration*, not a built-in floor: edit or empty it freely, add your own (`~/Documents/private`, …) alongside; existing configs are never rewritten
 - `builtinDenyFloor: false` turns off the built-in danger/path floor (your risk)
+- `gateOmpDir` (default `true`) is the **forced `.omp` gate**: any file-tool path or bash command touching a `.omp` directory (lexical or symlink-resolved; `~/.omp`, `<project>/.omp`, …) triggers a terminal ask you adjudicate (non-interactive → deny). It runs after the built-in floor and your `deny` rules and before `denyPaths`/`allow`, so an `allow` regex cannot skip it. `false` disables it; toggle it from `/verdict`. `grep`/`find`/`ls` are checked on their own target only (a recursive search that merely traverses a nested `.omp` is not an access)
 - `classifierModel` pins the classifier model, e.g. `"zai/glm-5.3-flash:low"` (thinking suffix supported; default: session model with thinking off)
 - `classifierModel: "typesafe/jev-latest"` opts into the bundled **jev decisions adapter** — gray-zone verdicts via TypeSafe's jev (OpenRouter by default, or TypeSafe's official API directly with `PI_VERDICT_JEV_TRANSPORT=typesafe`); experimental, see [ADR-0003](docs/adr/0003-jev-decisions-adapter.md)
 - `audit: true` records every **gray-zone adjudication** (the full transcript sent to the classifier, its raw response, the parsed verdict) as JSONL under `~/.pi/agent/verdicts/<sessionId>.jsonl` — one file per session, the 20 most recent kept. Interactive asks also record your answer (`userAnswer` ground truth, written after the confirm resolves), and protected-path asks are recorded too (#62); rule allow/deny stays unaudited. Local-only and full-fidelity (protected-path plaintext may appear — it never leaves your machine; [ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md) boundary note); the agent can neither read nor write the directory. `/automode` shows the audit state and path while on
@@ -168,6 +170,7 @@ tool_call
   ├─ 1. Rule layer (deterministic, zero latency)
   │     ├─ built-in deny floor: bash danger regexes + path sensitivity S0–S5
   │     ├─ your rules: user deny beats user allow
+  │     ├─ gateOmpDir: any .omp directory access → terminal ask, before denyPaths
   │     ├─ denyPaths (ADR-0002): protected paths → terminal ask,
   │     │   before user allow; classifier sees an existence hint only
   │     └─ no built-in allowlist — every "always allow" claim is yours to make

@@ -14,7 +14,7 @@ Auto Mode 门禁的启用状态:会话内存态,默认开启。有三个操作�
 
 ### 判定管线 (adjudication pipeline)
 
-从 tool_call 到三态裁决的完整判定流程,按序:内置 floor → 用户 deny → denyPaths ask → 用户 allow → 灰区交分类器;ask 降级(无 UI → deny)与 fail-closed 内建于管线语义。实现形态:`adjudicate(session, call, env) → Verdict` 纯函数——零 UI 依赖的 deep module,表现(notify/confirm/select)由扩展 handler 承担。_Avoid_: 裁决管线(全仓统一用「判定管线」)。
+从 tool_call 到三态裁决的完整判定流程,按序:内置 floor → 用户 deny → 强制 `.omp` 门禁(`gateOmpDir`,默认开)ask → denyPaths ask → 用户 allow → 灰区交分类器;ask 降级(无 UI → deny)与 fail-closed 内建于管线语义。实现形态:`adjudicate(session, call, env) → Verdict` 纯函数——零 UI 依赖的 deep module,表现(notify/confirm/select)由扩展 handler 承担。_Avoid_: 裁决管线(全仓统一用「判定管线」)。
 
 ### 裁决 (verdict)
 
@@ -51,6 +51,10 @@ Auto Mode 门禁的启用状态:会话内存态,默认开启。有三个操作�
 ### 存在性话术 (existence hint)
 
 注入分类器 system prompt 的固定背景句:告知用户配置了受保护路径,擦边行为(拷贝到临时目录再读、打包、间接引用)应从紧裁决。是 denyPaths 泄漏面为零承诺的推论:分类器知道"有",不知道"是什么"。
+
+### 强制 .omp 门禁 (forced .omp gate)
+
+Opt-out rule-layer gate (`gateOmpDir`, default on): any tool call whose file path or bash command resolves into a `.omp` path segment (lexical or realpath form, base tier) ends in a terminal ask (non-interactive → deny). It is a built-in declaration, not a user-listed path: it ranks after the built-in floor and user deny, before denyPaths and user allow. Unlike denyPaths it leaves no existence hint for the classifier (the ask is terminal) and scope tools (grep/find/ls) compare their own target only, not their subtree. Switchable from `/verdict` (the one scalar key it edits).
 
 ### 灰区 (gray zone)
 

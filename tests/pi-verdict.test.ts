@@ -116,13 +116,14 @@ const clearAudit = () => fs.rmSync(VERDICTS(), { recursive: true, force: true })
 beforeAll(() => { process.env.PI_CODING_AGENT_DIR = TMP_AGENT; });
 afterAll(() => { delete process.env.PI_CODING_AGENT_DIR; });
 
-function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; classifierModel?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown }, invalid?: string[]): void {
+function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown }, invalid?: string[]): void {
 	config = { allow: cfg.allow ?? [], deny: cfg.deny ?? [] };
 	const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
 	fs.mkdirSync(path.dirname(p), { recursive: true });
 	const raw: Record<string, unknown> = { ...config };
 	if (cfg.classifierModel !== undefined) raw.classifierModel = cfg.classifierModel;
 	if (cfg.builtinDenyFloor !== undefined) raw.builtinDenyFloor = cfg.builtinDenyFloor;
+	if (cfg.gateOmpDir !== undefined) raw.gateOmpDir = cfg.gateOmpDir;
 	if (cfg.toggleShortcut !== undefined) raw.toggleShortcut = cfg.toggleShortcut;
 	if (cfg.audit !== undefined) raw.audit = cfg.audit;
 	if (cfg.notifyAllows !== undefined) raw.notifyAllows = cfg.notifyAllows;
@@ -2264,6 +2265,100 @@ describe("project trust prompt", () => {
 	});
 });
 
+// ── Forced .omp directory gate (gateOmpDir) ─────────────
+
+describe("gateOmpDir forced gate", () => {
+	const OMP_FILE = "/proj/.omp/notes.md";
+
+	test("default on: file tools touching a .omp directory ask for confirmation", async () => {
+		for (const tool of ["read", "write", "edit"]) {
+			const h = session({});
+			await toolCall(h, tool, { path: OMP_FILE, content: "x" });
+			expect(h.confirms).toBe(1);
+			expect(h.calls.length).toBe(0); // terminal ask: no classifier involved
+		}
+	});
+
+	test("declined confirmation blocks; accepted passes; the block reason carries no path", async () => {
+		const h = session({});
+		h.confirmAnswer = false;
+		const r = await toolCall(h, "read", { path: OMP_FILE });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).not.toContain(".omp");
+		const h2 = session({});
+		expect(await toolCall(h2, "read", { path: OMP_FILE })).toBeUndefined();
+		expect(h2.confirms).toBe(1);
+	});
+
+	test("scope tools: explicit .omp target asks; omitted path with a cwd inside .omp asks; a plain project root does not", async () => {
+		const h = session({});
+		await toolCall(h, "ls", { path: "/proj/.omp" });
+		expect(h.confirms).toBe(1);
+		const inside = session({}, { cwd: "/proj/.omp/agent" });
+		await toolCall(inside, "grep", { pattern: "x" });
+		expect(inside.confirms).toBe(1);
+		const plain = session({});
+		await toolCall(plain, "grep", { pattern: "x" });
+		expect(plain.confirms).toBe(0);
+	});
+
+	test("bash: .omp as a path component or bare word asks; lookalike names do not", async () => {
+		for (const command of ["ls ~/.omp/agent/skills", "cd .omp && ls", 'cat "$HOME/.omp/x"']) {
+			const h = session({});
+			await toolCall(h, "bash", { command });
+			expect(h.confirms).toBe(1);
+		}
+		for (const command of ["echo a.omp", "cat .ompx/y", "cat .omp.bak"]) {
+			const h = session({});
+			h.responses = [{ text: "<verdict>allow</verdict> fine" }];
+			await toolCall(h, "bash", { command });
+			expect(h.confirms).toBe(0);
+		}
+	});
+
+	test("lookalike file-tool segments (.ompx, x.omp) do not ask", async () => {
+		for (const p of ["/proj/.ompx/a", "/proj/x.omp", "/proj/omp/a"]) {
+			const h = session({});
+			expect(await toolCall(h, "read", { path: p })).toBeUndefined();
+			expect(h.confirms).toBe(0);
+		}
+	});
+
+	test("beats user allow rules but not user deny rules", async () => {
+		const allowed = session({ allow: [".*"] });
+		await toolCall(allowed, "read", { path: OMP_FILE });
+		expect(allowed.confirms).toBe(1);
+		const denied = session({ allow: [".*"], deny: ["\\.omp"] });
+		const r = await toolCall(denied, "read", { path: OMP_FILE });
+		expect(r?.block).toBe(true);
+		expect(denied.confirms).toBe(0);
+	});
+
+	test("non-interactive session: ask degrades to deny", async () => {
+		const h = session({});
+		h.ctx.hasUI = false;
+		const r = await toolCall(h, "read", { path: OMP_FILE });
+		expect(h.confirms).toBe(0);
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).toContain("non-interactive");
+	});
+
+	test("gateOmpDir:false disables the gate; non-false values keep it on", async () => {
+		const off = session({ gateOmpDir: false });
+		expect(await toolCall(off, "read", { path: OMP_FILE })).toBeUndefined();
+		expect(off.confirms).toBe(0);
+		const junk = session({ gateOmpDir: "nope" });
+		await toolCall(junk, "read", { path: OMP_FILE });
+		expect(junk.confirms).toBe(1);
+	});
+
+	test("master switch off → gate inert", async () => {
+		const h = session({}, { flag: false });
+		expect(await toolCall(h, "read", { path: OMP_FILE })).toBeUndefined();
+		expect(h.confirms).toBe(0);
+	});
+});
+
 // ── /verdict config editor ──────────────────────────────
 
 describe("/verdict config editor", () => {
@@ -2326,6 +2421,37 @@ describe("/verdict config editor", () => {
 		const h = session({});
 		await run(h, "bogus", { picks: [] });
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("Usage: /verdict [user|local]"))).toBe(true);
+	});
+
+	test("gateOmpDir: switch persists, applies immediately; On restores the gate", async () => {
+		const h = session({});
+		await run(h, "user", { picks: ["gateOmpDir", "Off", "Done"] });
+		expect(readUser().gateOmpDir).toBe(false);
+		expect(await toolCall(h, "read", { path: "/proj/.omp/notes.md" })).toBeUndefined();
+		expect(h.confirms).toBe(0);
+		h.selectPicks = ["gateOmpDir", "On", "Done"];
+		await h.commands.verdict.handler("user", h.ctx);
+		expect(readUser().gateOmpDir).toBe(true);
+		await toolCall(h, "read", { path: "/proj/.omp/notes.md" });
+		expect(h.confirms).toBe(1);
+	});
+
+	test("gateOmpDir: local file can set and unset (inherit global)", async () => {
+		await withTempDir("pv-verdict-gate-", async (dir) => {
+			const h = session({}, { cwd: dir });
+			const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
+			const file = path.join(dir, dot, "pi-verdict.json");
+			await run(h, "local", { picks: ["gateOmpDir", "Off", "gateOmpDir", "× Unset", "Done"] });
+			expect("gateOmpDir" in JSON.parse(fs.readFileSync(file, "utf8"))).toBe(false);
+		});
+	});
+
+	test("gateOmpDir: non-boolean value is not editable from the menu (warns, file unchanged)", async () => {
+		const h = session({ gateOmpDir: "nope" });
+		const before = fs.readFileSync(USER_FILE(), "utf8");
+		await run(h, "user", { picks: ["gateOmpDir", "Done"] });
+		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("gateOmpDir") && m.includes("not a boolean"))).toBe(true);
 	});
 });
 
