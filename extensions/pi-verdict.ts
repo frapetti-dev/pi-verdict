@@ -347,7 +347,8 @@ function samePath(a: string, b: string): boolean {
 }
 
 /** Nearest <dir>/<dotDir>/pi-verdict.json walking up from cwd. Stops (exclusive) at the home dir
- *  and at the agent tree's root parent, so the global tree is never mistaken for a project. */
+ *  and at the agent tree's root parent, so the global tree is never mistaken for a project.
+ *  Applied only when the project is trusted (see readTrustStore). */
 function findProjectConfig(cwd: string, agentDir: string): string | null {
 	const dot = projectDotDir(agentDir);
 	const stops = [os.homedir(), path.dirname(path.dirname(agentDir))];
@@ -362,25 +363,73 @@ function findProjectConfig(cwd: string, agentDir: string): string | null {
 	}
 }
 
-function parseTrustedProjects(raw: unknown, skipped: string[]): string[] {
-	if (raw === undefined || raw === null) return [];
-	if (!Array.isArray(raw)) {
-		skipped.push(`trustedProjects: ${JSON.stringify(raw)} (must be an array of paths)`);
-		return [];
-	}
-	return raw.flatMap((x) => {
-		if (typeof x !== "string" || !x.trim()) {
-			skipped.push(`trustedProjects: ${JSON.stringify(x)}`);
-			return [];
-		}
-		return [path.resolve(expandHome(x.trim()))];
-	});
+// ---- project trust (gate-owned; the host's own trust notion is not usable: omp always reports trusted) ----
+
+const TRUST_CHOICE = "Trust — apply this project's config (remembered)";
+const NOT_NOW_CHOICE = "Not now — ignore it this session";
+const NEVER_CHOICE = "Never — ignore it and don't ask again";
+
+function trustStorePath(): string {
+	return path.join(agentDirPath(), "config", "pi-verdict-trust.json");
 }
 
-/** Exact-root trust (no subtree trust): any lexical/realpath form of root equals any form of an entry */
-function isTrustedRoot(root: string, trusted: string[]): boolean {
+/** The directory that contains the project's dot dir */
+function projectRootOf(configPath: string): string {
+	return path.dirname(path.dirname(configPath));
+}
+
+/** Exact-root match only, never subtrees */
+function rootIn(root: string, list: string[]): boolean {
 	const rootForms = baseForms(root);
-	return trusted.some((t) => baseForms(t).some((tf) => rootForms.some((rf) => samePath(tf, rf))));
+	return list.some((t) => baseForms(t).some((tf) => rootForms.some((rf) => samePath(tf, rf))));
+}
+
+interface TrustStore { trusted: string[]; untrusted: string[]; error: string | null }
+
+function readTrustStore(): TrustStore {
+	const p = trustStorePath();
+	if (!fs.existsSync(p)) return { trusted: [], untrusted: [], error: null };
+	let raw: unknown;
+	try {
+		raw = JSON.parse(fs.readFileSync(p, "utf8"));
+	} catch (err) {
+		return { trusted: [], untrusted: [], error: `trust file unreadable: ${err instanceof Error ? err.message : String(err)} (${p})` };
+	}
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+		return { trusted: [], untrusted: [], error: `trust file unreadable: top level must be a JSON object (${p})` };
+	}
+	let error: string | null = null;
+	const obj = raw as Record<string, unknown>; // narrowed above to a non-null, non-array object
+	const list = (key: "trusted" | "untrusted"): string[] => {
+		const v = obj[key];
+		if (v === undefined) return [];
+		if (!Array.isArray(v)) {
+			error ??= `trust file ${key}: must be an array of paths (${p})`;
+			return [];
+		}
+		return v.flatMap((x) => (typeof x === "string" && x.trim() ? [path.resolve(x.trim())] : []));
+	};
+	const trusted = list("trusted");
+	const untrusted = list("untrusted");
+	return { trusted, untrusted, error };
+}
+
+/** Persist a trust decision for a project root. Returns an error message, or null on success.
+ *  A damaged file is never overwritten (the user may have hand-edited it). */
+function recordTrust(root: string, decision: "trusted" | "untrusted"): string | null {
+	const store = readTrustStore();
+	if (store.error !== null) return store.error;
+	const trusted = store.trusted.filter((e) => !rootIn(root, [e]));
+	const untrusted = store.untrusted.filter((e) => !rootIn(root, [e]));
+	(decision === "trusted" ? trusted : untrusted).push(path.resolve(root));
+	const p = trustStorePath();
+	try {
+		fs.mkdirSync(path.dirname(p), { recursive: true });
+		fs.writeFileSync(p, JSON.stringify({ trusted, untrusted }, null, 2) + "\n");
+	} catch (err) {
+		return `could not write ${p}: ${err instanceof Error ? err.message : String(err)}`;
+	}
+	return null;
 }
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
@@ -406,17 +455,16 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	classifierFallbackModel: null,
 	classifierFallbackMode: "shadow",
 	rules: [],
-	trustedProjects: [],
 }, null, 2)}\n`;
 
-interface LoadedRules { rules: UserRules; skipped: string[]; shortcutWarning: string | null; project: { path: string; applied: boolean } | null }
+interface LoadedRules { rules: UserRules; skipped: string[]; shortcutWarning: string | null; project: { path: string; trusted: boolean; applied: boolean } | null }
 
 /**
  * 加载用户规则。首启生成带注释模板(allow 内示例默认仅 ^ls\b 可用,其余为说明占位);
  * 配置缺失/损坏/字段非法一律回退空规则(安全默认,不失效),非法正则收集回报,
  * 非法 toggleShortcut 收集警告文案(与 skipped 同经 session_start 发出)。
  */
-function loadUserRules(cwd: string | null = null): LoadedRules {
+function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | null = null): LoadedRules {
 	try {
 		const p = userConfigPath();
 		if (!fs.existsSync(p)) {
@@ -426,7 +474,7 @@ function loadUserRules(cwd: string | null = null): LoadedRules {
 			} catch { /* 只读环境静默跳过 */ }
 			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null };
 		}
-	let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown; trustedProjects?: unknown };
+	let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown };
 		try {
 			raw = JSON.parse(fs.readFileSync(p, "utf8")) as typeof raw;
 		} catch (err) {
@@ -436,38 +484,37 @@ function loadUserRules(cwd: string | null = null): LoadedRules {
 			return { rules: EMPTY_RULES, skipped: [`config parse failed: ${err instanceof Error ? err.message : String(err)} — user rules not loaded (${p})`], shortcutWarning: null, project: null };
 		}
 		const skipped: string[] = [];
-		// [pi-verdict local patch: project overrides] replace-merge a trusted project's file over the global raw object
+		// [pi-verdict local patch: project overrides] shallow-merge the nearest trusted project's config over the global raw object
 		const agentDir = agentDirPath();
-		const trusted = parseTrustedProjects(raw.trustedProjects, skipped);
 		let project: LoadedRules["project"] = null;
 		const pp = cwd === null ? null : findProjectConfig(cwd, agentDir);
 		if (pp) {
-			project = { path: pp, applied: false };
-			const root = path.dirname(path.dirname(pp));
-			if (!isTrustedRoot(root, trusted)) {
-				skipped.push(`project config ${pp} ignored: ${root} is not listed in trustedProjects of ${p}`);
-			} else {
-				let projRaw: unknown;
+			const root = projectRootOf(pp);
+			const store = readTrustStore();
+			if (store.error) skipped.push(store.error);
+			const trusted = (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, store.trusted);
+			project = { path: pp, trusted, applied: false };
+			let projRaw: unknown;
+			// untrusted and undecided both mean "not applied" (file never parsed); the session_start prompt owns the user-facing notice
+			if (trusted) {
 				try {
 					projRaw = JSON.parse(fs.readFileSync(pp, "utf8"));
 				} catch (err) {
 					skipped.push(`project config parse failed: ${err instanceof Error ? err.message : String(err)} — project overrides not loaded (${pp})`);
 				}
-				if (projRaw !== undefined) {
-					if (typeof projRaw !== "object" || projRaw === null || Array.isArray(projRaw)) {
-						skipped.push(`project config ${pp}: top level must be a JSON object — project overrides not loaded`);
-					} else {
-						const over: Record<string, unknown> = { ...(projRaw as Record<string, unknown>) };
-						for (const k of ["trustedProjects", "toggleShortcut"]) {
-							if (k in over) {
-								skipped.push(`${k}: not overridable per project — key ignored (${pp})`);
-								delete over[k];
-							}
-						}
-						delete over._hint;
-						raw = { ...raw, ...over } as typeof raw;
-						project = { path: pp, applied: true };
+			}
+			if (projRaw !== undefined) {
+				if (typeof projRaw !== "object" || projRaw === null || Array.isArray(projRaw)) {
+					skipped.push(`project config ${pp}: top level must be a JSON object — project overrides not loaded`);
+				} else {
+					const over: Record<string, unknown> = { ...(projRaw as Record<string, unknown>) };
+					if ("toggleShortcut" in over) {
+						skipped.push(`toggleShortcut: not overridable per project — key ignored (${pp})`);
+						delete over.toggleShortcut;
 					}
+					delete over._hint;
+					raw = { ...raw, ...over } as typeof raw;
+					project = { path: pp, trusted: true, applied: true };
 				}
 			}
 		}
@@ -1438,8 +1485,8 @@ export class SessionState {
 
 	/** 会话重置:重载用户规则(配置改动新会话生效)+ 按会话 cwd 重锚 denyPaths
 	 *  (ADR-0002: 每会话锚定一次)+ 清影子缓存;返回加载报告供表现层通知 */
-	reset(cwd: string): { skipped: string[]; shortcutWarning: string | null; project: { path: string; applied: boolean } | null } {
-		const loaded = loadUserRules(cwd);
+	reset(cwd: string, sessionTrustedRoot: string | null = null): { skipped: string[]; shortcutWarning: string | null; project: { path: string; trusted: boolean; applied: boolean } | null } {
+		const loaded = loadUserRules(cwd, sessionTrustedRoot);
 		this.userRules = loaded.rules;
 		this.denyPathBases = anchorDenyPaths(loaded.rules.denyPaths, cwd); // anchored to the session cwd, once (ADR-0002)
 		this.shadow.reset();
@@ -1784,13 +1831,38 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	// session_start:重置影子缓存(会话内存态,#5 定案)+ 重载用户规则(配置改动新会话生效)
 	pi.on("session_start", async (_event, ctx) => {
-		const report = state.reset(ctx.cwd);
+		// Project trust prompt: any await stays inside the prompt branch so the no-project path remains synchronous
+		let sessionTrustedRoot: string | null = null;
+		const pp = findProjectConfig(ctx.cwd, agentDirPath());
+		if (pp) {
+			const root = projectRootOf(pp);
+			const store = readTrustStore();
+			// ctx.agent is omp-only (pi's ExtensionContext has no `agent`): narrow at runtime
+			const isSub = "agent" in ctx && typeof ctx.agent === "object" && ctx.agent !== null && "kind" in ctx.agent && ctx.agent.kind === "sub";
+			if (!rootIn(root, store.trusted) && !rootIn(root, store.untrusted) && ctx.hasUI && !isSub) {
+				const choice = await ctx.ui.select(
+					`🛡️ pi-verdict: ${pp} can override your global gate config (allow rules, builtinDenyFloor, autoDeny, …). Trust this project?`,
+					[TRUST_CHOICE, NOT_NOW_CHOICE, NEVER_CHOICE],
+				);
+				if (choice === TRUST_CHOICE) {
+					sessionTrustedRoot = root;
+					const err = recordTrust(root, "trusted");
+					if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
+				} else if (choice === NEVER_CHOICE) {
+					const err = recordTrust(root, "untrusted");
+					if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — you will be asked again`, "warning");
+				}
+				// undefined (dialog dismissed) or NOT_NOW_CHOICE: ignore for this session, persist nothing
+			}
+		}
+		const report = state.reset(ctx.cwd, sessionTrustedRoot);
 		state.audit?.prune(); // #54: converge to the AUDIT_KEEP_SESSIONS most recent files at session start
 		if (report.skipped.length > 0) {
 			ctx.ui.notify(`pi-verdict: skipped ${report.skipped.length} invalid config value(s) in config (${userConfigPath()}${report.project?.applied ? ` + ${report.project.path}` : ""}): ${report.skipped.join(", ")}`, "warning");
 		}
 		if (report.shortcutWarning) ctx.ui.notify(`pi-verdict: ${report.shortcutWarning}`, "warning");
 		if (report.project?.applied) ctx.ui.notify(`pi-verdict: project overrides applied from ${report.project.path}`, "info");
+		if (report.project && !report.project.trusted) ctx.ui.notify(`pi-verdict: project config ${report.project.path} ignored — project not trusted (decisions: ${trustStorePath()})`, "info");
 		refreshStatus(ctx);
 	});
 

@@ -2142,3 +2142,112 @@ describe("adjudicate pipeline (interface level)", () => {
 		for (const [msg] of h.notifies) expect(msg).not.toContain("secret-project");
 	});
 });
+
+describe("project trust prompt", () => {
+	const TRUST_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
+	const readTrust = () => JSON.parse(fs.readFileSync(TRUST_FILE(), "utf8")) as { trusted: string[]; untrusted: string[] };
+
+	/** Project config denies the probe command; blocked-by-rule ⇔ the project config is applied. */
+	async function withProject(fn: (h: Harness, dir: string) => Promise<void>): Promise<void> {
+		await withTempDir("pv-proj-", async (dir) => {
+			fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
+			fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ deny: ["^echo trusted-marker"] }));
+			fs.rmSync(TRUST_FILE(), { force: true });
+			const h = session({}, { cwd: dir });
+			h.responses = [{ text: "<verdict>allow</verdict> ok" }]; // unapplied config → gray → classifier allows
+			try {
+				await fn(h, dir);
+			} finally {
+				fs.rmSync(TRUST_FILE(), { force: true });
+			}
+		});
+	}
+	const applied = async (h: Harness) => {
+		const before = h.calls.length;
+		const r = await toolCall(h, "bash", { command: "echo trusted-marker" });
+		return r?.block === true && h.calls.length === before;
+	};
+	const start = (h: Harness) => h.handlers.session_start({}, h.ctx);
+
+	test("Trust: applies, persists the root, and is not asked again", async () => {
+		await withProject(async (h, dir) => {
+			(h as any).selectIndex = 0;
+			await start(h);
+			expect((h as any).selects).toBe(1);
+			expect(await applied(h)).toBe(true);
+			expect(readTrust().trusted).toContain(path.resolve(dir));
+			await start(h);
+			expect((h as any).selects).toBe(1);
+			expect(await applied(h)).toBe(true);
+		});
+	});
+
+	test("Not now: ignored, nothing persisted, asked again next session", async () => {
+		await withProject(async (h) => {
+			(h as any).selectIndex = 1;
+			await start(h);
+			expect(await applied(h)).toBe(false);
+			expect(fs.existsSync(TRUST_FILE())).toBe(false);
+			await start(h);
+			expect((h as any).selects).toBe(2);
+		});
+	});
+
+	test("dismissed dialog behaves like Not now", async () => {
+		await withProject(async (h) => {
+			(h as any).selectIndex = null;
+			await start(h);
+			expect(await applied(h)).toBe(false);
+			expect(fs.existsSync(TRUST_FILE())).toBe(false);
+			await start(h);
+			expect((h as any).selects).toBe(2);
+		});
+	});
+
+	test("Never: ignored, persisted as untrusted, never asked again, notifies", async () => {
+		await withProject(async (h, dir) => {
+			(h as any).selectIndex = 2;
+			await start(h);
+			expect(await applied(h)).toBe(false);
+			expect(readTrust().untrusted).toContain(path.resolve(dir));
+			await start(h);
+			expect((h as any).selects).toBe(1);
+			expect(h.notifies.some(([m, l]) => l === "info" && m.includes("not trusted"))).toBe(true);
+		});
+	});
+
+	test("headless: no prompt, config ignored", async () => {
+		await withProject(async (h) => {
+			h.ctx.hasUI = false;
+			await start(h);
+			expect((h as any).selects).toBe(0);
+			expect(await applied(h)).toBe(false);
+		});
+	});
+
+	test("subagent: no prompt and ignored when undecided; applied when the main session trusted it", async () => {
+		await withProject(async (h, dir) => {
+			h.ctx.agent = { kind: "sub" };
+			await start(h);
+			expect((h as any).selects).toBe(0);
+			expect(await applied(h)).toBe(false);
+			fs.mkdirSync(path.dirname(TRUST_FILE()), { recursive: true });
+			fs.writeFileSync(TRUST_FILE(), JSON.stringify({ trusted: [dir] }));
+			await start(h);
+			expect((h as any).selects).toBe(0);
+			expect(await applied(h)).toBe(true);
+		});
+	});
+
+	test("malformed trust file: Trust applies for the session, file untouched, warns", async () => {
+		await withProject(async (h) => {
+			fs.mkdirSync(path.dirname(TRUST_FILE()), { recursive: true });
+			fs.writeFileSync(TRUST_FILE(), "{");
+			(h as any).selectIndex = 0;
+			await start(h);
+			expect(await applied(h)).toBe(true);
+			expect(fs.readFileSync(TRUST_FILE(), "utf8")).toBe("{");
+			expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("not saved"))).toBe(true);
+		});
+	});
+});

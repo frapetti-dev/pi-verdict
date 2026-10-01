@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: `trustedProjects` in `pi-verdict.json` is replaced by an interactive project trust prompt plus a gate-owned trust file, `<agentDir>/config/pi-verdict-trust.json` (`{ "trusted": [...], "untrusted": [...] }`). A project config (`<dir>/.pi/pi-verdict.json`, `.omp/…` on omp) is applied only when its project root is trusted; an interactive session starting in an undecided project asks **Trust** / **Not now** / **Never**. Headless sessions and subagents never prompt and ignore undecided project configs. Existing `trustedProjects` entries are no longer read, so affected projects prompt once.
+
 ## [0.13.0] - 2026-09-25
 
 ### Removed
