@@ -79,9 +79,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type * as PiAgent from "@earendil-works/pi-coding-agent";
+import type * as PiTui from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
-import { activeTransport, parseJevConfidence, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER } from "./jev-adapter";
+import { activeTransport, type JevReason, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER } from "./jev-adapter";
 
 // ============================================================================
 // 规则层:bash
@@ -1833,6 +1835,206 @@ function entryLabel(x: unknown): string {
 }
 
 // ============================================================================
+// Approve dialog
+// ============================================================================
+
+/** Terminal-injection defense for text the dialog prints verbatim: control, bidi and
+ *  zero-width characters become visible `\uXXXX` escapes; `\t` and `\n` survive. */
+export function displaySafe(text: string): string {
+	return text
+		.replace(/\r\n/g, "\n")
+		.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2069\ufeff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+const MAX_DIALOG_CODE_CHARS = 4000;
+const MAX_DIALOG_CODE_LINES = 40;
+const MAX_DIALOG_EDIT_BLOCKS = 3;
+
+/** One fenced code block; the fence outgrows any backtick run in the body so the body cannot close it. */
+function fencedBlock(body: string, lang: string): string {
+	let text = displaySafe(body);
+	if (text.length > MAX_DIALOG_CODE_CHARS) {
+		text = `${text.slice(0, 2400)}\n… [${text.length - MAX_DIALOG_CODE_CHARS} chars truncated] …\n${text.slice(-1600)}`;
+	}
+	const lines = text.split("\n");
+	if (lines.length > MAX_DIALOG_CODE_LINES) {
+		text = [...lines.slice(0, 30), `… [${lines.length - MAX_DIALOG_CODE_LINES} lines omitted] …`, ...lines.slice(-10)].join("\n");
+	}
+	const longestRun = Math.max(0, ...(text.match(/`+/g) ?? []).map((r) => r.length));
+	const fence = "`".repeat(Math.max(3, longestRun + 1));
+	return `${fence}${lang}\n${text}\n${fence}`;
+}
+
+/** Code view of a tool call for the approve dialog: bash `command`, write `content`, or edit
+ *  `newText` blocks, as Markdown with fenced code. null → the dialog shows the one-line action. */
+export function approveCodeMarkdown(
+	toolName: string,
+	input: Record<string, unknown>,
+	langFromPath: (p: string) => string | undefined,
+): { header: string; markdown: string } | null {
+	if (typeof input.command === "string") {
+		return { header: displaySafe(toolName), markdown: fencedBlock(input.command, "bash") };
+	}
+	if (typeof input.path === "string" && typeof input.content === "string") {
+		return { header: displaySafe(`${toolName}: ${input.path}`), markdown: fencedBlock(input.content, langFromPath(input.path) ?? "") };
+	}
+	if (typeof input.path === "string" && Array.isArray(input.edits)) {
+		const texts = input.edits.map((e) => (e as { newText?: unknown } | null)?.newText).filter((t): t is string => typeof t === "string");
+		if (texts.length === 0) return null;
+		const n = texts.length;
+		const lang = langFromPath(input.path) ?? "";
+		const parts: string[] = [];
+		texts.slice(0, MAX_DIALOG_EDIT_BLOCKS).forEach((t, i) => parts.push(`edit ${i + 1} of ${n}`, fencedBlock(t, lang)));
+		if (n > MAX_DIALOG_EDIT_BLOCKS) parts.push(`… ${n - MAX_DIALOG_EDIT_BLOCKS} more edits not shown`);
+		return { header: displaySafe(`${toolName}: ${input.path} (${n} edit${n === 1 ? "" : "s"})`), markdown: parts.join("\n\n") };
+	}
+	return null;
+}
+
+/** Two lines: a probability bar (allow/ask/deny cells, largest-remainder rounding) and its legend. */
+export function renderJevBar(j: JevReason, width: number, theme: Pick<Theme, "fg" | "bold">): string[] {
+	const cells = Math.max(10, Math.min(48, width));
+	const names = ["allow", "ask", "deny"] as const;
+	const colors = { allow: "success", ask: "warning", deny: "error" } as const;
+	const sum = j.probabilities.allow + j.probabilities.ask + j.probabilities.deny;
+	let bar: string;
+	if (sum === 0) {
+		bar = theme.fg("muted", "░".repeat(cells));
+	} else {
+		const exact = names.map((k) => (j.probabilities[k] / sum) * cells);
+		const counts = exact.map(Math.floor);
+		let left = cells - counts.reduce((a, b) => a + b, 0);
+		const order = exact.map((e, i) => ({ i, frac: e - Math.floor(e) })).sort((a, b) => b.frac - a.frac || a.i - b.i);
+		for (const { i } of order) {
+			if (left <= 0) break;
+			counts[i]++;
+			left--;
+		}
+		bar = names.map((k, i) => (counts[i] > 0 ? theme.fg(colors[k], "█".repeat(counts[i])) : "")).join("");
+	}
+	const label = (k: (typeof names)[number]): string => {
+		const s = theme.fg(colors[k], `${k} ${j.probabilities[k]}%`);
+		return k === j.choice ? theme.bold(s) : s;
+	};
+	const legend = [...names.map(label), theme.fg("muted", `confidence ${j.confidence}%`)].join("  ");
+	return [bar, legend];
+}
+
+type DialogModules = { tui: typeof PiTui; agent: typeof PiAgent };
+let dialogModules: Promise<DialogModules | null> | undefined;
+/** Value imports are lazy so hosts and test mocks that never open the rich dialog do not load pi-tui / pi-coding-agent. */
+function loadDialogModules(): Promise<DialogModules | null> {
+	dialogModules ??= Promise.all([import("@earendil-works/pi-tui"), import("@earendil-works/pi-coding-agent")]).then(
+		([tui, agent]) => ({ tui, agent }),
+		() => null,
+	);
+	return dialogModules;
+}
+
+interface ApproveDialogSpec {
+	/** dialog title */
+	title: string;
+	toolName: string;
+	input: Record<string, unknown>;
+	/** toolCallLine, shown when approveCodeMarkdown returns null */
+	action: string;
+	/** "Classifier opinion: …" / "Rule: …" / "Fail-closed: …" / protected-path reason */
+	reasonLine: string;
+	/** protected path only: rendered as "Protected path: <detail>" */
+	detail?: string;
+	/** "Allow execution?" | "Allow this access?" */
+	question: string;
+	jev: JevReason | null;
+	/** exact plain-text confirm() message used when the rich dialog is unavailable */
+	fallbackMessage: string;
+}
+
+/** Selector-style Yes/No dialog mirroring ExtensionSelectorComponent. Resolves `done(undefined)`
+ *  with an empty container if construction throws, so the caller falls back to `confirm`. */
+export function buildApproveDialog(
+	mods: DialogModules,
+	tui: { requestRender(): void },
+	theme: Theme,
+	spec: ApproveDialogSpec,
+	done: (result: boolean | undefined) => void,
+): PiTui.Container {
+	const { Container, Markdown, Spacer, Text, getKeybindings } = mods.tui;
+	const { DynamicBorder, getLanguageFromPath, getMarkdownTheme, keyHint, rawKeyHint } = mods.agent;
+	try {
+		const root = new Container() as PiTui.Container & { handleInput(data: string): void };
+		root.addChild(new DynamicBorder());
+		root.addChild(new Spacer(1));
+		root.addChild(new Text(theme.fg("accent", theme.bold(displaySafe(spec.title))), 1, 0));
+		root.addChild(new Spacer(1));
+		const code = approveCodeMarkdown(spec.toolName, spec.input, getLanguageFromPath);
+		if (code) {
+			root.addChild(new Text(theme.fg("toolTitle", theme.bold(code.header)), 1, 0));
+			root.addChild(new Markdown(code.markdown, 1, 0, getMarkdownTheme()));
+		} else {
+			root.addChild(new Text(displaySafe(spec.action), 1, 0));
+		}
+		root.addChild(new Spacer(1));
+		const jev = spec.jev;
+		if (jev) {
+			root.addChild({ render: (w: number) => renderJevBar(jev, w - 2, theme).map((l) => ` ${l}`), invalidate() {} });
+			if (jev.concern) root.addChild(new Text(theme.fg("muted", "concern: ") + jev.concern, 1, 0));
+			if (jev.rest) root.addChild(new Text(theme.fg("muted", displaySafe(jev.rest)), 1, 0));
+		} else {
+			root.addChild(new Text(displaySafe(spec.reasonLine), 1, 0));
+		}
+		if (spec.detail !== undefined) root.addChild(new Text(displaySafe(`Protected path: ${spec.detail}`), 1, 0));
+		root.addChild(new Spacer(1));
+		root.addChild(new Text(theme.fg("text", spec.question), 1, 0));
+		const options = ["Yes", "No"];
+		let index = 0;
+		const list = new Container();
+		const updateList = (): void => {
+			list.clear();
+			options.forEach((o, i) => list.addChild(new Text(i === index ? theme.fg("accent", "→ ") + theme.fg("accent", o) : `  ${theme.fg("text", o)}`, 1, 0)));
+		};
+		updateList();
+		root.addChild(list);
+		root.addChild(new Spacer(1));
+		root.addChild(new Text(`${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`, 1, 0));
+		root.addChild(new Spacer(1));
+		root.addChild(new DynamicBorder());
+		root.handleInput = (data: string): void => {
+			const kb = getKeybindings();
+			if (kb.matches(data, "tui.select.up") || data === "k") {
+				index = 0;
+				updateList();
+				tui.requestRender();
+			} else if (kb.matches(data, "tui.select.down") || data === "j") {
+				index = 1;
+				updateList();
+				tui.requestRender();
+			} else if (kb.matches(data, "tui.select.confirm") || data === "\n") {
+				done(index === 0);
+			} else if (kb.matches(data, "tui.select.cancel")) {
+				done(false);
+			}
+		};
+		return root;
+	} catch {
+		done(undefined);
+		return new Container();
+	}
+}
+
+/** Rich dialog when the host supports `ui.custom` (interactive TUI); plain `confirm` otherwise
+ *  (no `custom`, modules unavailable, or RPC mode, whose `custom()` returns undefined unrun). */
+async function confirmAsk(ctx: ExtensionContext, spec: ApproveDialogSpec): Promise<boolean> {
+	if (typeof ctx.ui.custom === "function") {
+		const mods = await loadDialogModules();
+		if (mods) {
+			const r = await ctx.ui.custom<boolean | undefined>((tui, theme, _kb, done) => buildApproveDialog(mods, tui, theme, spec, done));
+			if (r === true || r === false) return r;
+		}
+	}
+	return ctx.ui.confirm(spec.title, spec.fallbackMessage);
+}
+
+// ============================================================================
 // 扩展主体
 // ============================================================================
 
@@ -1862,7 +2064,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Verdict → UI(本扩展唯一的裁决呈现点):按 source × degraded 查模板,文案与
 	 *  重构前逐字节一致。受保护路径分支的通知永不携带路径明文与 action 行
 	 *  (ADR-0002 story 11:通知与 block reason 回流 agent context)。 */
-	async function presentVerdict(v: Verdict, action: string, ctx: ExtensionContext): Promise<{ block: true; reason: string } | undefined> {
+	async function presentVerdict(v: Verdict, call: { toolName: string; input: Record<string, unknown> }, action: string, ctx: ExtensionContext): Promise<{ block: true; reason: string } | undefined> {
 		if (v.verdict === "allow") {
 			// #60 (CONTEXT.md 通知): classifier allows surface via notifyAllows OR
 			// debug — exactly one notification either way; the shadow suffix stays
@@ -1896,7 +2098,17 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		}
 		// ask → 人工确认;非交互已在管线内降级,能走到这里的必有 UI
 		if (v.source === "protected-path") {
-			const ok = await ctx.ui.confirm("🛡️ Auto Mode: protected path", `${action}\n\n${v.reason}\n\nProtected path: ${v.detail ?? "(see pi-verdict.json)"}\n\nAllow this access?`);
+			const ok = await confirmAsk(ctx, {
+				title: "🛡️ Auto Mode: protected path",
+				toolName: call.toolName,
+				input: call.input,
+				action,
+				reasonLine: v.reason,
+				detail: v.detail ?? "(see pi-verdict.json)",
+				question: "Allow this access?",
+				jev: null,
+				fallbackMessage: `${action}\n\n${v.reason}\n\nProtected path: ${v.detail ?? "(see pi-verdict.json)"}\n\nAllow this access?`,
+			});
 			if (ok) {
 				// debug notify 不带 action 行:同上,通知不得携带受保护路径明文
 				if (debug) ctx.ui.notify("🛡️ allow (protected-path confirm)", "info");
@@ -1905,7 +2117,16 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			return { block: true, reason: blockedReason("user-declined", "user declined protected-path access") };
 		}
 		const label = v.source === "rule" ? "Rule" : v.source === "fail-closed" ? "Fail-closed" : "Classifier opinion";
-		const ok = await ctx.ui.confirm("🛡️ Auto Mode confirmation", `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`);
+		const ok = await confirmAsk(ctx, {
+			title: "🛡️ Auto Mode confirmation",
+			toolName: call.toolName,
+			input: call.input,
+			action,
+			reasonLine: `${label}: ${v.reason}`,
+			question: "Allow execution?",
+			jev: v.source === "classifier" ? parseJevReason(v.reason) : null,
+			fallbackMessage: `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`,
+		});
 		return ok ? undefined : { block: true, reason: blockedReason("user-declined", "user declined") };
 	}
 
@@ -2269,7 +2490,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		// (without the answer) and the error propagates unchanged. `undefined` = allowed.
 		let presented: { block: true; reason: string } | undefined;
 		try {
-			presented = await presentVerdict(verdict, action, ctx);
+			presented = await presentVerdict(verdict, { toolName: event.toolName, input }, action, ctx);
 		} catch (err) {
 			if (verdict.pendingAudit) state.audit?.append(verdict.pendingAudit);
 			throw err;

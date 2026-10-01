@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, BASH_MAX_MATCH_LEN, bindCompletion, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, displaySafe, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
 
 // ── 桩设施 ──────────────────────────────────────────────
 
@@ -2326,5 +2326,108 @@ describe("/verdict config editor", () => {
 		const h = session({});
 		await run(h, "bogus", { picks: [] });
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("Usage: /verdict [user|local]"))).toBe(true);
+	});
+});
+
+// ── Approve dialog ──────────────────────────────────────
+
+describe("approve dialog helpers", () => {
+	const fakeTheme = { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bold: (t: string) => `*${t}*` } as any;
+	const count = (s: string, ch: string) => s.split(ch).length - 1;
+
+	test("renderJevBar: largest-remainder cells, bold chosen label, all-zero muted bar, width clamp", () => {
+		const [bar, legend] = renderJevBar({ choice: "ask", probabilities: { allow: 35, ask: 63, deny: 2 }, confidence: 45, concern: null, rest: "" }, 40, fakeTheme);
+		expect(bar).toBe(`<success>${"█".repeat(14)}</success><warning>${"█".repeat(25)}</warning><error>█</error>`);
+		expect(legend).toContain("*<warning>ask 63%</warning>*");
+		expect(legend).not.toContain("*<success>");
+		expect(legend).toContain("<muted>confidence 45%</muted>");
+		const zero = renderJevBar({ choice: "ask", probabilities: { allow: 0, ask: 0, deny: 0 }, confidence: 0, concern: null, rest: "" }, 40, fakeTheme)[0];
+		expect(zero).toBe(`<muted>${"░".repeat(40)}</muted>`);
+		expect(count(renderJevBar({ choice: "allow", probabilities: { allow: 100, ask: 0, deny: 0 }, confidence: 100, concern: null, rest: "" }, 200, fakeTheme)[0], "█")).toBe(48);
+	});
+
+	test("approveCodeMarkdown: fence outgrows body backticks, language from path, edit cap, line cap", () => {
+		const lang = (p: string) => (p.endsWith(".ts") ? "typescript" : undefined);
+		const bash = approveCodeMarkdown("bash", { command: "echo ```x```" }, lang)!;
+		expect(bash.markdown).toBe("````bash\necho ```x```\n````");
+		expect(approveCodeMarkdown("write", { path: "a.ts", content: "x" }, lang)!.markdown).toBe("```typescript\nx\n```");
+		expect(approveCodeMarkdown("write", { path: "a.bin", content: "x" }, lang)!.markdown).toBe("```\nx\n```");
+		const edits = Array.from({ length: 5 }, (_, i) => ({ oldText: "o", newText: `n${i}` }));
+		const e = approveCodeMarkdown("edit", { path: "a.ts", edits }, lang)!;
+		expect(e.header).toBe("edit: a.ts (5 edits)");
+		expect(count(e.markdown, "```typescript")).toBe(3);
+		expect(e.markdown).toContain("… 2 more edits not shown");
+		expect(approveCodeMarkdown("edit", { path: "a.ts", edits: [{ oldText: "o" }] }, lang)).toBeNull();
+		expect(approveCodeMarkdown("read", { path: "a.ts" }, lang)).toBeNull();
+		const long = approveCodeMarkdown("bash", { command: Array.from({ length: 100 }, (_, i) => `l${i}`).join("\n") }, lang)!;
+		expect(long.markdown).toContain("[60 lines omitted]");
+		expect(long.markdown).toContain("l0\n");
+		expect(long.markdown).toContain("l99\n");
+		const wide = approveCodeMarkdown("bash", { command: "x".repeat(10_000) }, lang)!;
+		expect(wide.markdown).toContain("[6000 chars truncated]");
+	});
+
+	test("displaySafe: control / bidi characters become visible escapes; tab and newline survive", () => {
+		expect(displaySafe("a\x1b[31mb")).toBe("a\\u001b[31mb");
+		expect(displaySafe("a\u202eb\r\nc\td")).toBe("a\\u202eb\nc\td");
+	});
+});
+
+describe("approve dialog routing", () => {
+	const ANSI = /\x1b\[[0-9;]*m/g;
+
+	test("ui.custom returning undefined (RPC mode) falls back to confirm", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
+		h.ctx.ui.custom = async () => undefined;
+		h.confirmAnswer = true;
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(r).toBeUndefined();
+		expect(h.confirms).toBe(1);
+	});
+
+	/** Drives the real dialog component: renders, sends the given keys, resolves like the TUI host would. */
+	function driveDialog(h: Harness, keys: string[], rendered: string[]): void {
+		h.ctx.ui.custom = async (factory: any) => {
+			const { initTheme } = await import("@earendil-works/pi-coding-agent");
+			initTheme("dark", false);
+			const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+			return new Promise((resolve) => {
+				const component = factory({ requestRender() {} }, fakeTheme, undefined, resolve);
+				rendered.push(component.render(80).join("\n").replace(ANSI, ""));
+				for (const k of keys) component.handleInput(k);
+			});
+		};
+	}
+
+	test("rich dialog: Down + Enter declines without calling confirm; renders command and options", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
+		const rendered: string[] = [];
+		driveDialog(h, ["\x1b[B", "\r"], rendered);
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(r.reason).toContain("user-declined");
+		expect(h.confirms).toBe(0);
+		for (const s of ["cargo build", "Yes", "No", "Classifier opinion: needs a human"]) expect(rendered[0]).toContain(s);
+	});
+
+	test("rich dialog: Enter on the default allows", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
+		driveDialog(h, ["\r"], []);
+		expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
+		expect(h.confirms).toBe(0);
+	});
+
+	test("rich dialog: a jev ask reason renders the bar legend and the concern", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>ask</verdict> jev: ask 63% (confidence 45%; allow 35%, deny 2%) — concern: network operation" }];
+		const rendered: string[] = [];
+		driveDialog(h, ["\x1b"], rendered);
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(r.reason).toContain("user-declined"); // Escape cancels
+		expect(rendered[0]).toContain("concern: network operation");
+		expect(rendered[0]).toContain("allow 35%");
+		expect(rendered[0]).toContain("█");
 	});
 });

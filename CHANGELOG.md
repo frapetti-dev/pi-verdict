@@ -10,10 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ### Added
 
 - `/verdict [user|local]` command: edit the list keys of `pi-verdict.json` (`allow`, `deny`, `denyPaths`, `tools`, `rules`) from the TUI — add, edit, and remove entries. `user` targets `<agentDir>/config/pi-verdict.json`, `local` the project config (`<project>/.pi/pi-verdict.json`, `.omp/…` on omp); a bare call asks which. Regex entries (`allow`/`deny`) are validated before saving. Each save rewrites only the edited key (other keys, key order, and `_hint` are preserved), reloads the rules into the running session immediately without clearing shadow-cache or fallback session stats, and never auto-trusts a project. The first project-level edit of a key offers to start from a copy of the global list (a project list replaces, not extends, the global one); `× Unset` removes the override so the project inherits the global list again. Scalar keys (`builtinDenyFloor`, `classifierModel`, `toggleShortcut`, …) are out of scope. Requires an interactive UI.
+- Rich approve dialog in the interactive TUI: the code under review (bash `command`, write `content`, edit `newText` blocks) is rendered with the chat's Markdown renderer as a syntax-highlighted fenced block (capped at 40 lines / 4000 characters; control and bidi characters shown as `\uXXXX` escapes). When the ask comes straight from jev, a colored bar graphs its allow/ask/deny distribution with a confidence legend, plus a `concern:` line. RPC mode and hosts without `ui.custom` keep the plain-text confirm unchanged.
+- jev backend: each decisions request now also carries a typed `concern` question (deletion, write outside the project, network, package install, environment change, credentials, untrusted code execution, other, none); the answer is appended to the reason as ` — concern: <label>` (cosmetic — a missing or malformed answer is ignored, only the verdict stays fail-closed).
 
 ### Changed
 
 - **BREAKING**: `trustedProjects` in `pi-verdict.json` is replaced by an interactive project trust prompt plus a gate-owned trust file, `<agentDir>/config/pi-verdict-trust.json` (`{ "trusted": [...], "untrusted": [...] }`). A project config (`<dir>/.pi/pi-verdict.json`, `.omp/…` on omp) is applied only when its project root is trusted; an interactive session starting in an undecided project asks **Trust** / **Not now** / **Never**. Headless sessions and subagents never prompt and ignore undecided project configs. Existing `trustedProjects` entries are no longer read, so affected projects prompt once.
+
+### Fixed
+
+- jev adapter on pi 0.84: host detection no longer relies on `registerProvider.length` (pi's wrapper is now `(providerOrName, config)`, arity 2, so pi was routed into the omp registration branch and every jev classifier call failed closed with `No API provider registered for api: jev-decisions`). omp is now recognized by its API object carrying `logger` and `typebox`; behavior on omp is unchanged.
 
 ## [0.13.0] - 2026-09-25
 
