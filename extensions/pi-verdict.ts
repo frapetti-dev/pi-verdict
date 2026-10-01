@@ -1459,6 +1459,13 @@ export class AuditLog {
 // 会话态:判定管线的会话期状态(复位清单集中一处)
 // ============================================================================
 
+/** Outcome of a rules (re)load, for the presentation layer to notify on */
+export interface RulesLoadReport {
+	skipped: string[];
+	shortcutWarning: string | null;
+	project: { path: string; trusted: boolean; applied: boolean } | null;
+}
+
 /**
  * 判定管线的会话期状态。session_start 的复位清单归 reset() 拥有——新增会话态只改
  * 这里,install 与 session_start 不再各持一份初始化点。导出仅为测试(内部 seam 的
@@ -1483,16 +1490,23 @@ export class SessionState {
 		return rules.audit && this.agentDir ? new AuditLog(path.join(this.agentDir, "verdicts")) : null;
 	}
 
-	/** 会话重置:重载用户规则(配置改动新会话生效)+ 按会话 cwd 重锚 denyPaths
-	 *  (ADR-0002: 每会话锚定一次)+ 清影子缓存;返回加载报告供表现层通知 */
-	reset(cwd: string, sessionTrustedRoot: string | null = null): { skipped: string[]; shortcutWarning: string | null; project: { path: string; trusted: boolean; applied: boolean } | null } {
+	/** Reload user (+ trusted project) rules and re-anchor denyPaths to `cwd` (ADR-0002: once per session
+	 *  start; /verdict re-anchors after a config edit). Leaves shadow-cache / fallback stats untouched. */
+	reloadRules(cwd: string, sessionTrustedRoot: string | null = null): RulesLoadReport {
 		const loaded = loadUserRules(cwd, sessionTrustedRoot);
 		this.userRules = loaded.rules;
 		this.denyPathBases = anchorDenyPaths(loaded.rules.denyPaths, cwd); // anchored to the session cwd, once (ADR-0002)
-		this.shadow.reset();
-		this.fallback.reset();
 		this.audit = this.makeAudit(loaded.rules);
 		return { skipped: loaded.skipped, shortcutWarning: loaded.shortcutWarning, project: loaded.project };
+	}
+
+	/** 会话重置:重载用户规则(配置改动新会话生效)+ 按会话 cwd 重锚 denyPaths
+	 *  (ADR-0002: 每会话锚定一次)+ 清影子缓存;返回加载报告供表现层通知 */
+	reset(cwd: string, sessionTrustedRoot: string | null = null): RulesLoadReport {
+		const report = this.reloadRules(cwd, sessionTrustedRoot);
+		this.shadow.reset();
+		this.fallback.reset();
+		return report;
 	}
 
 	/** denyPaths 基址:session_start 已锚定;此惰性回退仅守护乱序的首次 tool_call
@@ -1741,6 +1755,84 @@ export async function adjudicate(
 }
 
 // ============================================================================
+// Config editor helpers (/verdict)
+// ============================================================================
+
+const EDITABLE_LIST_KEYS = ["allow", "deny", "denyPaths", "tools", "rules"] as const;
+type EditableListKey = (typeof EDITABLE_LIST_KEYS)[number];
+const LIST_KEY_DESC: Record<EditableListKey, string> = {
+	allow: "regexes that auto-allow",
+	deny: "regexes that auto-deny",
+	denyPaths: "protected paths (always ask)",
+	tools: "MCP/custom tool names that auto-allow",
+	rules: "free-text classifier rules",
+};
+const LIST_KEY_PLACEHOLDER: Record<EditableListKey, string> = {
+	allow: "regex, e.g. ^git status\\b",
+	deny: "regex, e.g. ^git push --force",
+	denyPaths: "path, e.g. ~/.aws/",
+	tools: "exact tool name, e.g. ask",
+	rules: "free-text rule for the classifier",
+};
+
+/** Where a project config would be written for `cwd`: the existing one if discovered, else `<cwd>/<dotdir>/pi-verdict.json`.
+ *  null when `findProjectConfig`'s stop rule (home dir / agent tree root) would never discover a file there. */
+function projectConfigTarget(cwd: string, agentDir: string): string | null {
+	const found = findProjectConfig(cwd, agentDir);
+	if (found) return found;
+	if (samePath(cwd, os.homedir()) || samePath(cwd, path.dirname(path.dirname(agentDir)))) return null;
+	return path.join(path.resolve(cwd), projectDotDir(agentDir), "pi-verdict.json");
+}
+
+/** Parse a config file into its top-level object. A missing file yields the first-run template (user) or `{}` (local). */
+function readConfigObject(file: string, kind: "user" | "local"): { raw: Record<string, unknown> } | { error: string } {
+	if (!fs.existsSync(file)) return { raw: kind === "user" ? (JSON.parse(USER_CONFIG_TEMPLATE) as Record<string, unknown>) : {} };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch (e) {
+		return { error: `${file} is not valid JSON (${e instanceof Error ? e.message : String(e)}) — fix it by hand` };
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return { error: `${file}: top level must be a JSON object — fix it by hand` };
+	}
+	return { raw: parsed as Record<string, unknown> };
+}
+
+/** Write the config object back as pretty JSON; null on success, the error message otherwise */
+function writeConfigObject(file: string, raw: Record<string, unknown>): string | null {
+	try {
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify(raw, null, 2) + "\n");
+		return null;
+	} catch (e) {
+		return e instanceof Error ? e.message : String(e);
+	}
+}
+
+/** Validate and canonicalize a typed list entry; null = blank input (treated as cancel) */
+function normalizeEntry(key: EditableListKey, input: string): { value: string } | { error: string } | null {
+	const text = input.replace(/[\r\n]+$/, ""); // editor dialogs may append a trailing newline
+	if (text.trim() === "") return null;
+	if (key !== "rules" && /[\r\n]/.test(text)) return { error: "must be a single line" };
+	if (key === "allow" || key === "deny") {
+		// verbatim: patterns like "rm " rely on their spaces
+		try {
+			new RegExp(text);
+		} catch (e) {
+			return { error: `invalid regex: ${e instanceof Error ? e.message : String(e)}` };
+		}
+		return { value: text };
+	}
+	return { value: text.trim() }; // matches loadUserRules trimming
+}
+
+/** Display form of a list entry; non-strings stay visible as JSON so they can be removed or fixed */
+function entryLabel(x: unknown): string {
+	return typeof x === "string" ? x : JSON.stringify(x);
+}
+
+// ============================================================================
 // 扩展主体
 // ============================================================================
 
@@ -1829,10 +1921,21 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		refreshStatus(ctx);
 	}
 
+	/** Session-scoped trust grant (set by the session_start prompt; /verdict reloads must honor it) */
+	let sessionTrustedRoot: string | null = null;
+
+	/** Surface skipped-value and shortcut warnings from a rules (re)load */
+	function reportLoadWarnings(report: RulesLoadReport, ctx: ExtensionContext): void {
+		if (report.skipped.length > 0) {
+			ctx.ui.notify(`pi-verdict: skipped ${report.skipped.length} invalid config value(s) in config (${userConfigPath()}${report.project?.applied ? ` + ${report.project.path}` : ""}): ${report.skipped.join(", ")}`, "warning");
+		}
+		if (report.shortcutWarning) ctx.ui.notify(`pi-verdict: ${report.shortcutWarning}`, "warning");
+	}
+
 	// session_start:重置影子缓存(会话内存态,#5 定案)+ 重载用户规则(配置改动新会话生效)
 	pi.on("session_start", async (_event, ctx) => {
 		// Project trust prompt: any await stays inside the prompt branch so the no-project path remains synchronous
-		let sessionTrustedRoot: string | null = null;
+		sessionTrustedRoot = null;
 		const pp = findProjectConfig(ctx.cwd, agentDirPath());
 		if (pp) {
 			const root = projectRootOf(pp);
@@ -1857,10 +1960,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		}
 		const report = state.reset(ctx.cwd, sessionTrustedRoot);
 		state.audit?.prune(); // #54: converge to the AUDIT_KEEP_SESSIONS most recent files at session start
-		if (report.skipped.length > 0) {
-			ctx.ui.notify(`pi-verdict: skipped ${report.skipped.length} invalid config value(s) in config (${userConfigPath()}${report.project?.applied ? ` + ${report.project.path}` : ""}): ${report.skipped.join(", ")}`, "warning");
-		}
-		if (report.shortcutWarning) ctx.ui.notify(`pi-verdict: ${report.shortcutWarning}`, "warning");
+		reportLoadWarnings(report, ctx);
 		if (report.project?.applied) ctx.ui.notify(`pi-verdict: project overrides applied from ${report.project.path}`, "info");
 		if (report.project && !report.project.trusted) ctx.ui.notify(`pi-verdict: project config ${report.project.path} ignored — project not trusted (decisions: ${trustStorePath()})`, "info");
 		refreshStatus(ctx);
@@ -1910,6 +2010,161 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 			// 未知参数:严格拒绝并列出用法(大小写已归一化)
 			ctx.ui.notify(`unknown argument: ${arg}\nUsage: /automode (status) | /automode on | /automode off${toggleHint()}`, "warning");
+		},
+	});
+
+	pi.registerCommand("verdict", {
+		description: "Edit pi-verdict list rules (allow/deny/denyPaths/tools/rules): /verdict [user|local]",
+		handler: async (args, ctx) => {
+			if (!ctx.hasUI) {
+				ctx.ui.notify("pi-verdict: /verdict needs an interactive UI", "warning");
+				return;
+			}
+			const arg = args.trim().toLowerCase();
+			const agentDir = agentDirPath();
+			const localFile = projectConfigTarget(ctx.cwd, agentDir);
+			let kind: "user" | "local";
+			let file: string;
+			if (arg === "user") {
+				kind = "user";
+				file = userConfigPath();
+			} else if (arg === "local") {
+				if (localFile === null) {
+					ctx.ui.notify("pi-verdict: no project config location here (cwd is your home dir or the agent tree root)", "warning");
+					return;
+				}
+				kind = "local";
+				file = localFile;
+			} else if (arg === "") {
+				const targets: Array<{ kind: "user" | "local"; file: string; label: string }> = [
+					{ kind: "user", file: userConfigPath(), label: `User — ${userConfigPath()}` },
+				];
+				if (localFile !== null) targets.push({ kind: "local", file: localFile, label: `Local (project) — ${localFile}` });
+				const choice = await ctx.ui.select("pi-verdict: which config?", targets.map((t) => t.label));
+				const picked = choice === undefined ? undefined : targets[targets.map((t) => t.label).indexOf(choice)];
+				if (!picked) return;
+				kind = picked.kind;
+				file = picked.file;
+			} else {
+				ctx.ui.notify(`unknown argument: ${arg}\nUsage: /verdict [user|local]`, "warning");
+				return;
+			}
+
+			const loadedRaw = readConfigObject(file, kind);
+			if ("error" in loadedRaw) {
+				ctx.ui.notify(`pi-verdict: ${loadedRaw.error}`, "error");
+				return;
+			}
+			let raw = loadedRaw.raw;
+
+			if (kind === "local") {
+				const root = projectRootOf(file);
+				const trusted = (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, readTrustStore().trusted);
+				if (!trusted) ctx.ui.notify(`pi-verdict: project ${root} is not trusted — edits are saved but not applied until you trust it (prompted at session start)`, "info");
+			}
+
+			/** Write `key` (or drop it when undefined) and hot-reload the rules; false = nothing changed */
+			function save(nextValue: unknown[] | undefined, key: EditableListKey): boolean {
+				const next: Record<string, unknown> = { ...raw };
+				if (nextValue === undefined) delete next[key];
+				else next[key] = nextValue;
+				const err = writeConfigObject(file, next);
+				if (err) {
+					ctx.ui.notify(`pi-verdict: could not save ${file}: ${err}`, "error");
+					return false;
+				}
+				raw = next;
+				reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
+				ctx.ui.notify(`pi-verdict: ${key} saved to ${file} — rules reloaded`, "info");
+				return true;
+			}
+
+			/** Normalize + duplicate-check a typed entry; undefined = nothing to save (already notified or cancelled) */
+			function acceptEntry(key: EditableListKey, input: string | undefined, list: unknown[], selfIndex: number): string | undefined {
+				if (input === undefined) return undefined;
+				const n = normalizeEntry(key, input);
+				if (n === null) return undefined;
+				if ("error" in n) {
+					ctx.ui.notify(`pi-verdict: ${key}: ${n.error} — not saved`, "warning");
+					return undefined;
+				}
+				if (list.some((x, j) => j !== selfIndex && x === n.value)) {
+					ctx.ui.notify(`pi-verdict: already in ${key}`, "info");
+					return undefined;
+				}
+				return n.value;
+			}
+
+			// Entry menu for one key; returns when the user goes back
+			async function editKey(key: EditableListKey): Promise<void> {
+				const ADD = "+ Add";
+				const BACK = "← Back";
+				const UNSET = `× Unset (inherit global ${key})`;
+				for (;;) {
+					const cur = raw[key];
+					const list: unknown[] = Array.isArray(cur) ? cur : [];
+					const options = [ADD, ...list.map((x, i) => `${i + 1}. ${entryLabel(x)}`)];
+					if (kind === "local" && key in raw) options.push(UNSET);
+					options.push(BACK);
+					const choice = await ctx.ui.select(`${key} — ${file}`, options);
+					if (choice === undefined || choice === BACK) return;
+					const idx = options.indexOf(choice);
+
+					if (choice === ADD) {
+						const value = acceptEntry(key, await ctx.ui.input(`Add to ${key}`, LIST_KEY_PLACEHOLDER[key]), list, -1);
+						if (value === undefined) continue;
+						let base: unknown[];
+						if (key in raw) base = list;
+						else if (kind === "local") {
+							const g = readConfigObject(userConfigPath(), "user");
+							const gv = "raw" in g && Array.isArray(g.raw[key]) ? (g.raw[key] as unknown[]).filter((x): x is string => typeof x === "string") : [];
+							const copyLabel = `Copy of global list (${gv.length})`;
+							const start = await ctx.ui.select(`Project "${key}" replaces the global list for this project. Start from:`, [copyLabel, "Empty list"]);
+							if (start === undefined) continue;
+							base = start === copyLabel ? gv : [];
+						} else base = [];
+						save([...base, value], key);
+					} else if (choice === UNSET) {
+						if (await ctx.ui.confirm(`Unset ${key} in ${file}?`, `The project will inherit the global ${key} list.`)) {
+							if (save(undefined, key)) return;
+						}
+					} else {
+						const i = idx - 1;
+						const x = list[i];
+						const actions = ["Edit", "Remove", BACK];
+						const act = await ctx.ui.select(`${key} #${i + 1}: ${entryLabel(x)}`, actions);
+						if (act === "Edit") {
+							const value = acceptEntry(key, await ctx.ui.editor(`Edit ${key} #${i + 1}`, entryLabel(x)), list, i);
+							if (value === undefined || value === x) continue;
+							save(list.map((e, j) => (j === i ? value : e)), key);
+						} else if (act === "Remove") {
+							if (await ctx.ui.confirm(`Remove from ${key}?`, entryLabel(x))) save(list.filter((_, j) => j !== i), key);
+						}
+					}
+				}
+			}
+
+			// Key menu
+			const DONE = "Done";
+			for (;;) {
+				const options = EDITABLE_LIST_KEYS.map((key) => {
+					const v = raw[key];
+					const desc = LIST_KEY_DESC[key];
+					if (v === undefined) return kind === "local" ? `${key} (not set: global applies) — ${desc}` : `${key} (0) — ${desc}`;
+					if (Array.isArray(v)) return `${key} (${v.length}) — ${desc}`;
+					return `${key} (invalid: not an array) — ${desc}`;
+				});
+				options.push(DONE);
+				const choice = await ctx.ui.select(`pi-verdict: edit ${file}`, options);
+				if (choice === undefined || choice === DONE) return;
+				const key = EDITABLE_LIST_KEYS[options.indexOf(choice)];
+				if (key === undefined) return;
+				if (raw[key] !== undefined && !Array.isArray(raw[key])) {
+					ctx.ui.notify(`pi-verdict: ${key} in ${file} is not an array — fix it by hand`, "warning");
+					continue;
+				}
+				await editKey(key);
+			}
 		},
 	});
 
