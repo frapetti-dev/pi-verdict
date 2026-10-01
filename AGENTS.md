@@ -14,6 +14,15 @@ ADR-0001's self-protection layer (a runtime rule-layer deny on agent writes to `
 
 - The agent should not write `<agentDir>/config/pi-verdict.json` or the installed copies under `<agentDir>/extensions/` — these are the user's live, installed gate; changes to them belong to the user, by hand, outside the repo.
 - To test a new build: the user runs `cp extensions/pi-verdict.ts extensions/jev-adapter.ts ~/.pi/agent/extensions/` in a terminal and restarts pi (`jev-adapter.ts` is optional, needed only for the jev classifier backend). The same applies to editing user rules — manual edit only.
+- Since `gateOmpDir` (default on), the gate itself asks for confirmation (non-interactive → deny) on any tool call touching a `.omp` directory, including `~/.omp/agent/`. The manual-only convention above still applies; the gate is an additional backstop for omp hosts, not a replacement.
+
+### Smoke-testing a build without touching the installed copy
+
+Spawn a sub-instance that loads only the repo copy, against a throwaway agent dir (never the live `~/.omp/agent`):
+
+- Create a temp agent dir containing `config/pi-verdict.json` (the test config) plus copies of `agent.db`, `config.yml`, `models.db` from `~/.omp/agent` for model auth.
+- Run: `PI_CODING_AGENT_DIR=<tmp> omp -p --no-session --no-title --no-extensions -e <repo>/extensions/pi-verdict.ts --tools read,bash --no-lsp "<prompt>"` from a throwaway project dir. `-p` has no UI, so asks degrade to deny — this exercises the headless path only; interactive dialogs and `/verdict` are covered by the stub tests in `tests/pi-verdict.test.ts`.
+- Delete the temp dir afterwards.
 
 ### Release
 
