@@ -436,11 +436,33 @@ function recordTrust(root: string, decision: "trusted" | "untrusted"): string | 
 	return null;
 }
 
+/**
+ * Starter `tools` allowlist written into the first-run config template (a pre-filled
+ * user declaration, like the denyPaths starter list — existing configs are never
+ * rewritten). Only tools with no path/command shape (toolKind() === null) can be
+ * listed. Selection criterion: no filesystem/process/network side effect of their own,
+ * or an effect already gated elsewhere.
+ *  - ask:        prompts the user; the user is the gate
+ *  - todo:       session task list (UI/session metadata only)
+ *  - wait:       blocks on already-started background jobs
+ *  - task:       spawns subagents; their tool calls pass this gate too (the extension is
+ *                re-bound in every subagent session)
+ *  - yield:      subagent result submission (hidden tool)
+ *  - think:      private scratchpad (hidden tool)
+ *  - checkpoint, rewind: prune session conversation context only (no file/git restore)
+ *  - recall, reflect:    read from the configured memory backend
+ * Deliberately NOT listed: glob/ast_grep/lsp (path-scoped reads that this tool-name
+ * family skips denyPaths for), web_search (query text leaves the machine), retain/learn/
+ * memory_edit/manage_skill (persist content into future prompts), eval/github/debug/ida/
+ * security_scan/ast_edit (execute code or mutate state).
+ */
+const DEFAULT_ALLOWED_TOOLS = ["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"];
+
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
 	allow: ["^ls\\b"],
 	deny: [],
-	tools: [],
+	tools: DEFAULT_ALLOWED_TOOLS,
 	denyPaths: [
 		"~/.ssh/",
 		"~/.profile",

@@ -1059,6 +1059,22 @@ describe("denyPaths (ADR-0002)", () => {
 		expect(h.calls.length).toBe(0);
 	});
 
+	test("template ships the starter tools allowlist, active from the next session", async () => {
+		fs.rmSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), { force: true });
+		const bootstrap = makeHarness(); bootstrap.install(); // first run → template
+		const raw = JSON.parse(fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8"));
+		expect(raw.tools).toEqual(["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"]);
+		// second session: listed tools skip the classifier, unlisted ones stay gray
+		const h = makeHarness();
+		h.install();
+		h.responses = [{ text: "<verdict>deny</verdict> mock" }];
+		expect(await toolCall(h, "todo", { op: "list" })).toBeUndefined();
+		expect(h.calls.length).toBe(0);
+		const r = await toolCall(h, "web_search", { query: "x" });
+		expect(h.calls.length).toBe(1);
+		expect(r?.block).toBe(true);
+	});
+
 	test("/automode status shows the active denyPaths count", async () => {
 		const h = session({ denyPaths: [SENS, "/proj/other"] });
 		await h.commands["automode"].handler("", h.ctx);
