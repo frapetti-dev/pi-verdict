@@ -252,6 +252,8 @@ interface UserRules {
 	tools: string[];
 	/** 内置 deny floor 开关(危险正则 + 路径敏感度 deny),默认 true;关闭后依赖用户规则与分类器 */
 	builtinDenyFloor: boolean;
+	/** Forced gate on `.omp` directories: any file-tool path or bash token that resolves into a `.omp` path segment (lexical or realpath form) is a terminal ask (non-interactive → deny). Default true; checked after the built-in floor and user deny, before denyPaths/user allow. Config key: "gateOmpDir". */
+	gateOmpDir: boolean;
 	/** [pi-verdict local patch: autoDeny] false → auto-review denies become interactive asks (headless still denies). Default true. */
 	autoDeny: boolean;
 	/** [pi-verdict local patch: rules] user-authored free-text rules appended to every classifier prompt (LLM + jev). Config key: "rules". */
@@ -276,7 +278,7 @@ interface UserRules {
 	classifierFallbackMode: "shadow" | "enforce";
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, classifierModel: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", autoDeny: true, classifierRules: [] };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, gateOmpDir: true, classifierModel: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", autoDeny: true, classifierRules: [] };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -435,7 +437,7 @@ function recordTrust(root: string, decision: "trusted" | "untrusted"): string | 
 }
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
 	allow: ["^ls\\b"],
 	deny: [],
 	tools: [],
@@ -448,6 +450,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 		"~/.bashrc",
 	],
 	builtinDenyFloor: true,
+	gateOmpDir: true,
 	autoDeny: true,
 	classifierModel: null,
 	toggleShortcut: DEFAULT_TOGGLE_SHORTCUT,
@@ -476,7 +479,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 			} catch { /* 只读环境静默跳过 */ }
 			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null };
 		}
-	let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown };
+	let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; gateOmpDir?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown };
 		try {
 			raw = JSON.parse(fs.readFileSync(p, "utf8")) as typeof raw;
 		} catch (err) {
@@ -569,6 +572,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 				denyPaths,
 				tools,
 				builtinDenyFloor: raw.builtinDenyFloor !== false,
+				gateOmpDir: raw.gateOmpDir !== false,
 				classifierModel: typeof raw.classifierModel === "string" && raw.classifierModel.trim() ? raw.classifierModel.trim() : null,
 				toggleShortcut: shortcut.key,
 				audit: raw.audit === true,
@@ -756,11 +760,35 @@ function hitDenyPaths(toolName: string, input: Record<string, unknown>, cwd: str
 	return null;
 }
 
+/** `.omp` as a whole path segment (case-insensitive: case-folding filesystems; both separators: win32 forms) */
+const OMP_DIR_SEGMENT = /(?:^|[\\/])\.omp(?:[\\/]|$)/i;
+/** `.omp` as a shell word inside a raw command string (`cd .omp`, `ls ~/.omp/x`, `"$HOME/.omp"`): not preceded by a word/dot/dash char, not followed by one (`x.omp`, `.omp.bak`, `.ompx` do not match). False positives ask — the safe direction */
+const OMP_DIR_IN_COMMAND = /(?<![\w.-])\.omp(?![\w.-])/;
+
+/** Forced-gate detection (gateOmpDir): does the call target a path inside a `.omp` directory?
+ *  Reuses the denyPaths candidate extraction and base-tier dual forms (lexical + realpath), so a
+ *  symlink aliasing a `.omp` directory hits too. Scope tools (grep/find/ls) are checked on their
+ *  own target only (omitted path → cwd): a recursive search from a project root that merely
+ *  traverses a nested `.omp` is not a `.omp` access. Returns the matched form (UI-only detail). */
+function hitOmpDir(toolName: string, input: Record<string, unknown>, cwd: string): string | null {
+	if (toolKind(toolName) === "command") {
+		const command = String(input.command ?? "");
+		if (OMP_DIR_IN_COMMAND.test(command)) return ".omp referenced in the command";
+	}
+	for (const candidate of denyPathCandidates(toolName, input, cwd)) {
+		for (const form of denyPathForms(candidate, cwd)) {
+			if (OMP_DIR_SEGMENT.test(form)) return form;
+		}
+	}
+	return null;
+}
+
 /**
  * Tool call → rule-layer verdict. Order (#12; ADR-0002 inserts denyPaths):
  *   1. built-in base (bash danger regex floor / path sensitivity grading) — deny is terminal
  *      (the floor can be turned off via builtinDenyFloor)
  *   2. user deny → deny (beats allow)
+ *      2a. gateOmpDir (default on): path/command touching a `.omp` directory → terminal ask
  *   3. denyPaths hit → terminal ask (ADR-0002: the declaring user adjudicates; before user allow)
  *   4. user allow → allow
  *   5. custom-tool exact match (user.tools) → allow (bypasses classifier for that tool)
@@ -793,6 +821,12 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 	if (target !== null) {
 		for (const re of user.deny) {
 			if (re.test(target)) return { verdict: "deny", reason: `user deny rule: ${re.source}` };
+		}
+		// Forced .omp gate: terminal ask, after user deny, before denyPaths/user allow.
+		// Reason carries no path (it travels back into agent context); the path is UI-only detail.
+		if (user.gateOmpDir) {
+			const omp = hitOmpDir(toolName, input, cwd);
+			if (omp) return { verdict: "ask", reason: "forced gate: access to a .omp directory (gateOmpDir)", detail: omp };
 		}
 		// denyPaths hit → terminal ask (ADR-0002): after user deny, before user allow —
 		// a protected path is the user's exception to their own allow rules.
@@ -1776,6 +1810,7 @@ const LIST_KEY_PLACEHOLDER: Record<EditableListKey, string> = {
 	tools: "exact tool name, e.g. ask",
 	rules: "free-text rule for the classifier",
 };
+const GATE_OMP_DIR_DESC = "forced ask on any .omp directory access";
 
 /** Where a project config would be written for `cwd`: the existing one if discovered, else `<cwd>/<dotdir>/pi-verdict.json`.
  *  null when `findProjectConfig`'s stop rule (home dir / agent tree root) would never discover a file there. */
@@ -2235,7 +2270,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	});
 
 	pi.registerCommand("verdict", {
-		description: "Edit pi-verdict list rules (allow/deny/denyPaths/tools/rules): /verdict [user|local]",
+		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch): /verdict [user|local]",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("pi-verdict: /verdict needs an interactive UI", "warning");
@@ -2285,7 +2320,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 
 			/** Write `key` (or drop it when undefined) and hot-reload the rules; false = nothing changed */
-			function save(nextValue: unknown[] | undefined, key: EditableListKey): boolean {
+			function save(nextValue: unknown, key: string): boolean {
 				const next: Record<string, unknown> = { ...raw };
 				if (nextValue === undefined) delete next[key];
 				else next[key] = nextValue;
@@ -2298,6 +2333,19 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
 				ctx.ui.notify(`pi-verdict: ${key} saved to ${file} — rules reloaded`, "info");
 				return true;
+			}
+
+			/** Boolean switch menu for gateOmpDir; local files can also unset (inherit the global value) */
+			async function editGateOmpDir(): Promise<void> {
+				const ON = "On — ask before any .omp directory access (default)";
+				const OFF = "Off — no forced gate on .omp directories";
+				const UNSET = "× Unset (inherit global gateOmpDir)";
+				const options = [ON, OFF];
+				if (kind === "local" && "gateOmpDir" in raw) options.push(UNSET);
+				const choice = await ctx.ui.select(`gateOmpDir — ${file}`, options);
+				if (choice === ON) save(true, "gateOmpDir");
+				else if (choice === OFF) save(false, "gateOmpDir");
+				else if (choice === UNSET) save(undefined, "gateOmpDir");
 			}
 
 			/** Normalize + duplicate-check a typed entry; undefined = nothing to save (already notified or cancelled) */
@@ -2375,10 +2423,23 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					if (Array.isArray(v)) return `${key} (${v.length}) — ${desc}`;
 					return `${key} (invalid: not an array) — ${desc}`;
 				});
+				const gateIdx = options.length;
+				const gv = raw.gateOmpDir;
+				const gateState = gv === undefined ? (kind === "local" ? "not set: global applies" : "on, default") : typeof gv === "boolean" ? (gv ? "on" : "off") : "invalid: not a boolean";
+				options.push(`gateOmpDir (${gateState}) — ${GATE_OMP_DIR_DESC}`);
 				options.push(DONE);
 				const choice = await ctx.ui.select(`pi-verdict: edit ${file}`, options);
 				if (choice === undefined || choice === DONE) return;
-				const key = EDITABLE_LIST_KEYS[options.indexOf(choice)];
+				const choiceIdx = options.indexOf(choice);
+				if (choiceIdx === gateIdx) {
+					if (gv !== undefined && typeof gv !== "boolean") {
+						ctx.ui.notify(`pi-verdict: gateOmpDir in ${file} is not a boolean — fix it by hand`, "warning");
+						continue;
+					}
+					await editGateOmpDir();
+					continue;
+				}
+				const key = EDITABLE_LIST_KEYS[choiceIdx];
 				if (key === undefined) return;
 				if (raw[key] !== undefined && !Array.isArray(raw[key])) {
 					ctx.ui.notify(`pi-verdict: ${key} in ${file} is not an array — fix it by hand`, "warning");
