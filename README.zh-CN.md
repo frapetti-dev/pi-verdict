@@ -81,6 +81,7 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
 - `/automode on`
 - `/automode off`
 - `ctrl+shift+a` —— 静默切换主开关(footer 始终显示为唯一反馈;键位可经 `toggleShortcut` 重绑或禁用)
+- `/verdict [user|local]` —— 交互式编辑全局(`user`)或项目(`local`)配置的列表规则(`allow`、`deny`、`denyPaths`、`tools`、`rules`):增 / 改 / 删条目,保存即落盘并立即作用于当前会话。标量键仍需手工编辑
 - footer 恒显 `auto mode on`(绿色)/ `auto mode off`(黄色)
 
 | 配置 | 默认 | 说明 |

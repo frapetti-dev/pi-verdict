@@ -32,6 +32,11 @@ interface Harness {
 	confirmMsgs: string[];
 	confirmAnswer: boolean;
 	confirmError: unknown;
+	/** When non-null, select answers from this queue of option prefixes (undefined = escape); null keeps selectIndex behaviour */
+	selectPicks: string[] | null;
+	/** Queued answers for ui.input / ui.editor (undefined = escape) */
+	inputs: Array<string | undefined>;
+	editors: Array<string | undefined>;
 	findMap: Record<string, any> | undefined;
 	install: (opts?: { flag?: boolean; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> }) => void;
 }
@@ -45,7 +50,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 	const fgCalls: Array<[string, string]> = [];
 	let flags: Record<string, unknown> = {};
 	const branch: any[] = [];
-	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectIndex: 0, findMap: undefined };
+	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined };
 
 	const ctx: any = {
 		cwd, hasUI: true, signal: undefined, model: { id: "mock/glm" },
@@ -72,7 +77,14 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 				h.confirmMsgs.push(m);
 				return h.confirmAnswer;
 			},
-			select: async (_t: string, options: string[]) => { h.selects++; return h.selectIndex === null ? undefined : options[h.selectIndex]; },
+			select: async (_t: string, options: string[]) => {
+				h.selects++;
+				if (h.selectPicks === null) return h.selectIndex === null ? undefined : options[h.selectIndex];
+				const prefix = h.selectPicks.shift();
+				return prefix === undefined ? undefined : options.find((o) => o.startsWith(prefix));
+			},
+			input: async () => h.inputs.shift(),
+			editor: async () => h.editors.shift(),
 			setStatus: (id: string, text: string) => statusSets.push([id, text]), theme: { fg: (c: string, s: string) => (fgCalls.push([c, s]), s) },
 		},
 	};
@@ -2249,5 +2261,70 @@ describe("project trust prompt", () => {
 			expect(fs.readFileSync(TRUST_FILE(), "utf8")).toBe("{");
 			expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("not saved"))).toBe(true);
 		});
+	});
+});
+
+// ── /verdict config editor ──────────────────────────────
+
+describe("/verdict config editor", () => {
+	const USER_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
+	const readUser = () => JSON.parse(fs.readFileSync(USER_FILE(), "utf8"));
+	/** Open a session, then run `/verdict <arg>` against the scripted dialogs */
+	async function run(h: Harness, arg: string, script: { picks: string[]; inputs?: Array<string | undefined>; editors?: Array<string | undefined> }): Promise<void> {
+		await h.handlers.session_start({}, h.ctx);
+		h.selectPicks = script.picks;
+		h.inputs = script.inputs ?? [];
+		h.editors = script.editors ?? [];
+		await h.commands.verdict.handler(arg, h.ctx);
+	}
+
+	test("add persists to the user file and takes effect immediately (no classifier call)", async () => {
+		const h = session({});
+		await run(h, "user", { picks: ["allow", "+ Add", "← Back", "Done"], inputs: ["^ls\\b"] });
+		expect(readUser().allow).toEqual(["^ls\\b"]);
+		const r = await toolCall(h, "bash", { command: "ls -la" });
+		expect(r).toBeUndefined();
+		expect(h.calls.length).toBe(0);
+	});
+
+	test("invalid regex is rejected: file unchanged, warning notified", async () => {
+		const h = session({ allow: ["^keep"] });
+		const before = fs.readFileSync(USER_FILE(), "utf8");
+		await run(h, "user", { picks: ["allow", "+ Add", "← Back", "Done"], inputs: ["("] });
+		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("invalid regex"))).toBe(true);
+	});
+
+	test("remove deletes the chosen entry after confirmation", async () => {
+		const h = session({ deny: ["rm "] });
+		h.confirmAnswer = true;
+		await run(h, "user", { picks: ["deny", "1.", "Remove", "← Back", "Done"] });
+		expect(readUser().deny).toEqual([]);
+	});
+
+	test("edit replaces the entry and preserves untouched keys; trailing newline stripped", async () => {
+		const h = session({ allow: ["^a"], classifierModel: "x/y" });
+		await run(h, "user", { picks: ["allow", "1.", "Edit", "← Back", "Done"], editors: ["^b\n"] });
+		const saved = readUser();
+		expect(saved.allow).toEqual(["^b"]);
+		expect(saved.classifierModel).toBe("x/y");
+	});
+
+	test("local: first add offers a copy of the global list and warns the project is untrusted", async () => {
+		await withTempDir("pv-verdict-cmd-", async (dir) => {
+			const h = session({ allow: ["^g"] }, { cwd: dir });
+			await run(h, "local", { picks: ["allow", "+ Add", "Copy of global", "← Back", "Done"], inputs: ["^p"] });
+			const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
+			const file = path.join(dir, dot, "pi-verdict.json");
+			expect(fs.existsSync(file)).toBe(true);
+			expect(JSON.parse(fs.readFileSync(file, "utf8")).allow).toEqual(["^g", "^p"]);
+			expect(h.notifies.some(([m, l]) => l === "info" && m.includes("is not trusted"))).toBe(true);
+		});
+	});
+
+	test("unknown argument → usage warning", async () => {
+		const h = session({});
+		await run(h, "bogus", { picks: [] });
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("Usage: /verdict [user|local]"))).toBe(true);
 	});
 });

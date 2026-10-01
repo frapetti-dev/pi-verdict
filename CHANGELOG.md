@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+
+- `/verdict [user|local]` command: edit the list keys of `pi-verdict.json` (`allow`, `deny`, `denyPaths`, `tools`, `rules`) from the TUI — add, edit, and remove entries. `user` targets `<agentDir>/config/pi-verdict.json`, `local` the project config (`<project>/.pi/pi-verdict.json`, `.omp/…` on omp); a bare call asks which. Regex entries (`allow`/`deny`) are validated before saving. Each save rewrites only the edited key (other keys, key order, and `_hint` are preserved), reloads the rules into the running session immediately without clearing shadow-cache or fallback session stats, and never auto-trusts a project. The first project-level edit of a key offers to start from a copy of the global list (a project list replaces, not extends, the global one); `× Unset` removes the override so the project inherits the global list again. Scalar keys (`builtinDenyFloor`, `classifierModel`, `toggleShortcut`, …) are out of scope. Requires an interactive UI.
+
 ### Changed
 
 - **BREAKING**: `trustedProjects` in `pi-verdict.json` is replaced by an interactive project trust prompt plus a gate-owned trust file, `<agentDir>/config/pi-verdict-trust.json` (`{ "trusted": [...], "untrusted": [...] }`). A project config (`<dir>/.pi/pi-verdict.json`, `.omp/…` on omp) is applied only when its project root is trusted; an interactive session starting in an undecided project asks **Trust** / **Not now** / **Never**. Headless sessions and subagents never prompt and ignore undecided project configs. Existing `trustedProjects` entries are no longer read, so affected projects prompt once.

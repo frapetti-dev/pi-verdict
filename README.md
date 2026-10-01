@@ -80,6 +80,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `/automode on`
 - `/automode off`
 - `ctrl+shift+a` — toggle the master switch silently (the always-on footer is the only feedback; rebind or disable via `toggleShortcut`)
+- `/verdict [user|local]` — edit the list rules (`allow`, `deny`, `denyPaths`, `tools`, `rules`) of the global (`user`) or project (`local`) config interactively: add / edit / remove entries, saved to disk and applied to the running session at once. Scalar keys stay hand-edited
 - footer always shows `auto mode on` (green) / `auto mode off` (yellow)
 
 | Option | Default | Description |
