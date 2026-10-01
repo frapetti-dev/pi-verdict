@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, displaySafe, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
 
 // ── 桩设施 ──────────────────────────────────────────────
 
@@ -116,12 +116,14 @@ const clearAudit = () => fs.rmSync(VERDICTS(), { recursive: true, force: true })
 beforeAll(() => { process.env.PI_CODING_AGENT_DIR = TMP_AGENT; });
 afterAll(() => { delete process.env.PI_CODING_AGENT_DIR; });
 
-function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown }, invalid?: string[]): void {
+function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; explainGateModel?: string | null; explainGatePrompt?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown }, invalid?: string[]): void {
 	config = { allow: cfg.allow ?? [], deny: cfg.deny ?? [] };
 	const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
 	fs.mkdirSync(path.dirname(p), { recursive: true });
 	const raw: Record<string, unknown> = { ...config };
 	if (cfg.classifierModel !== undefined) raw.classifierModel = cfg.classifierModel;
+	if (cfg.explainGateModel !== undefined) raw.explainGateModel = cfg.explainGateModel;
+	if (cfg.explainGatePrompt !== undefined) raw.explainGatePrompt = cfg.explainGatePrompt;
 	if (cfg.builtinDenyFloor !== undefined) raw.builtinDenyFloor = cfg.builtinDenyFloor;
 	if (cfg.gateOmpDir !== undefined) raw.gateOmpDir = cfg.gateOmpDir;
 	if (cfg.toggleShortcut !== undefined) raw.toggleShortcut = cfg.toggleShortcut;
@@ -2571,5 +2573,159 @@ describe("approve dialog routing", () => {
 		expect(rendered[0]).toContain("concern: network operation");
 		expect(rendered[0]).toContain("allow 35%");
 		expect(rendered[0]).toContain("█");
+	});
+});
+
+describe("EXPLAIN-GATE role and decline explanation", () => {
+	const ANSI = /\x1b\[[0-9;]*m/g;
+	const DOWN = "\x1b[B";
+	const ASK = { text: "<verdict>ask</verdict> needs a human" };
+
+	type DialogComponent = { render(width: number): string[]; handleInput(data: string): void };
+	type DialogFactory = (tui: { requestRender(): void }, theme: { fg(c: string, t: string): string; bold(t: string): string }, kb: undefined, done: (r: unknown) => void) => DialogComponent;
+
+	/** Each ui.custom call replays the next key script against the real dialog component and records its render; an exhausted script list presses Escape. */
+	function driveDialogs(h: Harness, scripts: string[][], rendered: string[]): void {
+		h.ctx.ui.custom = async (factory: DialogFactory) => {
+			const { initTheme } = await import("@earendil-works/pi-coding-agent");
+			initTheme("dark", false);
+			const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+			const keys = scripts.shift() ?? ["\x1b"];
+			return new Promise((resolve) => {
+				const component = factory({ requestRender() {} }, fakeTheme, undefined, resolve);
+				rendered.push(component.render(80).join("\n").replace(ANSI, ""));
+				for (const k of keys) component.handleInput(k);
+			});
+		};
+	}
+
+	test("the dialog offers the explanation-decline option; Explain only for asks whose content may reach a model", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		const rendered: string[] = [];
+		driveDialogs(h, [], rendered);
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(rendered[0]).toContain("No, with explanation…");
+		expect(rendered[0]).toContain("Explain…");
+
+		const p = session({});
+		const protectedRender: string[] = [];
+		driveDialogs(p, [], protectedRender);
+		await toolCall(p, "read", { path: "/proj/.omp/notes.md" });
+		expect(protectedRender[0]).toContain("No, with explanation…");
+		expect(protectedRender[0]).not.toContain("Explain");
+	});
+
+	test("Explain with a question: one EXPLAIN-GATE call, answer shown in the re-opened dialog, never sent to the agent", async () => {
+		const h = session({});
+		h.responses = [ASK, { text: "Compiles the project; builds run arbitrary scripts." }];
+		h.inputs = ["does it touch the network?"];
+		const rendered: string[] = [];
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], rendered);
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(r).toBeUndefined(); // second dialog: Yes
+		expect(h.calls).toHaveLength(2);
+		expect(String(h.calls[1].systemPrompt)).toContain("EXPLAIN-GATE");
+		const msg = String(h.calls[1].messages[0].content);
+		expect(msg).toContain("cargo build");
+		expect(msg).toContain("Classifier opinion: needs a human");
+		expect(msg).toContain("does it touch the network?");
+		expect(msg).not.toContain(EXPLAIN_GATE_DEFAULT_PROMPT);
+		expect(rendered).toHaveLength(2);
+		expect(rendered[0]).not.toContain("Compiles the project");
+		expect(rendered[1]).toContain("EXPLAIN-GATE");
+		expect(rendered[1]).toContain("Compiles the project");
+		expect(h.statusSets.at(-1)).toEqual(["explain-gate", undefined]);
+	});
+
+	test("Explain with an empty question uses the default prompt on the session model; the declined verdict carries no explanation text", async () => {
+		const h = session({});
+		h.responses = [ASK, { text: "Compiles the project." }];
+		h.inputs = [""];
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], [DOWN, "\r"]], []);
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(String(h.calls[1].messages[0].content)).toContain(`Task: ${EXPLAIN_GATE_DEFAULT_PROMPT}`);
+		expect(h.calls[1].model).toBe("mock/glm");
+		expect(r.block).toBe(true);
+		expect(r.reason).toContain("user-declined");
+		expect(r.reason).not.toContain("Compiles the project");
+	});
+
+	test("explainGateModel and explainGatePrompt configure the role", async () => {
+		const h = session({ explainGateModel: "mock/explain:low", explainGatePrompt: "Explain in one sentence." });
+		h.findMap = { "mock/explain": { id: "explain-model" } };
+		h.responses = [ASK, { text: "ok" }];
+		h.inputs = [""];
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], []);
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(h.calls[1].model).toBe("explain-model");
+		expect(h.calls[1].effort).toBe("low");
+		expect(String(h.calls[1].messages[0].content)).toContain("Task: Explain in one sentence.");
+	});
+
+	test("Explain failure: warning notification, dialog re-opens without an explanation", async () => {
+		const h = session({});
+		h.responses = [ASK, new Error("boom")];
+		h.inputs = [""];
+		const rendered: string[] = [];
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"]], rendered); // second dialog: Escape
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("EXPLAIN-GATE failed") && m.includes("boom"))).toBe(true);
+		expect(rendered).toHaveLength(2);
+		expect(rendered[1]).not.toContain("model-generated");
+		expect(r.block).toBe(true);
+		expect(h.statusSets.at(-1)).toEqual(["explain-gate", undefined]);
+	});
+
+	test("Escape on the Explain question returns to the dialog without a model call", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		h.inputs = [undefined];
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], []);
+		expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
+		expect(h.calls).toHaveLength(1);
+	});
+
+	test("No, with explanation: the user's text reaches the agent in the block reason", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		h.inputs = ["use npm ci instead\nthanks"];
+		driveDialogs(h, [[DOWN, DOWN, "\r"]], []);
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(r.block).toBe(true);
+		expect(r.reason).toContain("user-declined");
+		expect(r.reason).toContain('saying: "use npm ci instead thanks"');
+	});
+
+	test("No, with explanation: Escape on the text prompt returns to the dialog; empty text declines like plain No", async () => {
+		const back = session({});
+		back.responses = [ASK];
+		back.inputs = [undefined];
+		driveDialogs(back, [[DOWN, DOWN, "\r"], ["\r"]], []);
+		expect(await toolCall(back, "bash", { command: "cargo build" })).toBeUndefined();
+
+		const empty = session({});
+		empty.responses = [ASK];
+		empty.inputs = ["  "];
+		driveDialogs(empty, [[DOWN, DOWN, "\r"]], []);
+		const r = await toolCall(empty, "bash", { command: "cargo build" });
+		expect(r.block).toBe(true);
+		expect(r.reason).not.toContain("saying");
+	});
+
+	test("protected-path ask: declining with an explanation works, and no model call is made", async () => {
+		const h = session({});
+		h.inputs = ["not that file"];
+		driveDialogs(h, [[DOWN, DOWN, "\r"]], []);
+		const r = await toolCall(h, "read", { path: "/proj/.omp/notes.md" });
+		expect(r.block).toBe(true);
+		expect(r.reason).toContain('saying: "not that file"');
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("declineDetail: single line, trimmed, absent when blank", () => {
+		expect(declineDetail("user declined", "a\r\nb")).toBe('user declined, saying: "a b"');
+		expect(declineDetail("user declined", undefined)).toBe("user declined");
+		expect(declineDetail("user declined", "   ")).toBe("user declined");
 	});
 });

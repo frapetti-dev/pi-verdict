@@ -110,6 +110,8 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
   "builtinDenyFloor": true,
   "gateOmpDir": true,
   "classifierModel": null,
+  "explainGateModel": null,
+  "explainGatePrompt": null,
   "toggleShortcut": "ctrl+shift+a",
   "audit": false,
   "notifyAllows": false,
@@ -125,6 +127,7 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
 - `gateOmpDir`(默认 `true`)是**强制 `.omp` 门禁**:文件类工具路径或 bash 命令触碰任何 `.omp` 目录(词法形或符号链接解析形;`~/.omp`、`<项目>/.omp` 等)即触发由你裁决的终局 ask(非交互降级 deny)。它位于内置 floor 与你的 `deny` 之后、`denyPaths`/`allow` 之前,因此 `allow` 正则无法绕过。设为 `false` 关闭;可在 `/verdict` 中切换。`grep`/`find`/`ls` 只检查其自身目标(仅仅途经嵌套 `.omp` 的递归搜索不算访问)
 - `classifierModel` 指定分类器模型,如 `"zai/glm-5.3-flash:low"`(支持思考后缀;缺省 = 会话模型且显式关思考)
 - `classifierModel: "typesafe/jev-latest"` 启用随包的 **jev 决策适配器**——灰区裁决经 TypeSafe jev 完成(默认 OpenRouter,或 `PI_VERDICT_JEV_TRANSPORT=typesafe` 直连官方 API);实验性质,详见 [ADR-0003](docs/adr/0003-jev-decisions-adapter.md)
+- `explainGateModel` / `explainGatePrompt` 配置交互式 ask 对话框两个附加选项背后的 **EXPLAIN-GATE 角色**。**Explain…** 可附带一个可选问题,连同被拦截的动作与门禁给出的理由一起交给 EXPLAIN-GATE 模型(缺省 = 会话模型;`provider/id[:thinking]`);回答显示在重新打开的对话框中(仅供参考——永不发给 agent);问题留空时使用默认提示(`explainGatePrompt`,内置:"Explain what this action does and why the gate held it for confirmation.")。**No, with explanation…** 拒绝并告知 agent 原因(`user declined, saying: "…"`)。protected-path ask(`denyPaths`、`.omp` 门禁)**不提供 Explain**——其路径明文不得到达模型提供方([ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md))。RPC 模式与无富对话框的宿主保持纯文本 Yes/No 确认
 - `audit: true` 把每次**灰区裁决**(发给分类器的完整转录、其原始响应、解析出的裁决)以 JSONL 记录到 `~/.pi/agent/verdicts/<sessionId>.jsonl`——按会话一分文件,保留最近 20 个。交互式 ask 还会记录你的应答(`userAnswer` ground truth,确认结束后落盘),protected-path ask 也入审计(#62);规则 allow/deny 仍不入。仅存本机且全保真(受保护路径明文可能出现——永不出本机;[ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md) 边界注);agent 对该目录读写双拒。开启时 `/automode` 会显示审计状态与路径
 - `notifyAllows: true` 对每次 **classifier 放行**发通知(reason + action 行——如 jev 的概率分解);默认 `false` 保持放行静默。机械放行(你自己的 allow 规则、protected-path 确认)永不通知;shadow 标注仍属 debug;两开关同开时通知只出现一次
 - `classifierMinConfidence`(可选,[ADR-0004](docs/adr/0004-classifier-fallback-cascade.md))设定**置信地板**:低于它的 jev 裁决被降级——配置了 `classifierFallbackModel` 则级联(`shadow` = 第二层只记录意见、由你裁决;`enforce` = 第二层全权裁决,但降级 deny 永不被自动翻成 allow),否则直接问你。不低于地板时第一层自主。天然搭配:jev 打头 + haiku 级兜底
