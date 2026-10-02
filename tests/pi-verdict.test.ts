@@ -22,6 +22,8 @@ interface Harness {
 	shortcuts: Record<string, any>;
 	notifies: Array<[string, string]>;
 	statusSets: Array<[string, string]>;
+	/** ui.setWidget calls: [key, content]; undefined content = cleared */
+	widgetSets: Array<[string, string[] | undefined]>;
 	/** theme.fg calls: [color, text] — asserts footer status colors */
 	fgCalls: Array<[string, string]>;
 	branch: any[];
@@ -47,10 +49,12 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 	const shortcuts: Record<string, any> = {};
 	const notifies: Array<[string, string]> = [];
 	const statusSets: Array<[string, string]> = [];
+	const widgetSets: Array<[string, string[] | undefined]> = [];
 	const fgCalls: Array<[string, string]> = [];
 	let flags: Record<string, unknown> = {};
 	const branch: any[] = [];
 	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined };
+	h.widgetSets = widgetSets;
 
 	const ctx: any = {
 		cwd, hasUI: true, signal: undefined, model: { id: "mock/glm" },
@@ -86,6 +90,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 			input: async () => h.inputs.shift(),
 			editor: async () => h.editors.shift(),
 			setStatus: (id: string, text: string) => statusSets.push([id, text]), theme: { fg: (c: string, s: string) => (fgCalls.push([c, s]), s) },
+			setWidget: (key: string, content: string[] | undefined) => widgetSets.push([key, content]),
 		},
 	};
 	h.ctx = ctx;
@@ -2757,6 +2762,86 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 
 // ── subagent gate (omp ctx.agent.kind = "sub") ───────────
 
+describe("ask dialog mouse clicks", () => {
+	const ANSI = /\x1b\[[0-9;]*m/g;
+	const DOWN = "\x1b[B";
+	const UP = "\x1b[A";
+	const ASK = { text: "<verdict>ask</verdict> needs a human" };
+
+	type DialogComponent = { render(width: number): string[]; handleInput(data: string): void };
+	type FakeTui = { requestRender(): void; terminal?: { rows: number; columns: number }; children?: unknown[] };
+	type DialogFactory = (tui: FakeTui, theme: { fg(c: string, t: string): string; bold(t: string): string }, kb: undefined, done: (r: unknown) => void) => DialogComponent;
+
+	/** Replays `keys` against the real dialog. A key given as a function receives the current render and returns the input (used to click a labelled row).
+	 *  `layout` hosts the dialog under a 3-line filler with terminal metrics, as a mouse-forwarding host would. */
+	function driveMouseDialog(h: Harness, keys: Array<string | ((lines: string[]) => string)>, opts: { layout: boolean }): void {
+		h.ctx.ui.custom = async (factory: DialogFactory) => {
+			const { initTheme } = await import("@earendil-works/pi-coding-agent");
+			initTheme("dark", false);
+			const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+			const filler = { render: () => ["x", "x", "x"], invalidate() {} };
+			const tui: FakeTui = opts.layout ? { requestRender() {}, terminal: { rows: 200, columns: 80 }, children: [filler] } : { requestRender() {} };
+			return new Promise((resolve) => {
+				const component = factory(tui, fakeTheme, undefined, resolve);
+				tui.children?.push(component);
+				for (const k of keys) {
+					const lines = component.render(80).map((l) => l.replace(ANSI, ""));
+					component.handleInput(typeof k === "function" ? k(lines) : k);
+				}
+			});
+		};
+	}
+
+	/** SGR click (button `b`, press `M` or release `m`) on the option labelled `label`, below the 3-line filler. */
+	const click = (label: string, b = 0, kind: "M" | "m" = "M") => (lines: string[]): string => {
+		const i = lines.findIndex((l) => l.trim() === `→ ${label}` || l.trim() === label);
+		if (i < 0) throw new Error(`option ${label} not rendered`);
+		return `\x1b[<${b};5;${3 + i + 1}${kind}`;
+	};
+
+	const run = async (keys: Array<string | ((lines: string[]) => string)>, layout = true) => {
+		const h = session({});
+		h.responses = [ASK];
+		driveMouseDialog(h, keys, { layout });
+		return toolCall(h, "bash", { command: "cargo build" });
+	};
+
+	test("click No, click No again → declined", async () => {
+		const r = await run([click("No"), click("No")]);
+		expect(r.block).toBe(true);
+		expect(r.reason).toContain("user-declined");
+	});
+
+	test("a single click never allows (initial Yes highlight does not arm a confirm)", async () => {
+		const r = await run([click("Yes"), "\x1b"]);
+		expect(r.block).toBe(true);
+	});
+
+	test("click Yes twice → allowed", async () => {
+		expect(await run([click("Yes"), click("Yes")])).toBeUndefined();
+	});
+
+	test("keyboard moves disarm the confirm click", async () => {
+		const r = await run([click("Yes"), DOWN, UP, click("Yes"), "\x1b"]);
+		expect(r.block).toBe(true);
+	});
+
+	test("a click on another row re-arms instead of confirming the first", async () => {
+		const r = await run([click("No"), click("Yes"), click("No"), "\x1b"]);
+		expect(r.block).toBe(true);
+	});
+
+	test("releases and wheel events are ignored", async () => {
+		const r = await run([click("Yes", 0, "m"), click("Yes", 0, "m"), click("Yes", 64), click("Yes", 64), "\x1b"]);
+		expect(r.block).toBe(true);
+	});
+
+	test("host without layout metrics: clicks are ignored without throwing", async () => {
+		const r = await run(["\x1b[<0;5;7M", "\x1b[<0;5;7M", "\x1b"], false);
+		expect(r.block).toBe(true);
+	});
+});
+
 describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 	const SENS = path.join(TMP_AGENT, "sensitive-sg");
 	fs.mkdirSync(SENS, { recursive: true });
@@ -3009,5 +3094,94 @@ describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
 			expect(root.confirms).toBe(0);
 		});
+	});
+});
+
+describe("live classifier status widget", () => {
+	const CLEAR = ["verdict", undefined];
+	const JEV_ALLOW_49 = "<verdict>allow</verdict> jev: allow 66% (confidence 49%; ask 33%, deny 1%)";
+
+	test("gray command: widget row set while the model runs, cleared after", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		await toolCall(h, "bash", { command: "echo hi" });
+		expect(h.widgetSets[0]![0]).toBe("verdict");
+		expect(h.widgetSets[0]![1]![0]).toContain("classifying bash via mock/glm");
+		expect(h.widgetSets.at(-1)).toEqual(CLEAR);
+		expect(h.widgetSets).toHaveLength(2);
+	});
+
+	test("row never carries command text", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		await toolCall(h, "bash", { command: "echo SECRET-MARKER" });
+		expect(JSON.stringify(h.widgetSets)).not.toContain("SECRET-MARKER");
+	});
+
+	test("rule allow never touches the widget", async () => {
+		const h = session({ allow: ["^ls\\b"] });
+		await toolCall(h, "bash", { command: "ls" });
+		expect(h.widgetSets).toEqual([]);
+	});
+
+	test("classifier error fails closed and the row is still cleared", async () => {
+		const h = session({});
+		h.responses = [new Error("boom")];
+		const r = await toolCall(h, "bash", { command: "echo hi" });
+		expect(r?.block).toBe(true);
+		expect(h.widgetSets.at(-1)).toEqual(CLEAR);
+	});
+
+	test("row is cleared before the confirm dialog opens", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
+		let atConfirm: Array<[string, string[] | undefined]> = [];
+		h.ctx.ui.confirm = async () => {
+			h.confirms++;
+			atConfirm = [...h.widgetSets];
+			return true;
+		};
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(h.confirms).toBe(1);
+		expect(atConfirm.at(-1)).toEqual(CLEAR);
+	});
+
+	test("fallback cascade shows a second row naming the fallback model", async () => {
+		const h = session({ classifierMinConfidence: 50, classifierFallbackModel: "mock/fb" });
+		h.findMap = { "mock/fb": { id: "fb-model" } };
+		h.responses = [{ text: JEV_ALLOW_49 }, { text: "<verdict>allow</verdict> fine" }];
+		h.confirmAnswer = true;
+		await toolCall(h, "bash", { command: "ls -la /tmp" });
+		const rows = h.widgetSets.filter(([, c]) => c !== undefined).map(([, c]) => c![0]);
+		expect(rows).toHaveLength(2);
+		expect(rows[0]).toContain("classifying bash via mock/glm");
+		expect(rows[1]).toContain("fallback classifier fb-model");
+		expect(h.widgetSets.at(-1)).toEqual(CLEAR);
+	});
+
+	test("no UI: no widget calls", async () => {
+		const h = session({});
+		h.ctx.hasUI = false;
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		await toolCall(h, "bash", { command: "echo hi" });
+		expect(h.widgetSets).toEqual([]);
+	});
+
+	test("subagent calls never set the row", async () => {
+		const root = session({ subagentGate: "normal" });
+		await root.handlers["session_start"]({}, root.ctx);
+		const sub = makeHarness();
+		sub.install();
+		sub.ctx.agent = { kind: "sub", id: "Scout1", name: "scout" };
+		sub.ctx.hasUI = true;
+		sub.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		try {
+			await toolCall(sub, "bash", { command: "echo hi" });
+			expect(sub.calls.length).toBe(1);
+			expect(sub.widgetSets).toEqual([]);
+			expect(root.widgetSets).toEqual([]);
+		} finally {
+			await root.handlers["session_shutdown"]({}, root.ctx);
+		}
 	});
 });
