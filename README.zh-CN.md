@@ -148,7 +148,7 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
 - **Transport**: OpenRouter decisions(默认)或 TypeSafe 直连——TypeSafe 侧单次成本显示 $0(其 API 不返回 cost)
 - **宿主**:仅支持pi。omp 上该设置会警告并回退会话模型。也绝不能选作会话主模型(不生成文本,选中即警告)
 - **逃生口**:`PI_VERDICT_JEV_URL` 可覆盖当前 transport 的端点(OpenRouter 侧为 alpha 接口)
-- **确认框**:交互式 TUI 中,ask 弹窗以语法高亮代码块呈现待审代码(bash 命令、write 内容、edit 片段);ask 直接来自 jev 时,另显示彩色 allow/ask/deny 概率条与 `concern:` 行(jev 对该动作的风险类别,由同一请求中的第二个 `concern` 问题给出)。其他宿主与 RPC 模式回退为纯文本 confirm
+- **确认框**:交互式 TUI 中,ask 弹窗以语法高亮代码块呈现待审代码(bash 命令、write 内容、edit 片段);ask 直接来自 jev 时,另显示彩色 allow/ask/deny 概率条、其下一条蓝色细置信度条(在 `classifierMinConfidence` 置信地板处有刻度线)与 `concern:` 行(jev 对该动作的风险类别,由同一请求中的第二个 `concern` 问题给出)。其他宿主与 RPC 模式回退为纯文本 confirm
 
 jev 的校准 confidence 正是置信地板的判定依据——搭配第二层使用(`"classifierMinConfidence": 50, "classifierFallbackModel": "anthropic/claude-haiku-4-5"`),让低置信调用交给更深的模型而非直接生效([ADR-0004](docs/adr/0004-classifier-fallback-cascade.md))。
 
