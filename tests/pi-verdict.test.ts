@@ -116,7 +116,7 @@ const clearAudit = () => fs.rmSync(VERDICTS(), { recursive: true, force: true })
 beforeAll(() => { process.env.PI_CODING_AGENT_DIR = TMP_AGENT; });
 afterAll(() => { delete process.env.PI_CODING_AGENT_DIR; });
 
-function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown }, invalid?: string[]): void {
+function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: boolean; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
 	config = { allow: cfg.allow ?? [], deny: cfg.deny ?? [] };
 	const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
 	fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -131,6 +131,9 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 	if (cfg.classifierFallbackConfidence !== undefined) raw.classifierFallbackConfidence = cfg.classifierFallbackConfidence;
 	if (cfg.classifierMinConfidence !== undefined) raw.classifierMinConfidence = cfg.classifierMinConfidence;
 	if (cfg.classifierFallbackMode !== undefined) raw.classifierFallbackMode = cfg.classifierFallbackMode;
+	if (cfg.autoDeny !== undefined) raw.autoDeny = cfg.autoDeny;
+	if (cfg.subagentGate !== undefined) raw.subagentGate = cfg.subagentGate;
+	if (cfg.subagentAskTimeoutMs !== undefined) raw.subagentAskTimeoutMs = cfg.subagentAskTimeoutMs;
 	// denyPaths (ADR-0002): unknown[] lets negative tests mix in non-string entries
 	if (cfg.denyPaths !== undefined) raw.denyPaths = cfg.denyPaths;
 	// 非法正则测试:把 invalid 条目直接混入 allow 数组
@@ -2177,12 +2180,12 @@ describe("project trust prompt", () => {
 	const readTrust = () => JSON.parse(fs.readFileSync(TRUST_FILE(), "utf8")) as { trusted: string[]; untrusted: string[] };
 
 	/** Project config denies the probe command; blocked-by-rule ⇔ the project config is applied. */
-	async function withProject(fn: (h: Harness, dir: string) => Promise<void>): Promise<void> {
+	async function withProject(fn: (h: Harness, dir: string) => Promise<void>, cfg: Parameters<typeof setConfig>[0] = {}): Promise<void> {
 		await withTempDir("pv-proj-", async (dir) => {
 			fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
 			fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ deny: ["^echo trusted-marker"] }));
 			fs.rmSync(TRUST_FILE(), { force: true });
-			const h = session({}, { cwd: dir });
+			const h = session(cfg, { cwd: dir });
 			h.responses = [{ text: "<verdict>allow</verdict> ok" }]; // unapplied config → gray → classifier allows
 			try {
 				await fn(h, dir);
@@ -2265,7 +2268,7 @@ describe("project trust prompt", () => {
 			await start(h);
 			expect((h as any).selects).toBe(0);
 			expect(await applied(h)).toBe(true);
-		});
+		}, { subagentGate: "normal" }); // the probe runs tool_call on a subagent, which is inert under the default "off"
 	});
 
 	test("malformed trust file: Trust applies for the session, file untouched, warns", async () => {
@@ -2571,5 +2574,262 @@ describe("approve dialog routing", () => {
 		expect(rendered[0]).toContain("concern: network operation");
 		expect(rendered[0]).toContain("allow 35%");
 		expect(rendered[0]).toContain("█");
+	});
+});
+
+// ── subagent gate (omp ctx.agent.kind = "sub") ───────────
+
+describe("subagent gate (omp ctx.agent.kind = sub)", () => {
+	const SENS = path.join(TMP_AGENT, "sensitive-sg");
+	fs.mkdirSync(SENS, { recursive: true });
+	const ASK = { text: "<verdict>ask</verdict> not sure" };
+	const ALLOW = { text: "<verdict>allow</verdict> fine" };
+	const DENY = { text: "<verdict>deny</verdict> unsafe" };
+	const JEV_ALLOW_49 = "<verdict>allow</verdict> jev: allow 66% (confidence 49%; ask 33%, deny 1%)";
+	const JEV_DENY_29 = "<verdict>deny</verdict> jev: deny 64% (confidence 29%; allow 36%)";
+	const LABEL = "[subagent Scout1 (scout)]";
+
+	/** A root harness (interactive, published as the root UI) + a subagent harness with no UI of its own.
+	 *  Always shuts the root down so the module-level registry never leaks between tests. */
+	async function withBridge(
+		cfg: Parameters<typeof setConfig>[0],
+		fn: (root: Harness, sub: Harness) => Promise<void>,
+		opts: { rootHasUI?: boolean } = {},
+	): Promise<void> {
+		// the production default is "off"; bridge tests opt in to "normal" unless they say otherwise
+		// (an explicit `subagentGate: undefined` key exercises the true default)
+		const root = session({ subagentGate: "normal", ...cfg });
+		root.ctx.hasUI = opts.rootHasUI ?? true;
+		await root.handlers["session_start"]({}, root.ctx);
+		const sub = makeHarness();
+		sub.install();
+		sub.ctx.agent = { kind: "sub", id: "Scout1", name: "scout" };
+		sub.ctx.hasUI = false;
+		sub.findMap = { "mock/fb": { id: "fb-model" } };
+		try {
+			await fn(root, sub);
+		} finally {
+			await root.handlers["session_shutdown"]({}, root.ctx);
+		}
+	}
+
+	/** Yield microtasks until `cond` holds (bounded) — no wall-clock waiting */
+	const flush = async (cond: () => boolean): Promise<void> => {
+		for (let i = 0; i < 200 && !cond(); i++) await Promise.resolve();
+	};
+
+	// subagentAskTimeoutMs below is a real AbortSignal.timeout — the code under test owns that
+	// platform timer, so these tests use a short genuine deadline rather than fake time.
+
+	/** Root confirm that never answers: resolves only when the dialog's signal aborts */
+	const hangUntilAbort = (root: Harness): void => {
+		root.ctx.ui.confirm = (_t: string, m: string, o?: { signal?: AbortSignal }) => {
+			root.confirms++;
+			root.confirmMsgs.push(m);
+			const { promise, resolve } = Promise.withResolvers<boolean>();
+			o?.signal?.addEventListener("abort", () => resolve(false), { once: true });
+			return promise;
+		};
+	};
+
+	test("normal: a classifier ask prompts the root UI, not the subagent's; the answer decides", async () => {
+		await withBridge({}, async (root, sub) => {
+			sub.responses = [ASK];
+			const ok = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(ok).toBeUndefined();
+			expect(root.confirms).toBe(1);
+			expect(sub.confirms).toBe(0);
+			expect(root.confirmMsgs[0]).toContain("cargo build");
+			root.confirmAnswer = false;
+			const no = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(no?.block).toBe(true);
+			expect(String(no.reason)).toContain("user-declined");
+		});
+	});
+
+	test("normal: notifications land on the root UI with the subagent label", async () => {
+		await withBridge({}, async (root, sub) => {
+			sub.responses = [DENY];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(root.notifies.some(([m]) => m.includes(`🛡️ ${LABEL} Auto Mode blocked`))).toBe(true);
+			expect(sub.notifies.length).toBe(0);
+		});
+	});
+
+	test("normal: unanswered past subagentAskTimeoutMs → second model decides; only an explicit allow permits", async () => {
+		await withBridge({ subagentAskTimeoutMs: 30, classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			hangUntilAbort(root);
+			sub.responses = [ASK, ALLOW];
+			expect(await toolCall(sub, "bash", { command: "cargo build" })).toBeUndefined();
+			expect(sub.calls.length).toBe(2);
+			sub.calls.length = 0;
+			sub.responses = [ASK, DENY];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(String(r.reason)).toContain("subagent-auto");
+			expect(String(r.reason)).toContain("second model did not approve");
+		});
+	});
+
+	test("normal: a cancelled subagent run closes the root dialog, blocks, and never consults the second model", async () => {
+		await withBridge({ subagentAskTimeoutMs: 60_000, classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			hangUntilAbort(root);
+			const ctrl = new AbortController();
+			sub.ctx.signal = ctrl.signal;
+			sub.responses = [ASK, ALLOW];
+			const pending = toolCall(sub, "bash", { command: "cargo build" });
+			await flush(() => root.confirms > 0);
+			ctrl.abort();
+			const r = await pending;
+			expect(r?.block).toBe(true);
+			expect(String(r.reason)).toContain("subagent-cancelled");
+			expect(sub.calls.length).toBe(1);
+		});
+	});
+
+	test("auto: never prompts; the second model decides; no second model configured → deny", async () => {
+		await withBridge({ subagentGate: "auto", classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			sub.responses = [ASK, ALLOW];
+			expect(await toolCall(sub, "bash", { command: "cargo build" })).toBeUndefined();
+			sub.responses = [ASK, DENY];
+			sub.calls.length = 0;
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(root.confirms).toBe(0);
+		});
+		await withBridge({ subagentGate: "auto" }, async (root, sub) => {
+			sub.responses = [ASK];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(String(r.reason)).toContain("no second model configured");
+			expect(root.confirms).toBe(0);
+		});
+	});
+
+	test("asks that did not come from the classifier never auto-allow (protected path, .omp, autoDeny:false)", async () => {
+		await withBridge({ subagentGate: "auto", denyPaths: [SENS], classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			sub.responses = [ALLOW];
+			const r = await toolCall(sub, "read", { path: path.join(SENS, "secret.md") });
+			expect(r?.block).toBe(true);
+			expect(sub.calls.length).toBe(0);
+			expect(root.notifies.map(([m]) => m).join("\n")).not.toContain(path.basename(SENS));
+			expect(String(r.reason)).not.toContain(path.basename(SENS));
+			const omp = await toolCall(sub, "read", { path: "/proj/.omp/x" });
+			expect(omp?.block).toBe(true);
+			expect(sub.calls.length).toBe(0);
+		});
+		await withBridge({ subagentGate: "auto", autoDeny: false, classifierFallbackModel: "mock/fb" }, async (_root, sub) => {
+			sub.responses = [DENY, ALLOW];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(sub.calls.length).toBe(1); // the second model was never asked
+		});
+	});
+
+	test("ADR-0004 carve-out holds for subagents: a demoted first-layer deny is never auto-allowed", async () => {
+		const cfg = { subagentGate: "auto", classifierMinConfidence: 50, classifierFallbackModel: "mock/fb" };
+		await withBridge(cfg, async (_root, sub) => {
+			sub.responses = [{ text: JEV_DENY_29 }, ALLOW];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+		});
+		// control: a demoted allow with a second-model allow passes
+		await withBridge(cfg, async (_root, sub) => {
+			sub.responses = [{ text: JEV_ALLOW_49 }, ALLOW];
+			expect(await toolCall(sub, "bash", { command: "cargo build" })).toBeUndefined();
+		});
+	});
+
+	test("off: the gate is inert in subagents (the root stays gated)", async () => {
+		await withBridge({ subagentGate: "off" }, async (root, sub) => {
+			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
+			expect(sub.calls.length).toBe(0);
+			const r = await toolCall(root, "bash", { command: "rm " + "-rf /tmp/x" });
+			expect(r?.block).toBe(true);
+		});
+	});
+
+	test("default is off: a fresh config leaves subagents ungated", async () => {
+		await withBridge({ subagentGate: undefined }, async (root, sub) => {
+			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
+			expect(sub.calls.length).toBe(0);
+			expect(root.confirms).toBe(0);
+		});
+	});
+
+	test("no root UI: normal degrades to the second-model path with no prompt", async () => {
+		await withBridge({ classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			sub.responses = [ASK, ALLOW];
+			expect(await toolCall(sub, "bash", { command: "cargo build" })).toBeUndefined();
+			expect(sub.calls.length).toBe(2);
+			expect(root.confirms).toBe(0);
+		}, { rootHasUI: false });
+	});
+
+	test("root dialogs are serialized: concurrent subagent asks never overlap", async () => {
+		await withBridge({}, async (root, sub) => {
+			let inFlight = 0;
+			let maxInFlight = 0;
+			const gates: Array<() => void> = [];
+			root.ctx.ui.confirm = async () => {
+				inFlight++;
+				maxInFlight = Math.max(maxInFlight, inFlight);
+				const { promise, resolve } = Promise.withResolvers<void>();
+				gates.push(resolve);
+				await promise;
+				inFlight--;
+				return true;
+			};
+			sub.responses = [ASK];
+			const both = Promise.all([toolCall(sub, "bash", { command: "cargo build" }), toolCall(sub, "bash", { command: "cargo test" })]);
+			await flush(() => gates.length >= 1);
+			await flush(() => gates.length >= 2); // gives the second ask every chance to (wrongly) start
+			expect(gates.length).toBe(1);
+			gates[0]();
+			await flush(() => gates.length >= 2);
+			gates[1]();
+			expect(await both).toEqual([undefined, undefined]);
+			expect(maxInFlight).toBe(1);
+		});
+	});
+
+	test("audit records who resolved the ask: timeout (second model) vs human", async () => {
+		clearAudit();
+		try {
+			await withBridge({ audit: true, subagentAskTimeoutMs: 30, classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+				hangUntilAbort(root);
+				sub.responses = [ASK, ALLOW];
+				await toolCall(sub, "bash", { command: "cargo build" });
+				const rec = readAudit().at(-1);
+				expect(rec.subagent).toEqual({ id: "Scout1", name: "scout", resolution: "timeout" });
+				expect(rec.fallback).toMatchObject({ triggeredBy: "subagent-ask", verdict: "allow", effective: "allow" });
+				expect(rec.userAnswer).toBeUndefined();
+			});
+			clearAudit();
+			await withBridge({ audit: true }, async (_root, sub) => {
+				sub.responses = [ASK];
+				await toolCall(sub, "bash", { command: "cargo build" });
+				const rec = readAudit().at(-1);
+				expect(rec.subagent).toEqual({ id: "Scout1", name: "scout", resolution: "human" });
+				expect(rec.userAnswer).toBe("allowed");
+			});
+		} finally {
+			clearAudit();
+		}
+	});
+
+	test("invalid subagentGate / subagentAskTimeoutMs warn and fall back to the defaults", async () => {
+		const h = session({ subagentGate: "x", subagentAskTimeoutMs: 0 });
+		await h.handlers["session_start"]({}, h.ctx);
+		const warning = h.notifies.filter(([m, l]) => l === "warning" && m.includes("skipped")).map(([m]) => m).join(" ");
+		expect(warning).toContain("subagentGate");
+		expect(warning).toContain("subagentAskTimeoutMs");
+		await h.handlers["session_shutdown"]({}, h.ctx);
+		// an invalid mode falls back to the default (off): the subagent is not gated, nothing prompts
+		await withBridge({ subagentGate: "x", subagentAskTimeoutMs: 0 }, async (root, sub) => {
+			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
+			expect(root.confirms).toBe(0);
+		});
 	});
 });

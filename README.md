@@ -113,7 +113,9 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
   "notifyAllows": false,
   "classifierMinConfidence": null,
   "classifierFallbackModel": null,
-  "classifierFallbackMode": "shadow"
+  "classifierFallbackMode": "shadow",
+  "subagentGate": "off",
+  "subagentAskTimeoutMs": 60000
 }
 ```
 
@@ -126,6 +128,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `audit: true` records every **gray-zone adjudication** (the full transcript sent to the classifier, its raw response, the parsed verdict) as JSONL under `~/.pi/agent/verdicts/<sessionId>.jsonl` — one file per session, the 20 most recent kept. Interactive asks also record your answer (`userAnswer` ground truth, written after the confirm resolves), and protected-path asks are recorded too (#62); rule allow/deny stays unaudited. Local-only and full-fidelity (protected-path plaintext may appear — it never leaves your machine; [ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md) boundary note); the agent can neither read nor write the directory. `/automode` shows the audit state and path while on
 - `notifyAllows: true` notifies on every **classifier allow** (reason + action line — e.g. jev's probability breakdown); default `false` keeps passes silent. Mechanical passes (your own allow rules, protected-path confirms) never notify; shadow-cache annotations stay debug-only; with both switches on the notification appears once
 - `classifierMinConfidence` (optional, [ADR-0004](docs/adr/0004-classifier-fallback-cascade.md)) sets the **confidence floor**: a jev verdict below it is demoted — cascaded to `classifierFallbackModel` if set (`shadow` = the second layer records its opinion and you are asked; `enforce` = the second layer adjudicates, except a demoted deny can never be auto-allowed), otherwise asked of you directly. At/above the floor the first layer is autonomous. A natural pairing: jev first + a haiku-class fallback
+- `subagentGate` (omp only) decides what happens to `ask`s raised inside **subagents**, which have no UI of their own: `"off"` (default) leaves subagents ungated; `"normal"` shows the confirmation dialog on the root session's UI, labeled with the subagent; unanswered within `subagentAskTimeoutMs` (default 60000 ms) or with no root UI, it resolves via `classifierFallbackModel` — only an explicit `allow` from it permits the call, everything else denies; `"auto"` never prompts and always resolves that way. Protected-path / `.omp` asks never auto-allow. Set omp's `extensionHandlers.toolCallTimeoutMs` ≥ `subagentAskTimeoutMs + 60000`
 
 No built-in allowlist — every "always allow" claim is yours ([why](docs/configuration.md#why-no-built-in-allowlist)). Full reference: [docs/configuration.md](docs/configuration.md).
 
