@@ -9,7 +9,6 @@
 		"extensions/pi-verdict.ts",
 		"extensions/jev-adapter.ts",
 		"README.md",
-		"README.zh-CN.md",
 		"LICENSE"
 	],
 	"keywords": [
