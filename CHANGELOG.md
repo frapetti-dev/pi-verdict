@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-02
+
 ### Added
 
 - Footer status redesign and `footer` config key (`"full"` default | `"compact"` | `"off"`; editable from `/verdict`, project-overridable, invalid values warn and fall back to `"full"`): the footer used to show only `auto mode on`/`auto mode off`. `"full"` now renders Nerd Font powerline blocks — gate state, risky settings (`floor off`, `.omp gate off`), the classifier model (`↺` inherited session model, `⚠ ↺` configured model unavailable so the session model is used, `↳ <id>·shadow|enforce` fallback model), per-session verdict counters (final pipeline verdicts of root-session calls; reset by `SessionState.reset()`, kept across `/verdict` saves; subagent calls and calls while the master switch is off are not counted), and info badges (`≥N%`, `autoDeny off`, `subagent normal|auto`); `"compact"` is one plain text line without counters, also used when the host theme lacks `bg`/`getBgAnsi` (e.g. omp). The footer refreshes after every adjudicated tool call, on `/verdict` saves and on `model_select`, and never contains command or path text (ADR-0002). Pure renderer exported as `renderFooter`.
