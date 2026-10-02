@@ -411,7 +411,8 @@ describe("S-rule case folding + firmlink prefixes (#21)", () => {
 		expect(r?.block).toBe(true);
 	});
 
-	test("read via project-local symlink to /etc grades gray (real form hits the firmlink prefix)", async () => {
+	// /etc does not exist on win32 (the symlink would dangle), so the real-form hit cannot be exercised there
+	test.skipIf(process.platform === "win32")("read via project-local symlink to /etc grades gray (real form hits the firmlink prefix)", async () => {
 		await withTempDir(".pv-t21-", async (root) => {
 				fs.symlinkSync("/etc", path.join(root, "e"));
 				const h = session({});

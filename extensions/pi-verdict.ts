@@ -641,6 +641,12 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 // 规则层:文件路径敏感度(源自研究报告 §4.4)
 // ============================================================================
 
+/** S-rule regexes are written against POSIX spelling. On win32 (path.sep "\\") convert
+ *  separators to "/" and drop the drive letter so `C:\proj\.ssh\id_rsa` and `/etc/x`
+ *  (which path.resolve roots at the cwd drive) match like their POSIX counterparts.
+ *  On POSIX a backslash is a legal filename character and is left untouched. */
+const toRuleForm = (f: string): string => (path.sep === "\\" ? f.replace(/\\/g, "/").replace(/^[A-Za-z]:(?=\/)/, "") : f);
+
 function expandHome(p: string): string {
 	return p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p;
 }
@@ -670,7 +676,8 @@ function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: b
 	// a project-local symlink aliasing ~/.ssh or a .git/hooks dir must not pass
 	// the floor on its lexical spelling alone.
 	const forms = rebuiltForms(abs);
-	const hit = (rules: RegExp[]) => forms.some((f) => rules.some((r) => r.test(f)));
+	const ruleForms = forms.map(toRuleForm);
+	const hit = (rules: RegExp[]) => ruleForms.some((f) => rules.some((r) => r.test(f)));
 	// floor 关闭时:内置 deny 一律降级 gray(永不升格 allow);非 deny 分支(allow/gray)保持
 	const D = floorOn
 		? (reason: string): RuleResult => ({ verdict: "deny", reason })
@@ -687,7 +694,7 @@ function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: b
 	// In-cwd write allowance (#20): every canonical form must sit inside the cwd
 	// (in either its lexical or real form) — a lexical prefix hit whose real
 	// form escapes the project (symlink alias) grades as an outside-cwd write.
-	const cwdBases = new Set(baseForms(cwd));
+	const cwdBases = new Set(baseForms(path.resolve(cwd)));
 	const inCwd = (f: string) => [...cwdBases].some((b) => f === b || f.startsWith(b + path.sep));
 	if (forms.every(inCwd)) return { verdict: "allow" };
 	return { verdict: "gray", reason: `write outside project directory (CWD): ${rawPath}` };
@@ -729,8 +736,8 @@ function userRuleTarget(toolName: string, input: Record<string, unknown>, cwd: s
 	if (kind === "command") return String(input.command ?? "");
 	if (kind === "file") {
 		const p = typeof input.path === "string" && input.path ? input.path : null;
-		if (!p) return isScopeTool(toolName) ? path.resolve(cwd) : null;
-		return path.resolve(cwd, expandHome(p));
+		if (!p) return isScopeTool(toolName) ? toRuleForm(path.resolve(cwd)) : null;
+		return toRuleForm(path.resolve(cwd, expandHome(p)));
 	}
 	return null;
 }
@@ -774,7 +781,13 @@ const anchorDenyPaths = (paths: string[], cwd: string): string[] => paths.flatMa
  *  IS the cwd subtree (#48). */
 function denyPathCandidates(toolName: string, input: Record<string, unknown>, cwd: string): string[] {
 	const kind = toolKind(toolName);
-	if (kind === "command") return [...String(input.command ?? "").matchAll(BASH_PATH_TOKENS)].map((m) => m[0]);
+	if (kind === "command") {
+		// win32: backslash-separated paths (`C:\proj\f`) are the native spelling; BASH_PATH_TOKENS is
+		// "/"-only, so unify separators first (drive letter is skipped by the absolute-path branch;
+		// a mis-read shell escape only yields extra candidates — false positives ask, the safe direction)
+		const cmd = String(input.command ?? "");
+		return [...(path.sep === "\\" ? cmd.replace(/\\/g, "/") : cmd).matchAll(BASH_PATH_TOKENS)].map((m) => m[0]);
+	}
 	if (kind === "file") {
 		const p = typeof input.path === "string" && input.path ? input.path : null;
 		if (!p) return isScopeTool(toolName) ? [cwd] : [];
