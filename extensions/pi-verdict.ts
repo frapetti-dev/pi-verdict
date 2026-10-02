@@ -79,9 +79,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type * as PiAgent from "@earendil-works/pi-coding-agent";
+import type * as PiTui from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
-import { activeTransport, parseJevConfidence, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER } from "./jev-adapter";
+import { activeTransport, type JevReason, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER } from "./jev-adapter";
 
 // ============================================================================
 // 规则层:bash
@@ -250,6 +252,8 @@ interface UserRules {
 	tools: string[];
 	/** 内置 deny floor 开关(危险正则 + 路径敏感度 deny),默认 true;关闭后依赖用户规则与分类器 */
 	builtinDenyFloor: boolean;
+	/** Forced gate on `.omp` directories: any file-tool path or bash token that resolves into a `.omp` path segment (lexical or realpath form) is a terminal ask (non-interactive → deny). Default true; checked after the built-in floor and user deny, before denyPaths/user allow. Config key: "gateOmpDir". */
+	gateOmpDir: boolean;
 	/** [pi-verdict local patch: autoDeny] false → auto-review denies become interactive asks (headless still denies). Default true. */
 	autoDeny: boolean;
 	/** [pi-verdict local patch: rules] user-authored free-text rules appended to every classifier prompt (LLM + jev). Config key: "rules". */
@@ -272,9 +276,13 @@ interface UserRules {
 	/** #67: does the second layer adjudicate cascaded calls ("enforce") or only record its
 	 *  opinion while the human decides ("shadow", default)? */
 	classifierFallbackMode: "shadow" | "enforce";
+	/** Subagent gate mode (omp only): "off" = gate inert in subagents; "normal" = asks prompt on the root UI, unanswered within subagentAskTimeoutMs → resolved by the second model; "auto" = never prompt, resolved by the second model. Default "off". */
+	subagentGate: "off" | "normal" | "auto";
+	/** normal-mode root-dialog deadline in ms, measured from enqueue (queue wait counts). Default 60000. */
+	subagentAskTimeoutMs: number;
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, classifierModel: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", autoDeny: true, classifierRules: [] };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, gateOmpDir: true, classifierModel: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, autoDeny: true, classifierRules: [] };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -432,11 +440,33 @@ function recordTrust(root: string, decision: "trusted" | "untrusted"): string | 
 	return null;
 }
 
+/**
+ * Starter `tools` allowlist written into the first-run config template (a pre-filled
+ * user declaration, like the denyPaths starter list — existing configs are never
+ * rewritten). Only tools with no path/command shape (toolKind() === null) can be
+ * listed. Selection criterion: no filesystem/process/network side effect of their own,
+ * or an effect already gated elsewhere.
+ *  - ask:        prompts the user; the user is the gate
+ *  - todo:       session task list (UI/session metadata only)
+ *  - wait:       blocks on already-started background jobs
+ *  - task:       spawns subagents; their tool calls pass this gate too (the extension is
+ *                re-bound in every subagent session)
+ *  - yield:      subagent result submission (hidden tool)
+ *  - think:      private scratchpad (hidden tool)
+ *  - checkpoint, rewind: prune session conversation context only (no file/git restore)
+ *  - recall, reflect:    read from the configured memory backend
+ * Deliberately NOT listed: glob/ast_grep/lsp (path-scoped reads that this tool-name
+ * family skips denyPaths for), web_search (query text leaves the machine), retain/learn/
+ * memory_edit/manage_skill (persist content into future prompts), eval/github/debug/ida/
+ * security_scan/ast_edit (execute code or mutate state).
+ */
+const DEFAULT_ALLOWED_TOOLS = ["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"];
+
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000.",
 	allow: ["^ls\\b"],
 	deny: [],
-	tools: [],
+	tools: DEFAULT_ALLOWED_TOOLS,
 	denyPaths: [
 		"~/.ssh/",
 		"~/.profile",
@@ -446,6 +476,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 		"~/.bashrc",
 	],
 	builtinDenyFloor: true,
+	gateOmpDir: true,
 	autoDeny: true,
 	classifierModel: null,
 	toggleShortcut: DEFAULT_TOGGLE_SHORTCUT,
@@ -454,6 +485,8 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	classifierMinConfidence: null,
 	classifierFallbackModel: null,
 	classifierFallbackMode: "shadow",
+	subagentGate: "off",
+	subagentAskTimeoutMs: 60000,
 	rules: [],
 }, null, 2)}\n`;
 
@@ -474,7 +507,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 			} catch { /* 只读环境静默跳过 */ }
 			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null };
 		}
-	let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: unknown; rules?: unknown };
+		let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; gateOmpDir?: unknown; classifierModel?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; subagentGate?: unknown; subagentAskTimeoutMs?: unknown; autoDeny?: unknown; rules?: unknown };
 		try {
 			raw = JSON.parse(fs.readFileSync(p, "utf8")) as typeof raw;
 		} catch (err) {
@@ -560,6 +593,12 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 		if (minConfRaw !== undefined && minConfRaw !== null && !minConfOk) skipped.push(`classifierMinConfidence: ${JSON.stringify(minConfRaw)}`);
 		const fbModeRaw = raw.classifierFallbackMode;
 		if (fbModeRaw !== undefined && fbModeRaw !== "shadow" && fbModeRaw !== "enforce") skipped.push(`classifierFallbackMode: ${JSON.stringify(fbModeRaw)}`);
+		const sgRaw = raw.subagentGate;
+		const sgOk = sgRaw === "off" || sgRaw === "normal" || sgRaw === "auto";
+		if (sgRaw !== undefined && !sgOk) skipped.push(`subagentGate: ${JSON.stringify(sgRaw)}`);
+		const satRaw = raw.subagentAskTimeoutMs;
+		const satOk = typeof satRaw === "number" && Number.isInteger(satRaw) && satRaw >= 1;
+		if (satRaw !== undefined && !satOk) skipped.push(`subagentAskTimeoutMs: ${JSON.stringify(satRaw)}`);
 		return {
 			rules: {
 				allow: compile(raw.allow),
@@ -567,6 +606,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 				denyPaths,
 				tools,
 				builtinDenyFloor: raw.builtinDenyFloor !== false,
+				gateOmpDir: raw.gateOmpDir !== false,
 				classifierModel: typeof raw.classifierModel === "string" && raw.classifierModel.trim() ? raw.classifierModel.trim() : null,
 				toggleShortcut: shortcut.key,
 				audit: raw.audit === true,
@@ -574,6 +614,8 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 				classifierFallbackModel: typeof raw.classifierFallbackModel === "string" && raw.classifierFallbackModel.trim() ? raw.classifierFallbackModel.trim() : null,
 				classifierMinConfidence: minConfOk ? minConfRaw : null,
 				classifierFallbackMode: fbModeRaw === "enforce" ? "enforce" : "shadow",
+				subagentGate: sgOk ? sgRaw : "off",
+				subagentAskTimeoutMs: satOk ? satRaw : 60_000,
 				autoDeny: raw.autoDeny !== false,
 				classifierRules,
 			},
@@ -754,11 +796,35 @@ function hitDenyPaths(toolName: string, input: Record<string, unknown>, cwd: str
 	return null;
 }
 
+/** `.omp` as a whole path segment (case-insensitive: case-folding filesystems; both separators: win32 forms) */
+const OMP_DIR_SEGMENT = /(?:^|[\\/])\.omp(?:[\\/]|$)/i;
+/** `.omp` as a shell word inside a raw command string (`cd .omp`, `ls ~/.omp/x`, `"$HOME/.omp"`): not preceded by a word/dot/dash char, not followed by one (`x.omp`, `.omp.bak`, `.ompx` do not match). False positives ask — the safe direction */
+const OMP_DIR_IN_COMMAND = /(?<![\w.-])\.omp(?![\w.-])/;
+
+/** Forced-gate detection (gateOmpDir): does the call target a path inside a `.omp` directory?
+ *  Reuses the denyPaths candidate extraction and base-tier dual forms (lexical + realpath), so a
+ *  symlink aliasing a `.omp` directory hits too. Scope tools (grep/find/ls) are checked on their
+ *  own target only (omitted path → cwd): a recursive search from a project root that merely
+ *  traverses a nested `.omp` is not a `.omp` access. Returns the matched form (UI-only detail). */
+function hitOmpDir(toolName: string, input: Record<string, unknown>, cwd: string): string | null {
+	if (toolKind(toolName) === "command") {
+		const command = String(input.command ?? "");
+		if (OMP_DIR_IN_COMMAND.test(command)) return ".omp referenced in the command";
+	}
+	for (const candidate of denyPathCandidates(toolName, input, cwd)) {
+		for (const form of denyPathForms(candidate, cwd)) {
+			if (OMP_DIR_SEGMENT.test(form)) return form;
+		}
+	}
+	return null;
+}
+
 /**
  * Tool call → rule-layer verdict. Order (#12; ADR-0002 inserts denyPaths):
  *   1. built-in base (bash danger regex floor / path sensitivity grading) — deny is terminal
  *      (the floor can be turned off via builtinDenyFloor)
  *   2. user deny → deny (beats allow)
+ *      2a. gateOmpDir (default on): path/command touching a `.omp` directory → terminal ask
  *   3. denyPaths hit → terminal ask (ADR-0002: the declaring user adjudicates; before user allow)
  *   4. user allow → allow
  *   5. custom-tool exact match (user.tools) → allow (bypasses classifier for that tool)
@@ -791,6 +857,12 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 	if (target !== null) {
 		for (const re of user.deny) {
 			if (re.test(target)) return { verdict: "deny", reason: `user deny rule: ${re.source}` };
+		}
+		// Forced .omp gate: terminal ask, after user deny, before denyPaths/user allow.
+		// Reason carries no path (it travels back into agent context); the path is UI-only detail.
+		if (user.gateOmpDir) {
+			const omp = hitOmpDir(toolName, input, cwd);
+			if (omp) return { verdict: "ask", reason: "forced gate: access to a .omp directory (gateOmpDir)", detail: omp };
 		}
 		// denyPaths hit → terminal ask (ADR-0002): after user deny, before user allow —
 		// a protected path is the user's exception to their own allow rules.
@@ -1352,7 +1424,7 @@ const AUDIT_KEEP_SESSIONS = 20;
 export interface FallbackAudit {
 	model: string;
 	mode: "shadow" | "enforce";
-	triggeredBy: "confidence" | "fail-closed";
+	triggeredBy: "confidence" | "fail-closed" | "subagent-ask";
 	/** jev confidence that fired the floor; null unless triggeredBy = "confidence" */
 	confidence: number | null;
 	/** null = the fallback call itself failed (unresolvable model, timeout, parse) */
@@ -1398,6 +1470,8 @@ export interface AuditRecord {
 	demoted?: true;
 	/** #63/#67: second-layer outcome when the fallback was consulted. */
 	fallback?: FallbackAudit;
+	/** asks raised in a subagent session: who resolved them */
+	subagent?: { id: string; name: string; resolution: "human" | "timeout" | "auto" };
 }
 
 /** Audit sink (#54): append-only and fail-soft (the first write failure surfaces
@@ -1541,6 +1615,8 @@ export interface Verdict {
 	 *  owns the single finalize: append with userAnswer/answeredAt, or without them when
 	 *  presentation throws. Unset for every non-interactive verdict. */
 	pendingAudit?: AuditRecord;
+	/** Set on every ask: how the ask resolves without a human (subagent auto/timeout). "consult" = ask the second model; "allow"/"deny" = already decided by the cascade or not model-resolvable. */
+	autoResolve?: "consult" | "allow" | "deny";
 }
 
 /** 逐调用环境:呈现无关的宿主能力。model 经 getModel 惰性求值——保持「仅灰区才
@@ -1630,6 +1706,53 @@ async function runConfidenceCascade(
 	return { ...demotedMark, fb: { ...fb, effective: outcome.verdict }, effective: { verdict: outcome.verdict, reason: outcome.reason, source: "classifier" } };
 }
 
+/** Subagent gate: resolve an ask with no human answer. The UI-free counterpart of the
+ *  cascade. Only an explicit second-model allow permits the call; every other outcome denies.
+ *  Asks that did not come from the classifier (protected path, rule/fail-closed asks that
+ *  exist only under autoDeny:false) never reach the model: `autoResolve` is "deny" there. */
+export async function resolveAskWithoutHuman(
+	state: SessionState,
+	env: AdjudicateEnv,
+	v: Verdict,
+	actionLine: string,
+): Promise<{ verdict: "allow" | "deny"; reason: string; fb?: FallbackAudit }> {
+	if (v.autoResolve === "allow") return { verdict: "allow", reason: v.reason };
+	if (v.autoResolve !== "consult") return { verdict: "deny", reason: `no human answer — ${v.reason}` };
+	const rules = state.userRules;
+	if (!rules.classifierFallbackModel || !env.getFallbackModel) {
+		return { verdict: "deny", reason: `no human answer and no second model configured (classifierFallbackModel) — ${v.reason}` };
+	}
+	const start = Date.now();
+	const base = { mode: rules.classifierFallbackMode, triggeredBy: "subagent-ask" as const, confidence: null };
+	const resolved = env.getFallbackModel();
+	if (!resolved) {
+		const error = "fallback model unresolvable (not found or no configured auth)";
+		return {
+			verdict: "deny",
+			reason: `no human answer; second model unavailable (not found or no configured auth) — ${v.reason}`,
+			fb: { ...base, model: rules.classifierFallbackModel, verdict: null, reason: null, durationMs: Date.now() - start, error, effective: "deny" },
+		};
+	}
+	const outcome = await classifyWithModel(env.host, env.signal, env.complete, resolved.model, actionLine, resolved.thinking, rules.denyPaths.length > 0, FALLBACK_TIMEOUT_MS, rules.classifierRules);
+	state.fallback.note("ask", outcome.source === "model" ? outcome.verdict : null);
+	const allowed = outcome.source === "model" && outcome.verdict === "allow";
+	const result: { verdict: "allow" | "deny"; reason: string } = allowed
+		? { verdict: "allow", reason: `second model allows: ${outcome.reason}` }
+		: { verdict: "deny", reason: `second model did not approve (${outcome.source === "model" ? outcome.verdict : "error"}): ${outcome.reason}` };
+	return {
+		...result,
+		fb: {
+			...base,
+			model: resolved.model.id,
+			verdict: outcome.source === "model" ? outcome.verdict : null,
+			reason: outcome.source === "model" ? outcome.reason : null,
+			durationMs: Date.now() - start,
+			error: outcome.source === "model" ? null : outcome.reason,
+			effective: result.verdict,
+		},
+	};
+}
+
 /**
  * 判定管线(CONTEXT.md「判定管线」词条的实现):内置 floor → 用户 deny →
  * denyPaths ask → 用户 allow → 灰区分类器;ask 降级(无 UI → deny)与 fail-closed
@@ -1647,7 +1770,7 @@ export async function adjudicate(
 	const rule = classifyByRules(call.toolName, call.input, env.cwd, state.userRules, state.anchoredDenyPathBases(env.cwd));
 	if (rule.verdict === "allow") return { verdict: "allow", reason: rule.reason ?? "", source: "rule", degraded: false };
 	if (rule.verdict === "deny") {
-		if (!state.userRules.autoDeny && env.hasUI) return { verdict: "ask", reason: (rule.reason ?? "") + AUTO_DENY_OFF_SUFFIX, source: "rule", degraded: false };
+		if (!state.userRules.autoDeny && env.hasUI) return { verdict: "ask", reason: (rule.reason ?? "") + AUTO_DENY_OFF_SUFFIX, source: "rule", degraded: false, autoResolve: "deny" };
 		return { verdict: "deny", reason: rule.reason ?? "", source: "rule", degraded: false };
 	}
 
@@ -1677,7 +1800,7 @@ export async function adjudicate(
 		// denyPaths 命中 → ask 终局(ADR-0002):声明者本人裁决例外;无 UI 降级为 deny
 		if (env.hasUI) {
 			const ppRecord: AuditRecord = { ...buildRecord({ verdict: "ask", reason: rule.reason ?? "", source: "protected-path", degraded: false }, null, "-"), detail: rule.detail };
-			return { verdict: "ask", reason: rule.reason ?? "", detail: rule.detail, source: "protected-path", degraded: false, ...(state.audit ? { pendingAudit: ppRecord } : {}) };
+			return { verdict: "ask", reason: rule.reason ?? "", detail: rule.detail, source: "protected-path", degraded: false, autoResolve: "deny", ...(state.audit ? { pendingAudit: ppRecord } : {}) };
 		}
 		// headless: the ask degrades to deny — recorded like the gray-zone rule (the effective post-degradation verdict is what lands in the record)
 		state.audit?.append({ ...buildRecord({ verdict: "deny", reason: rule.reason ?? "", source: "protected-path", degraded: true }, null, "-"), detail: rule.detail });
@@ -1697,10 +1820,10 @@ export async function adjudicate(
 		const fcRecord = buildRecord({ verdict: "deny", reason, source: "fail-closed", degraded: false }, null, "-");
 		if (cascade.fb) fcRecord.fallback = cascade.fb;
 		if (eff?.verdict === "ask" && env.hasUI) {
-			return { verdict: "ask", reason: eff.reason, source: eff.source, degraded: false, ...(state.audit ? { pendingAudit: fcRecord } : {}) };
+			return { verdict: "ask", reason: eff.reason, source: eff.source, degraded: false, autoResolve: "deny", ...(state.audit ? { pendingAudit: fcRecord } : {}) };
 		}
 		if (eff?.verdict !== "allow" && !state.userRules.autoDeny && env.hasUI) {
-			return { verdict: "ask", reason: (eff?.reason ?? reason) + AUTO_DENY_OFF_SUFFIX, source: eff?.source ?? "fail-closed", degraded: false, ...(state.audit ? { pendingAudit: fcRecord } : {}) };
+			return { verdict: "ask", reason: (eff?.reason ?? reason) + AUTO_DENY_OFF_SUFFIX, source: eff?.source ?? "fail-closed", degraded: false, autoResolve: "deny", ...(state.audit ? { pendingAudit: fcRecord } : {}) };
 		}
 		state.audit?.append(fcRecord);
 		if (eff?.verdict === "allow") return { verdict: "allow", reason: eff.reason, source: "classifier", degraded: false };
@@ -1745,7 +1868,13 @@ export async function adjudicate(
 	// #62: an interactive ask defers the append to the handler finalize (ground truth);
 	// every other outcome appends immediately as before
 	if (env.hasUI && (effVerdict === "ask" || (effVerdict === "deny" && !state.userRules.autoDeny))) {
-		return { verdict: "ask", reason: effVerdict === "deny" ? effReason + AUTO_DENY_OFF_SUFFIX : effReason, source: effSource, degraded: false, shadow, ...(state.audit ? { pendingAudit: grayRecord } : {}) };
+		// Subagent gate: how this ask resolves without a human. ADR-0004 carve-out: a demoted deny is never auto-allowed.
+		const autoResolve: NonNullable<Verdict["autoResolve"]> = effVerdict === "deny" || effSource !== "classifier"
+			? "deny"
+			: cascade.fb
+				? (cascade.fb.verdict === "allow" && !(cascade.demoted && outcome.verdict === "deny") ? "allow" : "deny")
+				: "consult";
+		return { verdict: "ask", reason: effVerdict === "deny" ? effReason + AUTO_DENY_OFF_SUFFIX : effReason, source: effSource, degraded: false, shadow, autoResolve, ...(state.audit ? { pendingAudit: grayRecord } : {}) };
 	}
 	state.audit?.append(grayRecord);
 	if (effVerdict === "allow") return { verdict: "allow", reason: effReason, source: effSource, degraded: false, shadow };
@@ -1774,6 +1903,7 @@ const LIST_KEY_PLACEHOLDER: Record<EditableListKey, string> = {
 	tools: "exact tool name, e.g. ask",
 	rules: "free-text rule for the classifier",
 };
+const GATE_OMP_DIR_DESC = "forced ask on any .omp directory access";
 
 /** Where a project config would be written for `cwd`: the existing one if discovered, else `<cwd>/<dotdir>/pi-verdict.json`.
  *  null when `findProjectConfig`'s stop rule (home dir / agent tree root) would never discover a file there. */
@@ -1833,6 +1963,258 @@ function entryLabel(x: unknown): string {
 }
 
 // ============================================================================
+// Approve dialog
+// ============================================================================
+
+/** Terminal-injection defense for text the dialog prints verbatim: control, bidi and
+ *  zero-width characters become visible `\uXXXX` escapes; `\t` and `\n` survive. */
+export function displaySafe(text: string): string {
+	return text
+		.replace(/\r\n/g, "\n")
+		.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2069\ufeff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+const MAX_DIALOG_CODE_CHARS = 4000;
+const MAX_DIALOG_CODE_LINES = 40;
+const MAX_DIALOG_EDIT_BLOCKS = 3;
+
+/** One fenced code block; the fence outgrows any backtick run in the body so the body cannot close it. */
+function fencedBlock(body: string, lang: string): string {
+	let text = displaySafe(body);
+	if (text.length > MAX_DIALOG_CODE_CHARS) {
+		text = `${text.slice(0, 2400)}\n… [${text.length - MAX_DIALOG_CODE_CHARS} chars truncated] …\n${text.slice(-1600)}`;
+	}
+	const lines = text.split("\n");
+	if (lines.length > MAX_DIALOG_CODE_LINES) {
+		text = [...lines.slice(0, 30), `… [${lines.length - MAX_DIALOG_CODE_LINES} lines omitted] …`, ...lines.slice(-10)].join("\n");
+	}
+	const longestRun = Math.max(0, ...(text.match(/`+/g) ?? []).map((r) => r.length));
+	const fence = "`".repeat(Math.max(3, longestRun + 1));
+	return `${fence}${lang}\n${text}\n${fence}`;
+}
+
+/** Code view of a tool call for the approve dialog: bash `command`, write `content`, or edit
+ *  `newText` blocks, as Markdown with fenced code. null → the dialog shows the one-line action. */
+export function approveCodeMarkdown(
+	toolName: string,
+	input: Record<string, unknown>,
+	langFromPath: (p: string) => string | undefined,
+): { header: string; markdown: string } | null {
+	if (typeof input.command === "string") {
+		return { header: displaySafe(toolName), markdown: fencedBlock(input.command, "bash") };
+	}
+	if (typeof input.path === "string" && typeof input.content === "string") {
+		return { header: displaySafe(`${toolName}: ${input.path}`), markdown: fencedBlock(input.content, langFromPath(input.path) ?? "") };
+	}
+	if (typeof input.path === "string" && Array.isArray(input.edits)) {
+		const texts = input.edits.map((e) => (e as { newText?: unknown } | null)?.newText).filter((t): t is string => typeof t === "string");
+		if (texts.length === 0) return null;
+		const n = texts.length;
+		const lang = langFromPath(input.path) ?? "";
+		const parts: string[] = [];
+		texts.slice(0, MAX_DIALOG_EDIT_BLOCKS).forEach((t, i) => parts.push(`edit ${i + 1} of ${n}`, fencedBlock(t, lang)));
+		if (n > MAX_DIALOG_EDIT_BLOCKS) parts.push(`… ${n - MAX_DIALOG_EDIT_BLOCKS} more edits not shown`);
+		return { header: displaySafe(`${toolName}: ${input.path} (${n} edit${n === 1 ? "" : "s"})`), markdown: parts.join("\n\n") };
+	}
+	return null;
+}
+
+/** Two lines: a probability bar (allow/ask/deny cells, largest-remainder rounding) and its legend. */
+export function renderJevBar(j: JevReason, width: number, theme: Pick<Theme, "fg" | "bold">): string[] {
+	const cells = Math.max(10, Math.min(48, width));
+	const names = ["allow", "ask", "deny"] as const;
+	const colors = { allow: "success", ask: "warning", deny: "error" } as const;
+	const sum = j.probabilities.allow + j.probabilities.ask + j.probabilities.deny;
+	let bar: string;
+	if (sum === 0) {
+		bar = theme.fg("muted", "░".repeat(cells));
+	} else {
+		const exact = names.map((k) => (j.probabilities[k] / sum) * cells);
+		const counts = exact.map(Math.floor);
+		let left = cells - counts.reduce((a, b) => a + b, 0);
+		const order = exact.map((e, i) => ({ i, frac: e - Math.floor(e) })).sort((a, b) => b.frac - a.frac || a.i - b.i);
+		for (const { i } of order) {
+			if (left <= 0) break;
+			counts[i]++;
+			left--;
+		}
+		bar = names.map((k, i) => (counts[i] > 0 ? theme.fg(colors[k], "█".repeat(counts[i])) : "")).join("");
+	}
+	const label = (k: (typeof names)[number]): string => {
+		const s = theme.fg(colors[k], `${k} ${j.probabilities[k]}%`);
+		return k === j.choice ? theme.bold(s) : s;
+	};
+	const legend = [...names.map(label), theme.fg("muted", `confidence ${j.confidence}%`)].join("  ");
+	return [bar, legend];
+}
+
+type DialogModules = { tui: typeof PiTui; agent: typeof PiAgent };
+let dialogModules: Promise<DialogModules | null> | undefined;
+/** Value imports are lazy so hosts and test mocks that never open the rich dialog do not load pi-tui / pi-coding-agent. */
+function loadDialogModules(): Promise<DialogModules | null> {
+	dialogModules ??= Promise.all([import("@earendil-works/pi-tui"), import("@earendil-works/pi-coding-agent")]).then(
+		([tui, agent]) => ({ tui, agent }),
+		() => null,
+	);
+	return dialogModules;
+}
+
+interface ApproveDialogSpec {
+	/** dialog title */
+	title: string;
+	toolName: string;
+	input: Record<string, unknown>;
+	/** toolCallLine, shown when approveCodeMarkdown returns null */
+	action: string;
+	/** "Classifier opinion: …" / "Rule: …" / "Fail-closed: …" / protected-path reason */
+	reasonLine: string;
+	/** protected path only: rendered as "Protected path: <detail>" */
+	detail?: string;
+	/** "Allow execution?" | "Allow this access?" */
+	question: string;
+	jev: JevReason | null;
+	/** exact plain-text confirm() message used when the rich dialog is unavailable */
+	fallbackMessage: string;
+}
+
+/** Selector-style Yes/No dialog mirroring ExtensionSelectorComponent. Resolves `done(undefined)`
+ *  with an empty container if construction throws, so the caller falls back to `confirm`. */
+export function buildApproveDialog(
+	mods: DialogModules,
+	tui: { requestRender(): void },
+	theme: Theme,
+	spec: ApproveDialogSpec,
+	done: (result: boolean | undefined) => void,
+): PiTui.Container {
+	const { Container, Markdown, Spacer, Text, getKeybindings } = mods.tui;
+	const { DynamicBorder, getLanguageFromPath, getMarkdownTheme, keyHint, rawKeyHint } = mods.agent;
+	try {
+		const root = new Container() as PiTui.Container & { handleInput(data: string): void };
+		root.addChild(new DynamicBorder());
+		root.addChild(new Spacer(1));
+		root.addChild(new Text(theme.fg("accent", theme.bold(displaySafe(spec.title))), 1, 0));
+		root.addChild(new Spacer(1));
+		const code = approveCodeMarkdown(spec.toolName, spec.input, getLanguageFromPath);
+		if (code) {
+			root.addChild(new Text(theme.fg("toolTitle", theme.bold(code.header)), 1, 0));
+			root.addChild(new Markdown(code.markdown, 1, 0, getMarkdownTheme()));
+		} else {
+			root.addChild(new Text(displaySafe(spec.action), 1, 0));
+		}
+		root.addChild(new Spacer(1));
+		const jev = spec.jev;
+		if (jev) {
+			root.addChild({ render: (w: number) => renderJevBar(jev, w - 2, theme).map((l) => ` ${l}`), invalidate() {} });
+			if (jev.concern) root.addChild(new Text(theme.fg("muted", "concern: ") + jev.concern, 1, 0));
+			if (jev.rest) root.addChild(new Text(theme.fg("muted", displaySafe(jev.rest)), 1, 0));
+		} else {
+			root.addChild(new Text(displaySafe(spec.reasonLine), 1, 0));
+		}
+		if (spec.detail !== undefined) root.addChild(new Text(displaySafe(`Protected path: ${spec.detail}`), 1, 0));
+		root.addChild(new Spacer(1));
+		root.addChild(new Text(theme.fg("text", spec.question), 1, 0));
+		const options = ["Yes", "No"];
+		let index = 0;
+		const list = new Container();
+		const updateList = (): void => {
+			list.clear();
+			options.forEach((o, i) => list.addChild(new Text(i === index ? theme.fg("accent", "→ ") + theme.fg("accent", o) : `  ${theme.fg("text", o)}`, 1, 0)));
+		};
+		updateList();
+		root.addChild(list);
+		root.addChild(new Spacer(1));
+		root.addChild(new Text(`${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`, 1, 0));
+		root.addChild(new Spacer(1));
+		root.addChild(new DynamicBorder());
+		root.handleInput = (data: string): void => {
+			const kb = getKeybindings();
+			if (kb.matches(data, "tui.select.up") || data === "k") {
+				index = 0;
+				updateList();
+				tui.requestRender();
+			} else if (kb.matches(data, "tui.select.down") || data === "j") {
+				index = 1;
+				updateList();
+				tui.requestRender();
+			} else if (kb.matches(data, "tui.select.confirm") || data === "\n") {
+				done(index === 0);
+			} else if (kb.matches(data, "tui.select.cancel")) {
+				done(false);
+			}
+		};
+		return root;
+	} catch {
+		done(undefined);
+		return new Container();
+	}
+}
+
+/** Rich dialog when the host supports `ui.custom` (interactive TUI); plain `confirm` otherwise
+ *  (no `custom`, modules unavailable, or RPC mode, whose `custom()` returns undefined unrun).
+ *  Dialogs are serialized process-wide (omp queues `confirm`/`select` but not `custom`), and
+ *  `signal` cancels a pending or shown dialog → "aborted" (custom has no signal option, so
+ *  cancellation goes through the factory's `done`). */
+async function confirmAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSignal): Promise<"allowed" | "declined" | "aborted"> {
+	return serializeDialog(async () => {
+		if (signal?.aborted) return "aborted";
+		if (typeof ui.custom === "function") {
+			const mods = await loadDialogModules();
+			if (mods && !signal?.aborted) {
+				let finish: ((r: boolean | undefined) => void) | undefined;
+				const onAbort = (): void => finish?.(undefined);
+				signal?.addEventListener("abort", onAbort, { once: true });
+				try {
+					const r = await ui.custom<boolean | undefined>((tui, theme, _kb, done) => {
+						finish = done;
+						const dialog = buildApproveDialog(mods, tui, theme, spec, done);
+						if (signal?.aborted) queueMicrotask(() => done(undefined));
+						return dialog;
+					});
+					if (signal?.aborted) return "aborted";
+					if (r === true || r === false) return r ? "allowed" : "declined";
+				} finally {
+					signal?.removeEventListener("abort", onAbort);
+				}
+			}
+		}
+		const ok = await ui.confirm(spec.title, spec.fallbackMessage, signal ? { signal } : undefined);
+		return signal?.aborted ? "aborted" : ok ? "allowed" : "declined";
+	});
+}
+
+// ============================================================================
+// Subagent bridge (omp)
+// ============================================================================
+
+type UiContext = ExtensionContext["ui"];
+
+/** omp-only: `ctx.agent = { kind: "main" | "sub", id, name, … }` (pi's ExtensionContext has no `agent`).
+ *  Returns the subagent's identity, or null for a root session / pi. */
+export function subagentIdentity(ctx: ExtensionContext): { id: string; name: string } | null {
+	const agent = (ctx as { agent?: unknown }).agent;
+	if (typeof agent !== "object" || agent === null) return null;
+	const a = agent as { kind?: unknown; id?: unknown; name?: unknown };
+	if (a.kind !== "sub") return null;
+	return { id: typeof a.id === "string" ? a.id : "?", name: typeof a.name === "string" ? a.name : "?" };
+}
+
+function subagentLabel(id: { id: string; name: string }): string {
+	return id.id === id.name ? `subagent ${id.id}` : `subagent ${id.id} (${id.name})`;
+}
+
+/** UI of the top-level interactive session in this process. Module-level: extension factories
+ *  are re-bound per subagent session but module variables are shared across sessions. */
+let rootUi: UiContext | null = null;
+
+let dialogTail: Promise<void> = Promise.resolve();
+function serializeDialog<T>(fn: () => Promise<T>): Promise<T> {
+	const run = dialogTail.then(fn, fn);
+	dialogTail = run.then(() => undefined, () => undefined);
+	return run;
+}
+
+
+// ============================================================================
 // 扩展主体
 // ============================================================================
 
@@ -1862,51 +2244,74 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Verdict → UI(本扩展唯一的裁决呈现点):按 source × degraded 查模板,文案与
 	 *  重构前逐字节一致。受保护路径分支的通知永不携带路径明文与 action 行
 	 *  (ADR-0002 story 11:通知与 block reason 回流 agent context)。 */
-	async function presentVerdict(v: Verdict, action: string, ctx: ExtensionContext): Promise<{ block: true; reason: string } | undefined> {
+	async function presentVerdict(v: Verdict, call: { toolName: string; input: Record<string, unknown> }, action: string, ui: UiContext, opts: { label: string | null; signal?: AbortSignal }): Promise<{ block: true; reason: string } | undefined | "aborted"> {
+		const note = (msg: string, level: "info" | "warning" | "error"): void => ui.notify(opts.label ? msg.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : msg, level);
+		const titled = (t: string): string => (opts.label ? t.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : t);
 		if (v.verdict === "allow") {
 			// #60 (CONTEXT.md 通知): classifier allows surface via notifyAllows OR
 			// debug — exactly one notification either way; the shadow suffix stays
 			// debug-only; mechanical passes (rule echo, protected-path confirm) stay
 			// debug-only — notifications carry judgment, the audit log carries completeness
 			if (debug) {
-				if (v.source === "rule") ctx.ui.notify(`🛡️ allow (rule): ${action}`, "info");
-				else if (v.source === "protected-path") ctx.ui.notify("🛡️ allow (protected-path confirm)", "info");
-				else ctx.ui.notify(`🛡️ allow (classifier): ${v.reason}\n  ${action}${v.shadow ? " " + v.shadow : ""}`, "info");
+				if (v.source === "rule") note(`🛡️ allow (rule): ${action}`, "info");
+				else if (v.source === "protected-path") note("🛡️ allow (protected-path confirm)", "info");
+				else note(`🛡️ allow (classifier): ${v.reason}\n  ${action}${v.shadow ? " " + v.shadow : ""}`, "info");
 			} else if (state.userRules.notifyAllows && v.source === "classifier") {
-				ctx.ui.notify(`🛡️ allow (classifier): ${v.reason}\n  ${action}`, "info");
+				note(`🛡️ allow (classifier): ${v.reason}\n  ${action}`, "info");
 			}
 			return undefined;
 		}
 		if (v.verdict === "deny") {
 			if (v.source === "protected-path") {
 				// 无 action 行:action 串可内嵌被触路径,通知不得携带受保护路径明文
-				ctx.ui.notify(`🛡️ Auto Mode blocked (non-interactive, protected-path ask→deny): ${v.reason}`, "warning");
+				note(`🛡️ Auto Mode blocked (non-interactive, protected-path ask→deny): ${v.reason}`, "warning");
 				return { block: true, reason: blockedReason("protected-path", `ask degraded to block in non-interactive mode: ${v.reason}`) };
 			}
 			if (v.source === "fail-closed") {
-				ctx.ui.notify(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}`, "warning");
+				note(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}`, "warning");
 				return { block: true, reason: blockedReason("fail-closed", v.reason) };
 			}
 			if (v.source === "rule") {
-				ctx.ui.notify(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}`, "warning");
+				note(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}`, "warning");
 				return { block: true, reason: blockedReason("rule", v.reason) };
 			}
-			ctx.ui.notify(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}${debug && v.shadow ? " " + v.shadow : ""}`, "warning");
+			note(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}${debug && v.shadow ? " " + v.shadow : ""}`, "warning");
 			return { block: true, reason: blockedReason("classifier", v.reason) };
 		}
 		// ask → 人工确认;非交互已在管线内降级,能走到这里的必有 UI
 		if (v.source === "protected-path") {
-			const ok = await ctx.ui.confirm("🛡️ Auto Mode: protected path", `${action}\n\n${v.reason}\n\nProtected path: ${v.detail ?? "(see pi-verdict.json)"}\n\nAllow this access?`);
-			if (ok) {
+			const ok = await confirmAsk(ui, {
+				title: titled("🛡️ Auto Mode: protected path"),
+				toolName: call.toolName,
+				input: call.input,
+				action,
+				reasonLine: v.reason,
+				detail: v.detail ?? "(see pi-verdict.json)",
+				question: "Allow this access?",
+				jev: null,
+				fallbackMessage: `${action}\n\n${v.reason}\n\nProtected path: ${v.detail ?? "(see pi-verdict.json)"}\n\nAllow this access?`,
+			}, opts.signal);
+			if (ok === "aborted") return "aborted";
+			if (ok === "allowed") {
 				// debug notify 不带 action 行:同上,通知不得携带受保护路径明文
-				if (debug) ctx.ui.notify("🛡️ allow (protected-path confirm)", "info");
+				if (debug) note("🛡️ allow (protected-path confirm)", "info");
 				return undefined;
 			}
 			return { block: true, reason: blockedReason("user-declined", "user declined protected-path access") };
 		}
 		const label = v.source === "rule" ? "Rule" : v.source === "fail-closed" ? "Fail-closed" : "Classifier opinion";
-		const ok = await ctx.ui.confirm("🛡️ Auto Mode confirmation", `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`);
-		return ok ? undefined : { block: true, reason: blockedReason("user-declined", "user declined") };
+		const ok = await confirmAsk(ui, {
+			title: titled("🛡️ Auto Mode confirmation"),
+			toolName: call.toolName,
+			input: call.input,
+			action,
+			reasonLine: `${label}: ${v.reason}`,
+			question: "Allow execution?",
+			jev: v.source === "classifier" ? parseJevReason(v.reason) : null,
+			fallbackMessage: `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`,
+		}, opts.signal);
+		if (ok === "aborted") return "aborted";
+		return ok === "allowed" ? undefined : { block: true, reason: blockedReason("user-declined", "user declined") };
 	}
 
 	function refreshStatus(ctx: ExtensionContext) {
@@ -1923,6 +2328,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	/** Session-scoped trust grant (set by the session_start prompt; /verdict reloads must honor it) */
 	let sessionTrustedRoot: string | null = null;
+
+	/** UI this factory instance published as the root's (see the registry at module level);
+	 *  session_shutdown clears the registry only if it still holds this one. */
+	let ownRootUi: UiContext | null = null;
 
 	/** Surface skipped-value and shortcut warnings from a rules (re)load */
 	function reportLoadWarnings(report: RulesLoadReport, ctx: ExtensionContext): void {
@@ -1941,7 +2350,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const root = projectRootOf(pp);
 			const store = readTrustStore();
 			// ctx.agent is omp-only (pi's ExtensionContext has no `agent`): narrow at runtime
-			const isSub = "agent" in ctx && typeof ctx.agent === "object" && ctx.agent !== null && "kind" in ctx.agent && ctx.agent.kind === "sub";
+			const isSub = subagentIdentity(ctx) !== null;
 			if (!rootIn(root, store.trusted) && !rootIn(root, store.untrusted) && ctx.hasUI && !isSub) {
 				const choice = await ctx.ui.select(
 					`🛡️ pi-verdict: ${pp} can override your global gate config (allow rules, builtinDenyFloor, autoDeny, …). Trust this project?`,
@@ -1958,12 +2367,23 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				// undefined (dialog dismissed) or NOT_NOW_CHOICE: ignore for this session, persist nothing
 			}
 		}
+		// Subagent gate: the top-level interactive session publishes its UI for subagent asks.
+		// A headless root clears the registry; a replaced root (/new, /resume) overwrites it.
+		if (subagentIdentity(ctx) === null) {
+			rootUi = ctx.hasUI ? ctx.ui : null;
+			ownRootUi = rootUi;
+		}
 		const report = state.reset(ctx.cwd, sessionTrustedRoot);
 		state.audit?.prune(); // #54: converge to the AUDIT_KEEP_SESSIONS most recent files at session start
 		reportLoadWarnings(report, ctx);
 		if (report.project?.applied) ctx.ui.notify(`pi-verdict: project overrides applied from ${report.project.path}`, "info");
 		if (report.project && !report.project.trusted) ctx.ui.notify(`pi-verdict: project config ${report.project.path} ignored — project not trusted (decisions: ${trustStorePath()})`, "info");
 		refreshStatus(ctx);
+	});
+
+	pi.on("session_shutdown", () => {
+		if (ownRootUi !== null && rootUi === ownRootUi) rootUi = null;
+		ownRootUi = null;
 	});
 
 	// 主开关 toggle 快捷键(#15):键位取首次加载的用户规则(会话内固定——改配置后
@@ -2014,7 +2434,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	});
 
 	pi.registerCommand("verdict", {
-		description: "Edit pi-verdict list rules (allow/deny/denyPaths/tools/rules): /verdict [user|local]",
+		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch): /verdict [user|local]",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("pi-verdict: /verdict needs an interactive UI", "warning");
@@ -2064,7 +2484,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 
 			/** Write `key` (or drop it when undefined) and hot-reload the rules; false = nothing changed */
-			function save(nextValue: unknown[] | undefined, key: EditableListKey): boolean {
+			function save(nextValue: unknown, key: string): boolean {
 				const next: Record<string, unknown> = { ...raw };
 				if (nextValue === undefined) delete next[key];
 				else next[key] = nextValue;
@@ -2077,6 +2497,19 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
 				ctx.ui.notify(`pi-verdict: ${key} saved to ${file} — rules reloaded`, "info");
 				return true;
+			}
+
+			/** Boolean switch menu for gateOmpDir; local files can also unset (inherit the global value) */
+			async function editGateOmpDir(): Promise<void> {
+				const ON = "On — ask before any .omp directory access (default)";
+				const OFF = "Off — no forced gate on .omp directories";
+				const UNSET = "× Unset (inherit global gateOmpDir)";
+				const options = [ON, OFF];
+				if (kind === "local" && "gateOmpDir" in raw) options.push(UNSET);
+				const choice = await ctx.ui.select(`gateOmpDir — ${file}`, options);
+				if (choice === ON) save(true, "gateOmpDir");
+				else if (choice === OFF) save(false, "gateOmpDir");
+				else if (choice === UNSET) save(undefined, "gateOmpDir");
 			}
 
 			/** Normalize + duplicate-check a typed entry; undefined = nothing to save (already notified or cancelled) */
@@ -2154,10 +2587,23 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					if (Array.isArray(v)) return `${key} (${v.length}) — ${desc}`;
 					return `${key} (invalid: not an array) — ${desc}`;
 				});
+				const gateIdx = options.length;
+				const gv = raw.gateOmpDir;
+				const gateState = gv === undefined ? (kind === "local" ? "not set: global applies" : "on, default") : typeof gv === "boolean" ? (gv ? "on" : "off") : "invalid: not a boolean";
+				options.push(`gateOmpDir (${gateState}) — ${GATE_OMP_DIR_DESC}`);
 				options.push(DONE);
 				const choice = await ctx.ui.select(`pi-verdict: edit ${file}`, options);
 				if (choice === undefined || choice === DONE) return;
-				const key = EDITABLE_LIST_KEYS[options.indexOf(choice)];
+				const choiceIdx = options.indexOf(choice);
+				if (choiceIdx === gateIdx) {
+					if (gv !== undefined && typeof gv !== "boolean") {
+						ctx.ui.notify(`pi-verdict: gateOmpDir in ${file} is not a boolean — fix it by hand`, "warning");
+						continue;
+					}
+					await editGateOmpDir();
+					continue;
+				}
+				const key = EDITABLE_LIST_KEYS[choiceIdx];
 				if (key === undefined) return;
 				if (raw[key] !== undefined && !Array.isArray(raw[key])) {
 					ctx.ui.notify(`pi-verdict: ${key} in ${file} is not an array — fix it by hand`, "warning");
@@ -2249,37 +2695,96 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	pi.on("tool_call", async (event, ctx) => {
 		if (!enabled) return undefined;
 
+		const sub = subagentIdentity(ctx);
+		const mode = state.userRules.subagentGate;
+		if (sub && mode === "off") return undefined;
+		const label = sub ? subagentLabel(sub) : null;
+		// A subagent with its own UI (not produced by omp today) uses it; otherwise the root UI, else none
+		const ui: UiContext | null = !sub || ctx.hasUI ? ctx.ui : rootUi;
+
 		const input = event.input as Record<string, unknown>;
+		const call = { toolName: event.toolName, input };
 		const action = describeAction(event.toolName, input);
 
 		// 判定管线(零 UI)→ 呈现(source × degraded 模板)
-		const verdict = await adjudicate(state, { toolName: event.toolName, input }, {
+		const env: AdjudicateEnv = {
 			cwd: ctx.cwd,
-			hasUI: !!ctx.hasUI,
+			// a subagent's asks are resolved by the bridge (root UI / second model), never degraded in the pipeline
+			hasUI: sub ? true : !!ctx.hasUI,
 			getModel: () => resolveClassifier(ctx),
 			complete: completeForClassifier(ctx.modelRegistry, deps),
 			host: ctx.sessionManager,
 			signal: ctx.signal,
 			getFallbackModel: () => resolveFallbackClassifier(ctx),
-		});
+		};
+		const verdict = await adjudicate(state, call, env);
+		const warn = (msg: string): void => (ui ?? ctx.ui).notify(label && !msg.startsWith("🛡️") ? `[${label}] ${msg}` : msg, "warning");
 		const auditWarning = state.audit?.drainWarning(); // #54: fail-soft one-shot warning
-		if (auditWarning) ctx.ui.notify(`pi-verdict: ${auditWarning}`, "warning");
+		if (auditWarning) warn(`pi-verdict: ${auditWarning}`);
 		// #62: an interactive ask's record is finalized here — exactly one append after the
 		// confirm, carrying the user's answer; a presentVerdict throw still lands the record
 		// (without the answer) and the error propagates unchanged. `undefined` = allowed.
-		let presented: { block: true; reason: string } | undefined;
-		try {
-			presented = await presentVerdict(verdict, action, ctx);
-		} catch (err) {
-			if (verdict.pendingAudit) state.audit?.append(verdict.pendingAudit);
-			throw err;
-		}
-		if (verdict.pendingAudit) {
-			state.audit?.append({ ...verdict.pendingAudit, userAnswer: presented === undefined ? "allowed" : "declined", answeredAt: new Date().toISOString() });
+		const finalize = (extra: Partial<AuditRecord>): void => {
+			if (!verdict.pendingAudit) return;
+			state.audit?.append({ ...verdict.pendingAudit, ...extra });
 			verdict.pendingAudit = undefined;
 			const lateWarning = state.audit?.drainWarning();
-			if (lateWarning) ctx.ui.notify(`pi-verdict: ${lateWarning}`, "warning");
+			if (lateWarning) warn(`pi-verdict: ${lateWarning}`);
+		};
+		const present = async (signal?: AbortSignal): Promise<{ block: true; reason: string } | undefined | "aborted"> => {
+			try {
+				return await presentVerdict(verdict, call, action, ui ?? ctx.ui, { label, signal });
+			} catch (err) {
+				if (verdict.pendingAudit) state.audit?.append(verdict.pendingAudit);
+				throw err;
+			}
+		};
+		const answerAudit = (presented: { block: true; reason: string } | undefined): Partial<AuditRecord> => ({
+			userAnswer: presented === undefined ? "allowed" : "declined",
+			answeredAt: new Date().toISOString(),
+		});
+
+		// Root session (and pi): unchanged behavior; no signal is passed, so "aborted" cannot occur
+		if (!sub) {
+			const r = await present();
+			const presented = r === "aborted" ? { block: true as const, reason: blockedReason("user-declined", "user declined") } : r;
+			finalize(answerAudit(presented));
+			return presented;
 		}
-		return presented;
+
+		if (verdict.verdict !== "ask") {
+			const r = await present();
+			return r === "aborted" ? undefined : r;
+		}
+
+		// Subagent ask resolved with no human answer: second model (only an explicit allow permits)
+		const finishWithoutHuman = async (resolution: "timeout" | "auto"): Promise<{ block: true; reason: string } | undefined> => {
+			const res = await resolveAskWithoutHuman(state, env, verdict, action);
+			finalize({ subagent: { ...sub, resolution }, ...(res.fb ? { fallback: res.fb } : {}) });
+			const out = (ui ?? ctx.ui).notify.bind(ui ?? ctx.ui);
+			if (res.verdict === "allow") {
+				if (debug || state.userRules.notifyAllows) out(`🛡️ [${label}] allow (second model, no human): ${res.reason}\n  ${action}`, "info");
+				return undefined;
+			}
+			// no path plaintext in notifications (ADR-0002): protected-path asks omit the action line
+			out(`🛡️ [${label}] Auto Mode blocked (subagent ask, no human): ${res.reason}${verdict.source === "protected-path" ? "" : `\n  ${action}`}`, "warning");
+			return { block: true, reason: blockedReason("subagent-auto", res.reason) };
+		};
+
+		if (mode === "normal" && ui !== null) {
+			const deadline = AbortSignal.timeout(state.userRules.subagentAskTimeoutMs);
+			const signal = ctx.signal ? AbortSignal.any([deadline, ctx.signal]) : deadline;
+			const r = await present(signal);
+			if (r !== "aborted") {
+				finalize({ ...answerAudit(r), subagent: { ...sub, resolution: "human" } });
+				return r;
+			}
+			if (ctx.signal?.aborted) {
+				finalize({ subagent: { ...sub, resolution: "timeout" } });
+				return { block: true, reason: blockedReason("subagent-cancelled", "subagent run was cancelled while awaiting approval") };
+			}
+			return finishWithoutHuman("timeout");
+		}
+		return finishWithoutHuman("auto");
 	});
 }

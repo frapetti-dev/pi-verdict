@@ -12,6 +12,7 @@ import jevAdapter, {
 	activeTransport,
 	API_ID,
 	buildDecisionsBody,
+	CONCERNS,
 	createJevProvider,
 	decisionsUrl,
 	extractState,
@@ -20,6 +21,7 @@ import jevAdapter, {
 	TRANSPORT_DEFAULTS,
 	VERDICT_QUESTIONS,
 	parseJevConfidence,
+	parseJevReason,
 	verdictText,
 	wireModel,
 } from "../extensions/jev-adapter.ts";
@@ -297,6 +299,23 @@ describe("extension wiring", () => {
 		handlers["model_select"]({ model: { provider: "anthropic", id: "claude" } }, ctx);
 		expect(notifies).toHaveLength(1);
 	});
+	test("pi 0.84 shape (registerProvider(providerOrName, config), arity 2) still registers the Provider object", () => {
+		const registered: unknown[] = [];
+		const pi = { registerProvider: (_providerOrName: unknown, _config?: unknown) => registered.push(_providerOrName), on: () => {} };
+		expect(pi.registerProvider.length).toBe(2);
+		jevAdapter(pi as any);
+		expect(registered).toHaveLength(1);
+		expect(typeof (registered[0] as any).streamSimple).toBe("function");
+	});
+	test("omp shape (logger + typebox on the API object) registers by name + config, never a Provider object", () => {
+		process.env.OPENROUTER_API_KEY = "sk-or";
+		const calls: unknown[][] = [];
+		const pi = { logger: {}, typebox: {}, registerProvider: (...a: unknown[]) => calls.push(a), on: () => {} };
+		jevAdapter(pi as any);
+		expect(calls).toHaveLength(1);
+		expect(calls[0][0]).toBe(PROVIDER_ID);
+		expect((calls[0][1] as any).models[0].id).toBe(MODEL_ID);
+	});
 	test("hosts without registerProvider (omp) stay inert", () => {
 		const pi: Record<string, unknown> = { on: () => {} };
 		expect(() => jevAdapter(pi as any)).not.toThrow();
@@ -389,5 +408,49 @@ describe("typesafe transport (direct v1 API)", () => {
 		const message = await provider.streamSimple(provider.getModels()[0], { messages: [{ role: "user", content: "x" }] } as any, {}).result();
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("TYPESAFE_API_KEY");
+	});
+});
+
+describe("concern question + reason (approve dialog)", () => {
+	const withConcern = (concern?: unknown) => {
+		const r = decisionResponse("ask", { ask: 0.63, allow: 0.35, deny: 0.02 }, 0.45) as { answers: Record<string, unknown> };
+		if (concern !== undefined) r.answers.concern = { type: "choice", choice: concern };
+		return r;
+	};
+
+	test("the decisions body carries a typed concern question whose criteria match the vocabulary; user rules extend only the verdict", () => {
+		for (const body of [buildDecisionsBody("s"), buildDecisionsBody("s", undefined, "user rule text")]) {
+			const q = (body as { questions: Record<string, { type: string; instructions: string; criteria: Record<string, string> }> }).questions;
+			expect(q.concern.type).toBe("choice");
+			expect(Object.keys(q.concern.criteria)).toEqual(Object.keys(CONCERNS));
+			expect(q.concern.instructions).toBe(VERDICT_QUESTIONS.concern.instructions);
+		}
+	});
+
+	test("verdictText appends the concern label; none / unknown / missing add nothing and never throw", () => {
+		const base = "<verdict>ask</verdict> jev: ask 63% (confidence 45%; allow 35%, deny 2%)";
+		expect(verdictText(withConcern("network"))).toBe(`${base} — concern: network operation`);
+		expect(verdictText(withConcern(" Network "))).toBe(`${base} — concern: network operation`);
+		for (const c of ["none", "bogus", "toString", 42, null, undefined]) expect(verdictText(withConcern(c))).toBe(base);
+	});
+
+	test("parseJevReason splits the jev segment, concern, and trailing cascade suffix; free text → null", () => {
+		expect(parseJevReason("jev: ask 63% (confidence 45%; allow 35%, deny 2%) — concern: network operation (confidence 45% is below your classifierMinConfidence of 50%)")).toEqual({
+			choice: "ask",
+			probabilities: { allow: 35, ask: 63, deny: 2 },
+			confidence: 45,
+			concern: "network operation",
+			rest: "(confidence 45% is below your classifierMinConfidence of 50%)",
+		});
+		expect(parseJevReason("jev: deny 96% (confidence 94%; allow 1%, ask 3%)")).toMatchObject({ concern: null, rest: "" });
+		expect(parseJevReason("needs a human")).toBeNull();
+	});
+
+	test("parseJevReason round-trips every concern label", () => {
+		for (const [key, [label]] of Object.entries(CONCERNS)) {
+			const parsed = parseJevReason(verdictText(withConcern(key)).replace(/^<verdict>ask<\/verdict>\s*/, ""));
+			expect(parsed?.concern).toBe(key === "none" ? null : label);
+			expect(parsed?.rest).toBe("");
+		}
 	});
 });

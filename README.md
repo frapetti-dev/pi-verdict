@@ -80,7 +80,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `/automode on`
 - `/automode off`
 - `ctrl+shift+a` — toggle the master switch silently (the always-on footer is the only feedback; rebind or disable via `toggleShortcut`)
-- `/verdict [user|local]` — edit the list rules (`allow`, `deny`, `denyPaths`, `tools`, `rules`) of the global (`user`) or project (`local`) config interactively: add / edit / remove entries, saved to disk and applied to the running session at once. Scalar keys stay hand-edited
+- `/verdict [user|local]` — edit the list rules (`allow`, `deny`, `denyPaths`, `tools`, `rules`) of the global (`user`) or project (`local`) config interactively: add / edit / remove entries, saved to disk and applied to the running session at once; also hosts the `gateOmpDir` on/off switch. Other scalar keys stay hand-edited
 - footer always shows `auto mode on` (green) / `auto mode off` (yellow)
 
 | Option | Default | Description |
@@ -106,24 +106,29 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
     "~/.bashrc"
   ],
   "builtinDenyFloor": true,
+  "gateOmpDir": true,
   "classifierModel": null,
   "toggleShortcut": "ctrl+shift+a",
   "audit": false,
   "notifyAllows": false,
   "classifierMinConfidence": null,
   "classifierFallbackModel": null,
-  "classifierFallbackMode": "shadow"
+  "classifierFallbackMode": "shadow",
+  "subagentGate": "off",
+  "subagentAskTimeoutMs": 60000
 }
 ```
 
 - `allow`/`deny` are JS regex arrays; **`deny` wins over `allow`**, both beat the classifier
 - `denyPaths` are plain paths you declare **protected** — touches trigger a terminal ask you adjudicate (non-interactive → deny); the classifier never learns the paths themselves, only that they exist. `grep`/`find`/`ls` compare their whole **search scope**: an omitted `path` (pi's default: the current directory) or a parent directory of a declared path triggers the ask as well. A fresh install pre-fills a **starter list** (`~/.ssh/`, `~/.gnupg`, `~/.mc`, shell rc/profile files), active from the first session after the initial run (any config change applies to new sessions) — a pre-filled *user declaration*, not a built-in floor: edit or empty it freely, add your own (`~/Documents/private`, …) alongside; existing configs are never rewritten
 - `builtinDenyFloor: false` turns off the built-in danger/path floor (your risk)
+- `gateOmpDir` (default `true`) is the **forced `.omp` gate**: any file-tool path or bash command touching a `.omp` directory (lexical or symlink-resolved; `~/.omp`, `<project>/.omp`, …) triggers a terminal ask you adjudicate (non-interactive → deny). It runs after the built-in floor and your `deny` rules and before `denyPaths`/`allow`, so an `allow` regex cannot skip it. `false` disables it; toggle it from `/verdict`. `grep`/`find`/`ls` are checked on their own target only (a recursive search that merely traverses a nested `.omp` is not an access)
 - `classifierModel` pins the classifier model, e.g. `"zai/glm-5.3-flash:low"` (thinking suffix supported; default: session model with thinking off)
 - `classifierModel: "typesafe/jev-latest"` opts into the bundled **jev decisions adapter** — gray-zone verdicts via TypeSafe's jev (OpenRouter by default, or TypeSafe's official API directly with `PI_VERDICT_JEV_TRANSPORT=typesafe`); experimental, see [ADR-0003](docs/adr/0003-jev-decisions-adapter.md)
 - `audit: true` records every **gray-zone adjudication** (the full transcript sent to the classifier, its raw response, the parsed verdict) as JSONL under `~/.pi/agent/verdicts/<sessionId>.jsonl` — one file per session, the 20 most recent kept. Interactive asks also record your answer (`userAnswer` ground truth, written after the confirm resolves), and protected-path asks are recorded too (#62); rule allow/deny stays unaudited. Local-only and full-fidelity (protected-path plaintext may appear — it never leaves your machine; [ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md) boundary note); the agent can neither read nor write the directory. `/automode` shows the audit state and path while on
 - `notifyAllows: true` notifies on every **classifier allow** (reason + action line — e.g. jev's probability breakdown); default `false` keeps passes silent. Mechanical passes (your own allow rules, protected-path confirms) never notify; shadow-cache annotations stay debug-only; with both switches on the notification appears once
 - `classifierMinConfidence` (optional, [ADR-0004](docs/adr/0004-classifier-fallback-cascade.md)) sets the **confidence floor**: a jev verdict below it is demoted — cascaded to `classifierFallbackModel` if set (`shadow` = the second layer records its opinion and you are asked; `enforce` = the second layer adjudicates, except a demoted deny can never be auto-allowed), otherwise asked of you directly. At/above the floor the first layer is autonomous. A natural pairing: jev first + a haiku-class fallback
+- `subagentGate` (omp only) decides what happens to `ask`s raised inside **subagents**, which have no UI of their own: `"off"` (default) leaves subagents ungated; `"normal"` shows the confirmation dialog on the root session's UI, labeled with the subagent; unanswered within `subagentAskTimeoutMs` (default 60000 ms) or with no root UI, it resolves via `classifierFallbackModel` — only an explicit `allow` from it permits the call, everything else denies; `"auto"` never prompts and always resolves that way. Protected-path / `.omp` asks never auto-allow. Set omp's `extensionHandlers.toolCallTimeoutMs` ≥ `subagentAskTimeoutMs + 60000`
 
 No built-in allowlist — every "always allow" claim is yours ([why](docs/configuration.md#why-no-built-in-allowlist)). Full reference: [docs/configuration.md](docs/configuration.md).
 
@@ -141,6 +146,7 @@ No built-in allowlist — every "always allow" claim is yours ([why](docs/config
 - **Transports**: OpenRouter decisions (default) or TypeSafe direct — on the TypeSafe transport per-call cost shows $0 (its API does not report it)
 - **Hosts**: pi only. On omp the setting warns and falls back to the session model; and it must never be selected as the session model (no text generation — selecting it warns)
 - **Escape hatch**: `PI_VERDICT_JEV_URL` overrides the active transport's endpoint (OpenRouter's is an alpha API)
+- **Approve dialog**: in the interactive TUI the ask prompt shows the code under review (bash command, write content, edit blocks) as a syntax-highlighted block, and — when the ask comes straight from jev — a colored allow/ask/deny probability bar with a `concern:` line (jev's risk category for the action, from a second `concern` question sent in the same request). Other hosts and RPC mode fall back to the plain-text confirm
 
 jev's calibrated confidence is exactly what the confidence floor keys on — pair it with a second layer (`"classifierMinConfidence": 50, "classifierFallbackModel": "anthropic/claude-haiku-4-5"`) so its low-confidence calls go to a deeper model instead of standing ([ADR-0004](docs/adr/0004-classifier-fallback-cascade.md)).
 
@@ -167,6 +173,7 @@ tool_call
   ├─ 1. Rule layer (deterministic, zero latency)
   │     ├─ built-in deny floor: bash danger regexes + path sensitivity S0–S5
   │     ├─ your rules: user deny beats user allow
+  │     ├─ gateOmpDir: any .omp directory access → terminal ask, before denyPaths
   │     ├─ denyPaths (ADR-0002): protected paths → terminal ask,
   │     │   before user allow; classifier sees an existence hint only
   │     └─ no built-in allowlist — every "always allow" claim is yours to make

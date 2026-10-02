@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, BASH_MAX_MATCH_LEN, bindCompletion, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, displaySafe, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
 
 // ── 桩设施 ──────────────────────────────────────────────
 
@@ -116,13 +116,14 @@ const clearAudit = () => fs.rmSync(VERDICTS(), { recursive: true, force: true })
 beforeAll(() => { process.env.PI_CODING_AGENT_DIR = TMP_AGENT; });
 afterAll(() => { delete process.env.PI_CODING_AGENT_DIR; });
 
-function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; classifierModel?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown }, invalid?: string[]): void {
+function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: boolean; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
 	config = { allow: cfg.allow ?? [], deny: cfg.deny ?? [] };
 	const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
 	fs.mkdirSync(path.dirname(p), { recursive: true });
 	const raw: Record<string, unknown> = { ...config };
 	if (cfg.classifierModel !== undefined) raw.classifierModel = cfg.classifierModel;
 	if (cfg.builtinDenyFloor !== undefined) raw.builtinDenyFloor = cfg.builtinDenyFloor;
+	if (cfg.gateOmpDir !== undefined) raw.gateOmpDir = cfg.gateOmpDir;
 	if (cfg.toggleShortcut !== undefined) raw.toggleShortcut = cfg.toggleShortcut;
 	if (cfg.audit !== undefined) raw.audit = cfg.audit;
 	if (cfg.notifyAllows !== undefined) raw.notifyAllows = cfg.notifyAllows;
@@ -130,6 +131,9 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 	if (cfg.classifierFallbackConfidence !== undefined) raw.classifierFallbackConfidence = cfg.classifierFallbackConfidence;
 	if (cfg.classifierMinConfidence !== undefined) raw.classifierMinConfidence = cfg.classifierMinConfidence;
 	if (cfg.classifierFallbackMode !== undefined) raw.classifierFallbackMode = cfg.classifierFallbackMode;
+	if (cfg.autoDeny !== undefined) raw.autoDeny = cfg.autoDeny;
+	if (cfg.subagentGate !== undefined) raw.subagentGate = cfg.subagentGate;
+	if (cfg.subagentAskTimeoutMs !== undefined) raw.subagentAskTimeoutMs = cfg.subagentAskTimeoutMs;
 	// denyPaths (ADR-0002): unknown[] lets negative tests mix in non-string entries
 	if (cfg.denyPaths !== undefined) raw.denyPaths = cfg.denyPaths;
 	// 非法正则测试:把 invalid 条目直接混入 allow 数组
@@ -1056,6 +1060,22 @@ describe("denyPaths (ADR-0002)", () => {
 		await toolCall(h, "read", { path: "~/.zshrc" });
 		expect(h.confirms).toBe(1);
 		expect(h.calls.length).toBe(0);
+	});
+
+	test("template ships the starter tools allowlist, active from the next session", async () => {
+		fs.rmSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), { force: true });
+		const bootstrap = makeHarness(); bootstrap.install(); // first run → template
+		const raw = JSON.parse(fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8"));
+		expect(raw.tools).toEqual(["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"]);
+		// second session: listed tools skip the classifier, unlisted ones stay gray
+		const h = makeHarness();
+		h.install();
+		h.responses = [{ text: "<verdict>deny</verdict> mock" }];
+		expect(await toolCall(h, "todo", { op: "list" })).toBeUndefined();
+		expect(h.calls.length).toBe(0);
+		const r = await toolCall(h, "web_search", { query: "x" });
+		expect(h.calls.length).toBe(1);
+		expect(r?.block).toBe(true);
 	});
 
 	test("/automode status shows the active denyPaths count", async () => {
@@ -2160,12 +2180,12 @@ describe("project trust prompt", () => {
 	const readTrust = () => JSON.parse(fs.readFileSync(TRUST_FILE(), "utf8")) as { trusted: string[]; untrusted: string[] };
 
 	/** Project config denies the probe command; blocked-by-rule ⇔ the project config is applied. */
-	async function withProject(fn: (h: Harness, dir: string) => Promise<void>): Promise<void> {
+	async function withProject(fn: (h: Harness, dir: string) => Promise<void>, cfg: Parameters<typeof setConfig>[0] = {}): Promise<void> {
 		await withTempDir("pv-proj-", async (dir) => {
 			fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
 			fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ deny: ["^echo trusted-marker"] }));
 			fs.rmSync(TRUST_FILE(), { force: true });
-			const h = session({}, { cwd: dir });
+			const h = session(cfg, { cwd: dir });
 			h.responses = [{ text: "<verdict>allow</verdict> ok" }]; // unapplied config → gray → classifier allows
 			try {
 				await fn(h, dir);
@@ -2248,7 +2268,7 @@ describe("project trust prompt", () => {
 			await start(h);
 			expect((h as any).selects).toBe(0);
 			expect(await applied(h)).toBe(true);
-		});
+		}, { subagentGate: "normal" }); // the probe runs tool_call on a subagent, which is inert under the default "off"
 	});
 
 	test("malformed trust file: Trust applies for the session, file untouched, warns", async () => {
@@ -2261,6 +2281,100 @@ describe("project trust prompt", () => {
 			expect(fs.readFileSync(TRUST_FILE(), "utf8")).toBe("{");
 			expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("not saved"))).toBe(true);
 		});
+	});
+});
+
+// ── Forced .omp directory gate (gateOmpDir) ─────────────
+
+describe("gateOmpDir forced gate", () => {
+	const OMP_FILE = "/proj/.omp/notes.md";
+
+	test("default on: file tools touching a .omp directory ask for confirmation", async () => {
+		for (const tool of ["read", "write", "edit"]) {
+			const h = session({});
+			await toolCall(h, tool, { path: OMP_FILE, content: "x" });
+			expect(h.confirms).toBe(1);
+			expect(h.calls.length).toBe(0); // terminal ask: no classifier involved
+		}
+	});
+
+	test("declined confirmation blocks; accepted passes; the block reason carries no path", async () => {
+		const h = session({});
+		h.confirmAnswer = false;
+		const r = await toolCall(h, "read", { path: OMP_FILE });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).not.toContain(".omp");
+		const h2 = session({});
+		expect(await toolCall(h2, "read", { path: OMP_FILE })).toBeUndefined();
+		expect(h2.confirms).toBe(1);
+	});
+
+	test("scope tools: explicit .omp target asks; omitted path with a cwd inside .omp asks; a plain project root does not", async () => {
+		const h = session({});
+		await toolCall(h, "ls", { path: "/proj/.omp" });
+		expect(h.confirms).toBe(1);
+		const inside = session({}, { cwd: "/proj/.omp/agent" });
+		await toolCall(inside, "grep", { pattern: "x" });
+		expect(inside.confirms).toBe(1);
+		const plain = session({});
+		await toolCall(plain, "grep", { pattern: "x" });
+		expect(plain.confirms).toBe(0);
+	});
+
+	test("bash: .omp as a path component or bare word asks; lookalike names do not", async () => {
+		for (const command of ["ls ~/.omp/agent/skills", "cd .omp && ls", 'cat "$HOME/.omp/x"']) {
+			const h = session({});
+			await toolCall(h, "bash", { command });
+			expect(h.confirms).toBe(1);
+		}
+		for (const command of ["echo a.omp", "cat .ompx/y", "cat .omp.bak"]) {
+			const h = session({});
+			h.responses = [{ text: "<verdict>allow</verdict> fine" }];
+			await toolCall(h, "bash", { command });
+			expect(h.confirms).toBe(0);
+		}
+	});
+
+	test("lookalike file-tool segments (.ompx, x.omp) do not ask", async () => {
+		for (const p of ["/proj/.ompx/a", "/proj/x.omp", "/proj/omp/a"]) {
+			const h = session({});
+			expect(await toolCall(h, "read", { path: p })).toBeUndefined();
+			expect(h.confirms).toBe(0);
+		}
+	});
+
+	test("beats user allow rules but not user deny rules", async () => {
+		const allowed = session({ allow: [".*"] });
+		await toolCall(allowed, "read", { path: OMP_FILE });
+		expect(allowed.confirms).toBe(1);
+		const denied = session({ allow: [".*"], deny: ["\\.omp"] });
+		const r = await toolCall(denied, "read", { path: OMP_FILE });
+		expect(r?.block).toBe(true);
+		expect(denied.confirms).toBe(0);
+	});
+
+	test("non-interactive session: ask degrades to deny", async () => {
+		const h = session({});
+		h.ctx.hasUI = false;
+		const r = await toolCall(h, "read", { path: OMP_FILE });
+		expect(h.confirms).toBe(0);
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).toContain("non-interactive");
+	});
+
+	test("gateOmpDir:false disables the gate; non-false values keep it on", async () => {
+		const off = session({ gateOmpDir: false });
+		expect(await toolCall(off, "read", { path: OMP_FILE })).toBeUndefined();
+		expect(off.confirms).toBe(0);
+		const junk = session({ gateOmpDir: "nope" });
+		await toolCall(junk, "read", { path: OMP_FILE });
+		expect(junk.confirms).toBe(1);
+	});
+
+	test("master switch off → gate inert", async () => {
+		const h = session({}, { flag: false });
+		expect(await toolCall(h, "read", { path: OMP_FILE })).toBeUndefined();
+		expect(h.confirms).toBe(0);
 	});
 });
 
@@ -2326,5 +2440,396 @@ describe("/verdict config editor", () => {
 		const h = session({});
 		await run(h, "bogus", { picks: [] });
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("Usage: /verdict [user|local]"))).toBe(true);
+	});
+
+	test("gateOmpDir: switch persists, applies immediately; On restores the gate", async () => {
+		const h = session({});
+		await run(h, "user", { picks: ["gateOmpDir", "Off", "Done"] });
+		expect(readUser().gateOmpDir).toBe(false);
+		expect(await toolCall(h, "read", { path: "/proj/.omp/notes.md" })).toBeUndefined();
+		expect(h.confirms).toBe(0);
+		h.selectPicks = ["gateOmpDir", "On", "Done"];
+		await h.commands.verdict.handler("user", h.ctx);
+		expect(readUser().gateOmpDir).toBe(true);
+		await toolCall(h, "read", { path: "/proj/.omp/notes.md" });
+		expect(h.confirms).toBe(1);
+	});
+
+	test("gateOmpDir: local file can set and unset (inherit global)", async () => {
+		await withTempDir("pv-verdict-gate-", async (dir) => {
+			const h = session({}, { cwd: dir });
+			const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
+			const file = path.join(dir, dot, "pi-verdict.json");
+			await run(h, "local", { picks: ["gateOmpDir", "Off", "gateOmpDir", "× Unset", "Done"] });
+			expect("gateOmpDir" in JSON.parse(fs.readFileSync(file, "utf8"))).toBe(false);
+		});
+	});
+
+	test("gateOmpDir: non-boolean value is not editable from the menu (warns, file unchanged)", async () => {
+		const h = session({ gateOmpDir: "nope" });
+		const before = fs.readFileSync(USER_FILE(), "utf8");
+		await run(h, "user", { picks: ["gateOmpDir", "Done"] });
+		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("gateOmpDir") && m.includes("not a boolean"))).toBe(true);
+	});
+});
+
+// ── Approve dialog ──────────────────────────────────────
+
+describe("approve dialog helpers", () => {
+	const fakeTheme = { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bold: (t: string) => `*${t}*` } as any;
+	const count = (s: string, ch: string) => s.split(ch).length - 1;
+
+	test("renderJevBar: largest-remainder cells, bold chosen label, all-zero muted bar, width clamp", () => {
+		const [bar, legend] = renderJevBar({ choice: "ask", probabilities: { allow: 35, ask: 63, deny: 2 }, confidence: 45, concern: null, rest: "" }, 40, fakeTheme);
+		expect(bar).toBe(`<success>${"█".repeat(14)}</success><warning>${"█".repeat(25)}</warning><error>█</error>`);
+		expect(legend).toContain("*<warning>ask 63%</warning>*");
+		expect(legend).not.toContain("*<success>");
+		expect(legend).toContain("<muted>confidence 45%</muted>");
+		const zero = renderJevBar({ choice: "ask", probabilities: { allow: 0, ask: 0, deny: 0 }, confidence: 0, concern: null, rest: "" }, 40, fakeTheme)[0];
+		expect(zero).toBe(`<muted>${"░".repeat(40)}</muted>`);
+		expect(count(renderJevBar({ choice: "allow", probabilities: { allow: 100, ask: 0, deny: 0 }, confidence: 100, concern: null, rest: "" }, 200, fakeTheme)[0], "█")).toBe(48);
+	});
+
+	test("approveCodeMarkdown: fence outgrows body backticks, language from path, edit cap, line cap", () => {
+		const lang = (p: string) => (p.endsWith(".ts") ? "typescript" : undefined);
+		const bash = approveCodeMarkdown("bash", { command: "echo ```x```" }, lang)!;
+		expect(bash.markdown).toBe("````bash\necho ```x```\n````");
+		expect(approveCodeMarkdown("write", { path: "a.ts", content: "x" }, lang)!.markdown).toBe("```typescript\nx\n```");
+		expect(approveCodeMarkdown("write", { path: "a.bin", content: "x" }, lang)!.markdown).toBe("```\nx\n```");
+		const edits = Array.from({ length: 5 }, (_, i) => ({ oldText: "o", newText: `n${i}` }));
+		const e = approveCodeMarkdown("edit", { path: "a.ts", edits }, lang)!;
+		expect(e.header).toBe("edit: a.ts (5 edits)");
+		expect(count(e.markdown, "```typescript")).toBe(3);
+		expect(e.markdown).toContain("… 2 more edits not shown");
+		expect(approveCodeMarkdown("edit", { path: "a.ts", edits: [{ oldText: "o" }] }, lang)).toBeNull();
+		expect(approveCodeMarkdown("read", { path: "a.ts" }, lang)).toBeNull();
+		const long = approveCodeMarkdown("bash", { command: Array.from({ length: 100 }, (_, i) => `l${i}`).join("\n") }, lang)!;
+		expect(long.markdown).toContain("[60 lines omitted]");
+		expect(long.markdown).toContain("l0\n");
+		expect(long.markdown).toContain("l99\n");
+		const wide = approveCodeMarkdown("bash", { command: "x".repeat(10_000) }, lang)!;
+		expect(wide.markdown).toContain("[6000 chars truncated]");
+	});
+
+	test("displaySafe: control / bidi characters become visible escapes; tab and newline survive", () => {
+		expect(displaySafe("a\x1b[31mb")).toBe("a\\u001b[31mb");
+		expect(displaySafe("a\u202eb\r\nc\td")).toBe("a\\u202eb\nc\td");
+	});
+});
+
+describe("approve dialog routing", () => {
+	const ANSI = /\x1b\[[0-9;]*m/g;
+
+	test("ui.custom returning undefined (RPC mode) falls back to confirm", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
+		h.ctx.ui.custom = async () => undefined;
+		h.confirmAnswer = true;
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(r).toBeUndefined();
+		expect(h.confirms).toBe(1);
+	});
+
+	/** Drives the real dialog component: renders, sends the given keys, resolves like the TUI host would. */
+	function driveDialog(h: Harness, keys: string[], rendered: string[]): void {
+		h.ctx.ui.custom = async (factory: any) => {
+			const { initTheme } = await import("@earendil-works/pi-coding-agent");
+			initTheme("dark", false);
+			const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+			return new Promise((resolve) => {
+				const component = factory({ requestRender() {} }, fakeTheme, undefined, resolve);
+				rendered.push(component.render(80).join("\n").replace(ANSI, ""));
+				for (const k of keys) component.handleInput(k);
+			});
+		};
+	}
+
+	test("rich dialog: Down + Enter declines without calling confirm; renders command and options", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
+		const rendered: string[] = [];
+		driveDialog(h, ["\x1b[B", "\r"], rendered);
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(r.reason).toContain("user-declined");
+		expect(h.confirms).toBe(0);
+		for (const s of ["cargo build", "Yes", "No", "Classifier opinion: needs a human"]) expect(rendered[0]).toContain(s);
+	});
+
+	test("rich dialog: Enter on the default allows", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
+		driveDialog(h, ["\r"], []);
+		expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
+		expect(h.confirms).toBe(0);
+	});
+
+	test("rich dialog: a jev ask reason renders the bar legend and the concern", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>ask</verdict> jev: ask 63% (confidence 45%; allow 35%, deny 2%) — concern: network operation" }];
+		const rendered: string[] = [];
+		driveDialog(h, ["\x1b"], rendered);
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(r.reason).toContain("user-declined"); // Escape cancels
+		expect(rendered[0]).toContain("concern: network operation");
+		expect(rendered[0]).toContain("allow 35%");
+		expect(rendered[0]).toContain("█");
+	});
+});
+
+// ── subagent gate (omp ctx.agent.kind = "sub") ───────────
+
+describe("subagent gate (omp ctx.agent.kind = sub)", () => {
+	const SENS = path.join(TMP_AGENT, "sensitive-sg");
+	fs.mkdirSync(SENS, { recursive: true });
+	const ASK = { text: "<verdict>ask</verdict> not sure" };
+	const ALLOW = { text: "<verdict>allow</verdict> fine" };
+	const DENY = { text: "<verdict>deny</verdict> unsafe" };
+	const JEV_ALLOW_49 = "<verdict>allow</verdict> jev: allow 66% (confidence 49%; ask 33%, deny 1%)";
+	const JEV_DENY_29 = "<verdict>deny</verdict> jev: deny 64% (confidence 29%; allow 36%)";
+	const LABEL = "[subagent Scout1 (scout)]";
+
+	/** A root harness (interactive, published as the root UI) + a subagent harness with no UI of its own.
+	 *  Always shuts the root down so the module-level registry never leaks between tests. */
+	async function withBridge(
+		cfg: Parameters<typeof setConfig>[0],
+		fn: (root: Harness, sub: Harness) => Promise<void>,
+		opts: { rootHasUI?: boolean } = {},
+	): Promise<void> {
+		// the production default is "off"; bridge tests opt in to "normal" unless they say otherwise
+		// (an explicit `subagentGate: undefined` key exercises the true default)
+		const root = session({ subagentGate: "normal", ...cfg });
+		root.ctx.hasUI = opts.rootHasUI ?? true;
+		await root.handlers["session_start"]({}, root.ctx);
+		const sub = makeHarness();
+		sub.install();
+		sub.ctx.agent = { kind: "sub", id: "Scout1", name: "scout" };
+		sub.ctx.hasUI = false;
+		sub.findMap = { "mock/fb": { id: "fb-model" } };
+		try {
+			await fn(root, sub);
+		} finally {
+			await root.handlers["session_shutdown"]({}, root.ctx);
+		}
+	}
+
+	/** Yield microtasks until `cond` holds (bounded) — no wall-clock waiting */
+	const flush = async (cond: () => boolean): Promise<void> => {
+		for (let i = 0; i < 200 && !cond(); i++) await Promise.resolve();
+	};
+
+	// subagentAskTimeoutMs below is a real AbortSignal.timeout — the code under test owns that
+	// platform timer, so these tests use a short genuine deadline rather than fake time.
+
+	/** Root confirm that never answers: resolves only when the dialog's signal aborts */
+	const hangUntilAbort = (root: Harness): void => {
+		root.ctx.ui.confirm = (_t: string, m: string, o?: { signal?: AbortSignal }) => {
+			root.confirms++;
+			root.confirmMsgs.push(m);
+			const { promise, resolve } = Promise.withResolvers<boolean>();
+			o?.signal?.addEventListener("abort", () => resolve(false), { once: true });
+			return promise;
+		};
+	};
+
+	test("normal: a classifier ask prompts the root UI, not the subagent's; the answer decides", async () => {
+		await withBridge({}, async (root, sub) => {
+			sub.responses = [ASK];
+			const ok = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(ok).toBeUndefined();
+			expect(root.confirms).toBe(1);
+			expect(sub.confirms).toBe(0);
+			expect(root.confirmMsgs[0]).toContain("cargo build");
+			root.confirmAnswer = false;
+			const no = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(no?.block).toBe(true);
+			expect(String(no.reason)).toContain("user-declined");
+		});
+	});
+
+	test("normal: notifications land on the root UI with the subagent label", async () => {
+		await withBridge({}, async (root, sub) => {
+			sub.responses = [DENY];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(root.notifies.some(([m]) => m.includes(`🛡️ ${LABEL} Auto Mode blocked`))).toBe(true);
+			expect(sub.notifies.length).toBe(0);
+		});
+	});
+
+	test("normal: unanswered past subagentAskTimeoutMs → second model decides; only an explicit allow permits", async () => {
+		await withBridge({ subagentAskTimeoutMs: 30, classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			hangUntilAbort(root);
+			sub.responses = [ASK, ALLOW];
+			expect(await toolCall(sub, "bash", { command: "cargo build" })).toBeUndefined();
+			expect(sub.calls.length).toBe(2);
+			sub.calls.length = 0;
+			sub.responses = [ASK, DENY];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(String(r.reason)).toContain("subagent-auto");
+			expect(String(r.reason)).toContain("second model did not approve");
+		});
+	});
+
+	test("normal: a cancelled subagent run closes the root dialog, blocks, and never consults the second model", async () => {
+		await withBridge({ subagentAskTimeoutMs: 60_000, classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			hangUntilAbort(root);
+			const ctrl = new AbortController();
+			sub.ctx.signal = ctrl.signal;
+			sub.responses = [ASK, ALLOW];
+			const pending = toolCall(sub, "bash", { command: "cargo build" });
+			await flush(() => root.confirms > 0);
+			ctrl.abort();
+			const r = await pending;
+			expect(r?.block).toBe(true);
+			expect(String(r.reason)).toContain("subagent-cancelled");
+			expect(sub.calls.length).toBe(1);
+		});
+	});
+
+	test("auto: never prompts; the second model decides; no second model configured → deny", async () => {
+		await withBridge({ subagentGate: "auto", classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			sub.responses = [ASK, ALLOW];
+			expect(await toolCall(sub, "bash", { command: "cargo build" })).toBeUndefined();
+			sub.responses = [ASK, DENY];
+			sub.calls.length = 0;
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(root.confirms).toBe(0);
+		});
+		await withBridge({ subagentGate: "auto" }, async (root, sub) => {
+			sub.responses = [ASK];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(String(r.reason)).toContain("no second model configured");
+			expect(root.confirms).toBe(0);
+		});
+	});
+
+	test("asks that did not come from the classifier never auto-allow (protected path, .omp, autoDeny:false)", async () => {
+		await withBridge({ subagentGate: "auto", denyPaths: [SENS], classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			sub.responses = [ALLOW];
+			const r = await toolCall(sub, "read", { path: path.join(SENS, "secret.md") });
+			expect(r?.block).toBe(true);
+			expect(sub.calls.length).toBe(0);
+			expect(root.notifies.map(([m]) => m).join("\n")).not.toContain(path.basename(SENS));
+			expect(String(r.reason)).not.toContain(path.basename(SENS));
+			const omp = await toolCall(sub, "read", { path: "/proj/.omp/x" });
+			expect(omp?.block).toBe(true);
+			expect(sub.calls.length).toBe(0);
+		});
+		await withBridge({ subagentGate: "auto", autoDeny: false, classifierFallbackModel: "mock/fb" }, async (_root, sub) => {
+			sub.responses = [DENY, ALLOW];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+			expect(sub.calls.length).toBe(1); // the second model was never asked
+		});
+	});
+
+	test("ADR-0004 carve-out holds for subagents: a demoted first-layer deny is never auto-allowed", async () => {
+		const cfg = { subagentGate: "auto", classifierMinConfidence: 50, classifierFallbackModel: "mock/fb" };
+		await withBridge(cfg, async (_root, sub) => {
+			sub.responses = [{ text: JEV_DENY_29 }, ALLOW];
+			const r = await toolCall(sub, "bash", { command: "cargo build" });
+			expect(r?.block).toBe(true);
+		});
+		// control: a demoted allow with a second-model allow passes
+		await withBridge(cfg, async (_root, sub) => {
+			sub.responses = [{ text: JEV_ALLOW_49 }, ALLOW];
+			expect(await toolCall(sub, "bash", { command: "cargo build" })).toBeUndefined();
+		});
+	});
+
+	test("off: the gate is inert in subagents (the root stays gated)", async () => {
+		await withBridge({ subagentGate: "off" }, async (root, sub) => {
+			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
+			expect(sub.calls.length).toBe(0);
+			const r = await toolCall(root, "bash", { command: "rm " + "-rf /tmp/x" });
+			expect(r?.block).toBe(true);
+		});
+	});
+
+	test("default is off: a fresh config leaves subagents ungated", async () => {
+		await withBridge({ subagentGate: undefined }, async (root, sub) => {
+			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
+			expect(sub.calls.length).toBe(0);
+			expect(root.confirms).toBe(0);
+		});
+	});
+
+	test("no root UI: normal degrades to the second-model path with no prompt", async () => {
+		await withBridge({ classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+			sub.responses = [ASK, ALLOW];
+			expect(await toolCall(sub, "bash", { command: "cargo build" })).toBeUndefined();
+			expect(sub.calls.length).toBe(2);
+			expect(root.confirms).toBe(0);
+		}, { rootHasUI: false });
+	});
+
+	test("root dialogs are serialized: concurrent subagent asks never overlap", async () => {
+		await withBridge({}, async (root, sub) => {
+			let inFlight = 0;
+			let maxInFlight = 0;
+			const gates: Array<() => void> = [];
+			root.ctx.ui.confirm = async () => {
+				inFlight++;
+				maxInFlight = Math.max(maxInFlight, inFlight);
+				const { promise, resolve } = Promise.withResolvers<void>();
+				gates.push(resolve);
+				await promise;
+				inFlight--;
+				return true;
+			};
+			sub.responses = [ASK];
+			const both = Promise.all([toolCall(sub, "bash", { command: "cargo build" }), toolCall(sub, "bash", { command: "cargo test" })]);
+			await flush(() => gates.length >= 1);
+			await flush(() => gates.length >= 2); // gives the second ask every chance to (wrongly) start
+			expect(gates.length).toBe(1);
+			gates[0]();
+			await flush(() => gates.length >= 2);
+			gates[1]();
+			expect(await both).toEqual([undefined, undefined]);
+			expect(maxInFlight).toBe(1);
+		});
+	});
+
+	test("audit records who resolved the ask: timeout (second model) vs human", async () => {
+		clearAudit();
+		try {
+			await withBridge({ audit: true, subagentAskTimeoutMs: 30, classifierFallbackModel: "mock/fb" }, async (root, sub) => {
+				hangUntilAbort(root);
+				sub.responses = [ASK, ALLOW];
+				await toolCall(sub, "bash", { command: "cargo build" });
+				const rec = readAudit().at(-1);
+				expect(rec.subagent).toEqual({ id: "Scout1", name: "scout", resolution: "timeout" });
+				expect(rec.fallback).toMatchObject({ triggeredBy: "subagent-ask", verdict: "allow", effective: "allow" });
+				expect(rec.userAnswer).toBeUndefined();
+			});
+			clearAudit();
+			await withBridge({ audit: true }, async (_root, sub) => {
+				sub.responses = [ASK];
+				await toolCall(sub, "bash", { command: "cargo build" });
+				const rec = readAudit().at(-1);
+				expect(rec.subagent).toEqual({ id: "Scout1", name: "scout", resolution: "human" });
+				expect(rec.userAnswer).toBe("allowed");
+			});
+		} finally {
+			clearAudit();
+		}
+	});
+
+	test("invalid subagentGate / subagentAskTimeoutMs warn and fall back to the defaults", async () => {
+		const h = session({ subagentGate: "x", subagentAskTimeoutMs: 0 });
+		await h.handlers["session_start"]({}, h.ctx);
+		const warning = h.notifies.filter(([m, l]) => l === "warning" && m.includes("skipped")).map(([m]) => m).join(" ");
+		expect(warning).toContain("subagentGate");
+		expect(warning).toContain("subagentAskTimeoutMs");
+		await h.handlers["session_shutdown"]({}, h.ctx);
+		// an invalid mode falls back to the default (off): the subagent is not gated, nothing prompts
+		await withBridge({ subagentGate: "x", subagentAskTimeoutMs: 0 }, async (root, sub) => {
+			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
+			expect(root.confirms).toBe(0);
+		});
 	});
 });

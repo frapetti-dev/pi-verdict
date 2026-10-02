@@ -81,7 +81,7 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
 - `/automode on`
 - `/automode off`
 - `ctrl+shift+a` —— 静默切换主开关(footer 始终显示为唯一反馈;键位可经 `toggleShortcut` 重绑或禁用)
-- `/verdict [user|local]` —— 交互式编辑全局(`user`)或项目(`local`)配置的列表规则(`allow`、`deny`、`denyPaths`、`tools`、`rules`):增 / 改 / 删条目,保存即落盘并立即作用于当前会话。标量键仍需手工编辑
+- `/verdict [user|local]` —— 交互式编辑全局(`user`)或项目(`local`)配置的列表规则(`allow`、`deny`、`denyPaths`、`tools`、`rules`):增 / 改 / 删条目,保存即落盘并立即作用于当前会话;同时承载 `gateOmpDir` 开关。其余标量键仍需手工编辑
 - footer 恒显 `auto mode on`(绿色)/ `auto mode off`(黄色)
 
 | 配置 | 默认 | 说明 |
@@ -108,24 +108,29 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
     "~/.bashrc"
   ],
   "builtinDenyFloor": true,
+  "gateOmpDir": true,
   "classifierModel": null,
   "toggleShortcut": "ctrl+shift+a",
   "audit": false,
   "notifyAllows": false,
   "classifierMinConfidence": null,
   "classifierFallbackModel": null,
-  "classifierFallbackMode": "shadow"
+  "classifierFallbackMode": "shadow",
+  "subagentGate": "off",
+  "subagentAskTimeoutMs": 60000
 }
 ```
 
 - `allow`/`deny` 为 JS 正则数组;**`deny` 优先于 `allow`**,两者都优先于分类器
 - `denyPaths` 是你声明**受保护**的普通路径列表:触碰触发**终局 ask** 由你裁决(非交互降级 deny);分类器只被告知路径**存在**,路径明文永不出本机。`grep`/`find`/`ls` 按**整个搜索范围**比较:省略 `path`(pi 默认:当前目录)或传入位于声明路径之上的父目录,同样触发 ask。全新安装会预填一份**入门列表**(`~/.ssh/`、`~/.gnupg`、`~/.mc`、shell rc/profile 文件),自初次运行后的第一个会话起生效(一切配置变更均自新会话生效)——它是预填的*用户声明*而非内置 floor:可随意增删清空,也可与自己的路径(`~/Documents/private`、……)并列;既有配置永不被改写
 - `builtinDenyFloor: false` 整体关闭内置危险/路径拦截(风险自担)
+- `gateOmpDir`(默认 `true`)是**强制 `.omp` 门禁**:文件类工具路径或 bash 命令触碰任何 `.omp` 目录(词法形或符号链接解析形;`~/.omp`、`<项目>/.omp` 等)即触发由你裁决的终局 ask(非交互降级 deny)。它位于内置 floor 与你的 `deny` 之后、`denyPaths`/`allow` 之前,因此 `allow` 正则无法绕过。设为 `false` 关闭;可在 `/verdict` 中切换。`grep`/`find`/`ls` 只检查其自身目标(仅仅途经嵌套 `.omp` 的递归搜索不算访问)
 - `classifierModel` 指定分类器模型,如 `"zai/glm-5.3-flash:low"`(支持思考后缀;缺省 = 会话模型且显式关思考)
 - `classifierModel: "typesafe/jev-latest"` 启用随包的 **jev 决策适配器**——灰区裁决经 TypeSafe jev 完成(默认 OpenRouter,或 `PI_VERDICT_JEV_TRANSPORT=typesafe` 直连官方 API);实验性质,详见 [ADR-0003](docs/adr/0003-jev-decisions-adapter.md)
 - `audit: true` 把每次**灰区裁决**(发给分类器的完整转录、其原始响应、解析出的裁决)以 JSONL 记录到 `~/.pi/agent/verdicts/<sessionId>.jsonl`——按会话一分文件,保留最近 20 个。交互式 ask 还会记录你的应答(`userAnswer` ground truth,确认结束后落盘),protected-path ask 也入审计(#62);规则 allow/deny 仍不入。仅存本机且全保真(受保护路径明文可能出现——永不出本机;[ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md) 边界注);agent 对该目录读写双拒。开启时 `/automode` 会显示审计状态与路径
 - `notifyAllows: true` 对每次 **classifier 放行**发通知(reason + action 行——如 jev 的概率分解);默认 `false` 保持放行静默。机械放行(你自己的 allow 规则、protected-path 确认)永不通知;shadow 标注仍属 debug;两开关同开时通知只出现一次
 - `classifierMinConfidence`(可选,[ADR-0004](docs/adr/0004-classifier-fallback-cascade.md))设定**置信地板**:低于它的 jev 裁决被降级——配置了 `classifierFallbackModel` 则级联(`shadow` = 第二层只记录意见、由你裁决;`enforce` = 第二层全权裁决,但降级 deny 永不被自动翻成 allow),否则直接问你。不低于地板时第一层自主。天然搭配:jev 打头 + haiku 级兜底
+- `subagentGate`(仅 omp)决定**子代理**内产生的 `ask` 的去向(子代理自身没有 UI):`"off"`(默认)子代理不受门禁;`"normal"` 在根会话 UI 上弹出确认框并标注子代理;若在 `subagentAskTimeoutMs`(默认 60000 ms)内无人应答或根会话无 UI,则交由 `classifierFallbackModel` 裁决——仅其明确 `allow` 才放行,其余一律拒绝;`"auto"` 从不弹框,始终按此裁决。protected-path / `.omp` 的 ask 永不自动放行。请将 omp 的 `extensionHandlers.toolCallTimeoutMs` 设为不小于 `subagentAskTimeoutMs + 60000`
 
 没有内置白名单——每一条「永远放行」声明都归你([为什么](docs/configuration.md#why-no-built-in-allowlist))。完整参考:[docs/configuration.md](docs/configuration.md)。
 
@@ -143,6 +148,7 @@ pi-verdict 同时支持 [pi](https://github.com/badlogic/pi-mono) 与 [oh-my-pi]
 - **Transport**: OpenRouter decisions(默认)或 TypeSafe 直连——TypeSafe 侧单次成本显示 $0(其 API 不返回 cost)
 - **宿主**:仅支持pi。omp 上该设置会警告并回退会话模型。也绝不能选作会话主模型(不生成文本,选中即警告)
 - **逃生口**:`PI_VERDICT_JEV_URL` 可覆盖当前 transport 的端点(OpenRouter 侧为 alpha 接口)
+- **确认框**:交互式 TUI 中,ask 弹窗以语法高亮代码块呈现待审代码(bash 命令、write 内容、edit 片段);ask 直接来自 jev 时,另显示彩色 allow/ask/deny 概率条与 `concern:` 行(jev 对该动作的风险类别,由同一请求中的第二个 `concern` 问题给出)。其他宿主与 RPC 模式回退为纯文本 confirm
 
 jev 的校准 confidence 正是置信地板的判定依据——搭配第二层使用(`"classifierMinConfidence": 50, "classifierFallbackModel": "anthropic/claude-haiku-4-5"`),让低置信调用交给更深的模型而非直接生效([ADR-0004](docs/adr/0004-classifier-fallback-cascade.md))。
 
@@ -169,6 +175,7 @@ tool_call
   ├─ 1. 规则层(确定性,零延迟)
   │     ├─ 内置 deny floor:bash 危险正则 + 路径敏感度 S0–S5
   │     ├─ 用户规则:deny 优先于 allow
+  │     ├─ gateOmpDir:任何 .omp 目录访问 → 终局 ask,先于 denyPaths
   │     ├─ denyPaths(ADR-0002):受保护路径 → 终局 ask,先于用户 allow;
   │     │   分类器只见存在性话术
   │     └─ 无内置白名单 —— 「永远放行」的声明由你自己做
