@@ -285,9 +285,11 @@ interface UserRules {
 	subagentGate: "off" | "normal" | "auto";
 	/** normal-mode root-dialog deadline in ms, measured from enqueue (queue wait counts). Default 60000. */
 	subagentAskTimeoutMs: number;
+	/** Footer status style: "full" = Nerd Font powerline blocks, "compact" = plain one-line text, "off" = no status. Default "full". */
+	footer: "full" | "compact" | "off";
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, autoDeny: true, classifierRules: [] };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", classifierMinConfidence: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, autoDeny: true, classifierRules: [] };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -468,7 +470,7 @@ function recordTrust(root: string, decision: "trusted" | "untrusted"): string | 
 const DEFAULT_ALLOWED_TOOLS = ["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"];
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below classifierFallbackConfidence, default 50); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the master-switch toggle key (null or empty disables). Changes apply to new sessions. autoDeny=false turns every auto-review deny (danger floor, deny rules, classifier) into a confirmation prompt; non-interactive sessions still deny. rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status).",
 	allow: ["^ls\\b"],
 	deny: [],
 	tools: DEFAULT_ALLOWED_TOOLS,
@@ -489,6 +491,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	toggleShortcut: DEFAULT_TOGGLE_SHORTCUT,
 	audit: false,
 	notifyAllows: false,
+	footer: "full",
 	classifierMinConfidence: null,
 	classifierFallbackModel: null,
 	classifierFallbackMode: "shadow",
@@ -514,7 +517,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 			} catch { /* 只读环境静默跳过 */ }
 			return { rules: EMPTY_RULES, skipped: [], shortcutWarning: null, project: null };
 		}
-		let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; gateOmpDir?: unknown; classifierModel?: unknown; explainGateModel?: unknown; explainGatePrompt?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; subagentGate?: unknown; subagentAskTimeoutMs?: unknown; autoDeny?: unknown; rules?: unknown };
+		let raw: { allow?: unknown; deny?: unknown; denyPaths?: unknown; tools?: unknown; builtinDenyFloor?: unknown; gateOmpDir?: unknown; classifierModel?: unknown; explainGateModel?: unknown; explainGatePrompt?: unknown; toggleShortcut?: unknown; audit?: unknown; notifyAllows?: unknown; classifierFallbackModel?: unknown; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; footer?: unknown; subagentGate?: unknown; subagentAskTimeoutMs?: unknown; autoDeny?: unknown; rules?: unknown };
 		try {
 			raw = JSON.parse(fs.readFileSync(p, "utf8")) as typeof raw;
 		} catch (err) {
@@ -600,6 +603,9 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 		if (minConfRaw !== undefined && minConfRaw !== null && !minConfOk) skipped.push(`classifierMinConfidence: ${JSON.stringify(minConfRaw)}`);
 		const fbModeRaw = raw.classifierFallbackMode;
 		if (fbModeRaw !== undefined && fbModeRaw !== "shadow" && fbModeRaw !== "enforce") skipped.push(`classifierFallbackMode: ${JSON.stringify(fbModeRaw)}`);
+		const footerRaw = raw.footer;
+		const footerOk = footerRaw === "full" || footerRaw === "compact" || footerRaw === "off";
+		if (footerRaw !== undefined && !footerOk) skipped.push(`footer: ${JSON.stringify(footerRaw)}`);
 		const sgRaw = raw.subagentGate;
 		const sgOk = sgRaw === "off" || sgRaw === "normal" || sgRaw === "auto";
 		if (sgRaw !== undefined && !sgOk) skipped.push(`subagentGate: ${JSON.stringify(sgRaw)}`);
@@ -623,6 +629,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 				classifierFallbackModel: typeof raw.classifierFallbackModel === "string" && raw.classifierFallbackModel.trim() ? raw.classifierFallbackModel.trim() : null,
 				classifierMinConfidence: minConfOk ? minConfRaw : null,
 				classifierFallbackMode: fbModeRaw === "enforce" ? "enforce" : "shadow",
+				footer: footerOk ? footerRaw : "full",
 				subagentGate: sgOk ? sgRaw : "off",
 				subagentAskTimeoutMs: satOk ? satRaw : 60_000,
 				autoDeny: raw.autoDeny !== false,
@@ -1574,6 +1581,8 @@ export class SessionState {
 	audit: AuditLog | null;
 	private denyPathBases: string[] | null = null;
 	private readonly agentDir: string | null;
+	/** Final pipeline verdicts this session (root calls only; an ask counts once whatever the user answers). Reset on session start, kept across /verdict reloads. */
+	verdictCounts = { allow: 0, ask: 0, deny: 0 };
 
 	constructor(userRules: UserRules = loadUserRules().rules, agentDir: string | null = null) {
 		this.userRules = userRules;
@@ -1602,6 +1611,7 @@ export class SessionState {
 		const report = this.reloadRules(cwd, sessionTrustedRoot);
 		this.shadow.reset();
 		this.fallback.reset();
+		this.verdictCounts = { allow: 0, ask: 0, deny: 0 };
 		return report;
 	}
 
@@ -1930,6 +1940,7 @@ const LIST_KEY_PLACEHOLDER: Record<EditableListKey, string> = {
 	rules: "free-text rule for the classifier",
 };
 const GATE_OMP_DIR_DESC = "forced ask on any .omp directory access";
+const FOOTER_DESC = "footer status style";
 
 /** Where a project config would be written for `cwd`: the existing one if discovered, else `<cwd>/<dotdir>/pi-verdict.json`.
  *  null when `findProjectConfig`'s stop rule (home dir / agent tree root) would never discover a file there. */
@@ -2492,6 +2503,98 @@ export interface AutoModeDeps {
 	compatLoader?: CompatLoader;
 }
 
+// ============================================================================
+// Footer status
+//
+// Pure model + renderer (UI-free, exported for tests). Carries no command, path or
+// denyPaths text (ADR-0002). The host joins every extension status onto ONE footer line
+// (sorted by key, truncated from the right), so the order below is also the truncation
+// priority: gate state, risks, classifier model, counters, info badges.
+// ============================================================================
+
+export interface FooterInfo {
+	enabled: boolean;
+	/** "configured" = an explicit spec resolved; "inherited" = no spec, session model; "unavailable" = spec set but unresolvable, session model used; "none" = no model at all (fail-closed) */
+	classifier: { id: string | null; thinking: string; state: "configured" | "inherited" | "unavailable" | "none" };
+	/** null = classifierFallbackModel not configured; id null = configured but unresolvable */
+	fallback: { id: string | null; mode: "shadow" | "enforce" } | null;
+	counts: { allow: number; ask: number; deny: number };
+	floorOff: boolean;
+	ompGateOff: boolean;
+	minConfidence: number | null;
+	autoDenyOff: boolean;
+	subagentGate: "off" | "normal" | "auto";
+}
+
+type ThemeBg = Parameters<Theme["bg"]>[0];
+type FooterTheme = Pick<Theme, "fg" | "bold"> & Partial<Pick<Theme, "bg" | "getBgAnsi">>;
+
+// Nerd Font (nf-fa) code points
+const NF_SEP = "\uE0B0"; // powerline right arrow
+const NF_SHIELD = "\uF132"; // gate on
+const NF_WARN = "\uF071"; // off / risk
+const NF_CHIP = "\uF2DB"; // model
+const NF_CHECK = "\uF00C"; // allow count
+const NF_ASK = "\uF128"; // ask count
+const NF_BAN = "\uF05E"; // deny count
+const NF_INFO = "\uF05A"; // info block
+
+export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full" | "compact"): string {
+	const { classifier, fallback } = info;
+	const modelLabel = classifier.state === "none" || classifier.id === null
+		? "no model · fail-closed"
+		: `${classifier.state === "unavailable" ? "⚠ ↺ " : classifier.state === "inherited" ? "↺ " : ""}${classifier.id}${classifier.thinking !== "off" ? `:${classifier.thinking}` : ""}`;
+	const modelColor = classifier.state === "none" ? "error" : classifier.state === "unavailable" ? "warning" : "accent";
+	const fallbackText = fallback ? `↳ ${fallback.id === null ? "⚠ unavailable" : fallback.id}·${fallback.mode}` : null;
+	const fallbackColor = fallback && fallback.id === null ? "warning" : "muted";
+	const infoItems: string[] = [];
+	if (info.minConfidence !== null) infoItems.push(`≥${info.minConfidence}%`);
+	if (info.autoDenyOff) infoItems.push("autoDeny off");
+	if (info.subagentGate !== "off") infoItems.push(`subagent ${info.subagentGate}`);
+	const risks: { text: string; color: "error" | "warning" }[] = [];
+	if (info.floorOff) risks.push({ text: "floor off", color: "error" });
+	if (info.ompGateOff) risks.push({ text: ".omp gate off", color: "warning" });
+
+	const bgFn = theme.bg;
+	const bgAnsi = theme.getBgAnsi;
+	if (style === "full" && typeof bgFn === "function" && typeof bgAnsi === "function") {
+		const bg = (c: ThemeBg, s: string): string => bgFn.call(theme, c, s);
+		// The arrow glyph is drawn in the previous block's background color: turn its bg escape into a fg escape
+		const bgAsFg = (c: ThemeBg): string | null => {
+			const bgEsc = bgAnsi.call(theme, c);
+			const fgEsc = bgEsc.replace("\x1b[48;", "\x1b[38;");
+			return fgEsc === bgEsc ? null : fgEsc;
+		};
+		const segs: { bg: ThemeBg; body: string }[] = [];
+		if (!info.enabled) {
+			segs.push({ bg: "toolPendingBg", body: theme.fg("warning", theme.bold(` ${NF_WARN} AUTO OFF · ungated `)) });
+		} else {
+			segs.push({ bg: "toolSuccessBg", body: theme.fg("success", theme.bold(` ${NF_SHIELD} AUTO `)) });
+			if (risks.length > 0) segs.push({ bg: "toolErrorBg", body: ` ${NF_WARN} ${risks.map((r) => theme.fg(r.color, r.text)).join("  ")} ` });
+			segs.push({ bg: "selectedBg", body: ` ${NF_CHIP} ${theme.fg(modelColor, modelLabel)}${fallbackText ? ` ${theme.fg(fallbackColor, fallbackText)}` : ""} ` });
+			segs.push({ bg: "customMessageBg", body: ` ${theme.fg("success", `${NF_CHECK} ${info.counts.allow}`)}  ${theme.fg("warning", `${NF_ASK} ${info.counts.ask}`)}  ${theme.fg("error", `${NF_BAN} ${info.counts.deny}`)} ` });
+			if (infoItems.length > 0) segs.push({ bg: "userMessageBg", body: ` ${NF_INFO} ${infoItems.map((i) => theme.fg("muted", i)).join("  ")} ` });
+		}
+		let out = "";
+		segs.forEach((seg, i) => {
+			out += bg(seg.bg, seg.body);
+			const next = segs[i + 1];
+			const fgEsc = bgAsFg(seg.bg);
+			if (next) out += bg(next.bg, fgEsc ? `${fgEsc}${NF_SEP}\x1b[39m` : NF_SEP);
+			else out += fgEsc ? `${fgEsc}${NF_SEP}\x1b[39m` : NF_SEP;
+		});
+		return out;
+	}
+
+	// compact (also the full-style fallback on hosts whose theme lacks bg/getBgAnsi)
+	if (!info.enabled) return theme.fg("warning", "○ auto off · ungated");
+	const parts = [theme.fg("success", "● auto")];
+	for (const r of risks) parts.push(theme.fg(r.color, `⚠ ${r.text}`));
+	parts.push(`${theme.fg(modelColor, modelLabel)}${fallbackText ? ` ${theme.fg(fallbackColor, fallbackText)}` : ""}`);
+	for (const i of infoItems) parts.push(theme.fg("muted", i));
+	return parts.join(theme.fg("dim", " · "));
+}
+
 export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	pi.registerFlag("auto-mode", { description: "Enable Auto Mode (rules + model classifier gating for tool calls)", type: "boolean", default: true });
 	pi.registerFlag("auto-mode-model", { description: "Classifier model as provider/id[:thinking] (pi --model syntax; default: inherit session model)", type: "string" });
@@ -2579,10 +2682,48 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		return d.allow ? undefined : { block: true, reason: blockedReason("user-declined", declineDetail("user declined", d.reason)) };
 	}
 
-	function refreshStatus(ctx: ExtensionContext) {
-		// Always-on dual-state footer: on = success (gate active), off = warning
-		// (ungated YOLO is a deliberate user choice — a note, not a fault, hence not error)
-		ctx.ui.setStatus("auto-mode", ctx.ui.theme.fg(enabled ? "success" : "warning", enabled ? "auto mode on" : "auto mode off"));
+	/** Classifier model as the footer shows it: same precedence as resolveClassifier, but side-effect free (no warnings, no calls). */
+	function footerInfo(ctx: ExtensionContext): FooterInfo {
+		const rules = state.userRules;
+		const raw = (pi.getFlag("auto-mode-model") as string | undefined) ?? process.env.PI_AUTO_MODE_MODEL ?? rules.classifierModel;
+		const session = ctx.model ?? null;
+		let classifier: FooterInfo["classifier"];
+		if (raw) {
+			const { specPart, level } = parseModelSpec(raw, () => {});
+			const thinking = level ?? "off";
+			const model = findAuthedModel(ctx, specPart);
+			if (model) classifier = { id: model.id, thinking, state: "configured" };
+			else if (session) classifier = { id: session.id, thinking, state: "unavailable" };
+			else classifier = { id: null, thinking: "off", state: "none" };
+		} else {
+			classifier = session ? { id: session.id, thinking: "off", state: "inherited" } : { id: null, thinking: "off", state: "none" };
+		}
+		let fallback: FooterInfo["fallback"] = null;
+		if (rules.classifierFallbackModel) {
+			const { specPart } = parseModelSpec(rules.classifierFallbackModel, () => {});
+			fallback = { id: findAuthedModel(ctx, specPart)?.id ?? null, mode: rules.classifierFallbackMode };
+		}
+		return {
+			enabled,
+			classifier,
+			fallback,
+			counts: state.verdictCounts,
+			floorOff: !rules.builtinDenyFloor,
+			ompGateOff: !rules.gateOmpDir,
+			minConfidence: rules.classifierMinConfidence,
+			autoDenyOff: !rules.autoDeny,
+			subagentGate: rules.subagentGate,
+		};
+	}
+
+	// Footer status: full = powerline blocks, compact = plain line, off = cleared; see renderFooter
+	function refreshStatus(ctx: ExtensionContext): void {
+		const style = state.userRules.footer;
+		if (style === "off") {
+			ctx.ui.setStatus("auto-mode", undefined);
+			return;
+		}
+		ctx.ui.setStatus("auto-mode", renderFooter(footerInfo(ctx), ctx.ui.theme, style));
 	}
 
 	/** 主开关设定(共用,#15):/automode 命令与 toggle 快捷键同一入口,不因操作面引入额外规则 */
@@ -2651,6 +2792,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		ownRootUi = null;
 	});
 
+	pi.on("model_select", (_e, ctx) => refreshStatus(ctx));
+
 	// 主开关 toggle 快捷键(#15):键位取首次加载的用户规则(会话内固定——改配置后
 	// /reload 重载扩展或新会话生效);handler 与 /automode 语义等价,静默切换,
 	// footer 始终显示是唯一反馈
@@ -2699,7 +2842,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	});
 
 	pi.registerCommand("verdict", {
-		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch): /verdict [user|local]",
+		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch, footer style): /verdict [user|local]",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("pi-verdict: /verdict needs an interactive UI", "warning");
@@ -2760,6 +2903,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				}
 				raw = next;
 				reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
+				refreshStatus(ctx);
 				ctx.ui.notify(`pi-verdict: ${key} saved to ${file} — rules reloaded`, "info");
 				return true;
 			}
@@ -2775,6 +2919,21 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				if (choice === ON) save(true, "gateOmpDir");
 				else if (choice === OFF) save(false, "gateOmpDir");
 				else if (choice === UNSET) save(undefined, "gateOmpDir");
+			}
+
+			/** Style menu for footer; local files can also unset (inherit the global value) */
+			async function editFooter(): Promise<void> {
+				const FULL = "full — Nerd Font powerline blocks (default)";
+				const COMPACT = "compact — plain one-line text";
+				const OFF = "off — no footer status";
+				const UNSET = "× Unset (inherit global footer)";
+				const options = [FULL, COMPACT, OFF];
+				if (kind === "local" && "footer" in raw) options.push(UNSET);
+				const choice = await ctx.ui.select(`footer — ${file}`, options);
+				if (choice === FULL) save("full", "footer");
+				else if (choice === COMPACT) save("compact", "footer");
+				else if (choice === OFF) save("off", "footer");
+				else if (choice === UNSET) save(undefined, "footer");
 			}
 
 			/** Normalize + duplicate-check a typed entry; undefined = nothing to save (already notified or cancelled) */
@@ -2856,6 +3015,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				const gv = raw.gateOmpDir;
 				const gateState = gv === undefined ? (kind === "local" ? "not set: global applies" : "on, default") : typeof gv === "boolean" ? (gv ? "on" : "off") : "invalid: not a boolean";
 				options.push(`gateOmpDir (${gateState}) — ${GATE_OMP_DIR_DESC}`);
+				const footerIdx = options.length;
+				const fv = raw.footer;
+				const footerState = fv === undefined ? (kind === "local" ? "not set: global applies" : "full, default") : fv === "full" || fv === "compact" || fv === "off" ? fv : "invalid";
+				options.push(`footer (${footerState}) — ${FOOTER_DESC}`);
 				options.push(DONE);
 				const choice = await ctx.ui.select(`pi-verdict: edit ${file}`, options);
 				if (choice === undefined || choice === DONE) return;
@@ -2866,6 +3029,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						continue;
 					}
 					await editGateOmpDir();
+					continue;
+				}
+				if (choiceIdx === footerIdx) {
+					if (fv !== undefined && fv !== "full" && fv !== "compact" && fv !== "off") {
+						ctx.ui.notify(`pi-verdict: footer in ${file} is not "full"|"compact"|"off" — fix it by hand`, "warning");
+						continue;
+					}
+					await editFooter();
 					continue;
 				}
 				const key = EDITABLE_LIST_KEYS[choiceIdx];
@@ -2896,6 +3067,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		return { specPart: raw, level: null };
 	}
 
+	/** Registry lookup of a "provider/id" spec (thinking suffix already stripped): the model only when it has configured auth. Side-effect free (no notifications). */
+	function findAuthedModel(ctx: ExtensionContext, specPart: string): NonNullable<ExtensionContext["model"]> | null {
+		const slash = specPart.indexOf("/");
+		if (slash <= 0) return null;
+		const model = ctx.modelRegistry.find(specPart.slice(0, slash), specPart.slice(slash + 1));
+		return model && ctx.modelRegistry.hasConfiguredAuth(model) ? model : null;
+	}
+
 	/** 解析分类器模型与思考级别:CLI flag > 环境变量 > 配置文件(classifierModel) >
 	 *  自省(会话模型)。不可用回退会话模型并警告一次;null = 连会话模型都没有 →
 	 *  fail-closed。经 AdjudicateEnv.getModel 惰性调用(仅灰区),回退警告不会出现在
@@ -2911,11 +3090,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				ctx.ui.notify(msg, "warning");
 			});
 			thinking = (level ?? "off") as ThinkingLevel;
-			const slash = specPart.indexOf("/");
-			if (slash > 0) {
-				const model = ctx.modelRegistry.find(specPart.slice(0, slash), specPart.slice(slash + 1));
-				if (model && ctx.modelRegistry.hasConfiguredAuth(model)) return { model, thinking };
-			}
+			const model = findAuthedModel(ctx, specPart);
+			if (model) return { model, thinking };
 			if (!warnedClassifierModel) {
 				warnedClassifierModel = true; // 每会话仅警告一次,避免逐调用刷屏
 				ctx.ui.notify(`pi-verdict: classifier model "${raw}" unavailable (not found or no configured auth), falling back to session model (self-reflection)`, "warning");
@@ -2941,11 +3117,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			ctx.ui.notify(msg, "warning");
 		});
 		const thinking = (level ?? "off") as ThinkingLevel;
-		const slash = specPart.indexOf("/");
-		if (slash > 0) {
-			const model = ctx.modelRegistry.find(specPart.slice(0, slash), specPart.slice(slash + 1));
-			if (model && ctx.modelRegistry.hasConfiguredAuth(model)) return { model, thinking };
-		}
+		const model = findAuthedModel(ctx, specPart);
+		if (model) return { model, thinking };
 		if (!warnedFallbackModel) {
 			warnedFallbackModel = true; // one warning per session
 			ctx.ui.notify(`pi-verdict: fallback model "${raw}" unavailable (not found or no configured auth) — classifierFallbackModel inactive this session`, "warning");
@@ -2968,11 +3141,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				ctx.ui.notify(msg, "warning");
 			});
 			thinking = (level ?? "off") as ThinkingLevel;
-			const slash = specPart.indexOf("/");
-			if (slash > 0) {
-				const model = ctx.modelRegistry.find(specPart.slice(0, slash), specPart.slice(slash + 1));
-				if (model && ctx.modelRegistry.hasConfiguredAuth(model)) return { model, thinking };
-			}
+			const model = findAuthedModel(ctx, specPart);
+			if (model) return { model, thinking };
 			if (!warnedExplainModel) {
 				warnedExplainModel = true;
 				ctx.ui.notify(`pi-verdict: ${EXPLAIN_GATE_ROLE} model "${raw}" unavailable (not found or no configured auth), falling back to session model`, "warning");
@@ -3045,6 +3215,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			verdict = await adjudicate(state, call, env);
 		} finally {
 			if (statusShown) statusUi?.setWidget(STATUS_WIDGET_KEY, undefined);
+		}
+		if (!sub) {
+			state.verdictCounts[verdict.verdict]++;
+			refreshStatus(ctx);
 		}
 		const warn = (msg: string): void => (ui ?? ctx.ui).notify(label && !msg.startsWith("🛡️") ? `[${label}] ${msg}` : msg, "warning");
 		const auditWarning = state.audit?.drainWarning(); // #54: fail-soft one-shot warning
