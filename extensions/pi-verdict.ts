@@ -2093,8 +2093,8 @@ export function approveCodeMarkdown(
 	return null;
 }
 
-/** Two lines: a probability bar (allow/ask/deny cells, largest-remainder rounding) and its legend. */
-export function renderJevBar(j: JevReason, width: number, theme: Pick<Theme, "fg" | "bold">): string[] {
+/** Three lines: a probability bar (allow/ask/deny cells, largest-remainder rounding), a confidence bar (fill to jev confidence, tick at the confidence floor), and the legend. */
+export function renderJevBar(j: JevReason, minConfidence: number | null, width: number, theme: Pick<Theme, "fg" | "bold">): string[] {
 	const cells = Math.max(10, Math.min(48, width));
 	const names = ["allow", "ask", "deny"] as const;
 	const colors = { allow: "success", ask: "warning", deny: "error" } as const;
@@ -2118,8 +2118,27 @@ export function renderJevBar(j: JevReason, width: number, theme: Pick<Theme, "fg
 		const s = theme.fg(colors[k], `${k} ${j.probabilities[k]}%`);
 		return k === j.choice ? theme.bold(s) : s;
 	};
-	const legend = [...names.map(label), theme.fg("muted", `confidence ${j.confidence}%`)].join("  ");
-	return [bar, legend];
+	const filled = Math.round((Math.max(0, Math.min(100, j.confidence)) / 100) * cells);
+	const tick = minConfidence === null ? -1 : Math.min(cells - 1, Math.round((minConfidence / 100) * cells));
+	const runs: { kind: "fill" | "track" | "tick"; n: number }[] = [];
+	for (let i = 0; i < cells; i++) {
+		const kind = i === tick ? "tick" : i < filled ? "fill" : "track";
+		const last = runs[runs.length - 1];
+		if (last && last.kind === kind) last.n++;
+		else runs.push({ kind, n: 1 });
+	}
+	const confBar = runs
+		.map(({ kind, n }) =>
+			kind === "fill"
+				? theme.fg("border", "━".repeat(n))
+				: kind === "track"
+					? theme.fg("dim", "─".repeat(n))
+					: theme.fg("text", "┃".repeat(n)),
+		)
+		.join("");
+	const confText = minConfidence === null ? `confidence ${j.confidence}%` : `confidence ${j.confidence}% · min ${minConfidence}%`;
+	const legend = [...names.map(label), theme.fg("muted", confText)].join("  ");
+	return [bar, confBar, legend];
 }
 
 type DialogModules = { tui: typeof PiTui; agent: typeof PiAgent };
@@ -2147,6 +2166,8 @@ interface ApproveDialogSpec {
 	/** "Allow execution?" | "Allow this access?" */
 	question: string;
 	jev: JevReason | null;
+	/** confidence floor (classifierMinConfidence) drawn as a tick on the jev confidence bar; null = floor off */
+	minConfidence: number | null;
 	/** exact plain-text confirm() message used when the rich dialog is unavailable */
 	fallbackMessage: string;
 	/** offer the "Explain…" option (EXPLAIN-GATE role) */
@@ -2199,7 +2220,7 @@ export function buildApproveDialog(
 		root.addChild(new Spacer(1));
 		const jev = spec.jev;
 		if (jev) {
-			root.addChild({ render: (w: number) => renderJevBar(jev, w - 2, theme).map((l) => ` ${l}`), invalidate() {} });
+			root.addChild({ render: (w: number) => renderJevBar(jev, spec.minConfidence, w - 2, theme).map((l) => ` ${l}`), invalidate() {} });
 			if (jev.concern) root.addChild(new Text(theme.fg("muted", "concern: ") + jev.concern, 1, 0));
 			if (jev.rest) root.addChild(new Text(theme.fg("muted", displaySafe(jev.rest)), 1, 0));
 		} else {
@@ -2426,6 +2447,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				detail: v.detail ?? "(see pi-verdict.json)",
 				question: "Allow this access?",
 				jev: null,
+				minConfidence: null,
 				fallbackMessage: `${action}\n\n${v.reason}\n\nProtected path: ${v.detail ?? "(see pi-verdict.json)"}\n\nAllow this access?`,
 			}, { signal: opts.signal });
 			if (d === "aborted") return "aborted";
@@ -2446,6 +2468,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			reasonLine,
 			question: "Allow execution?",
 			jev: v.source === "classifier" ? parseJevReason(v.reason) : null,
+			minConfidence: state.userRules.classifierMinConfidence,
 			fallbackMessage: `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`,
 		}, { signal: opts.signal, explain: (question) => explainAsk(opts.ctx, call, action, reasonLine, question) });
 		if (d === "aborted") return "aborted";

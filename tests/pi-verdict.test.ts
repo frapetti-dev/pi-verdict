@@ -2482,15 +2482,26 @@ describe("approve dialog helpers", () => {
 	const fakeTheme = { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bold: (t: string) => `*${t}*` } as any;
 	const count = (s: string, ch: string) => s.split(ch).length - 1;
 
-	test("renderJevBar: largest-remainder cells, bold chosen label, all-zero muted bar, width clamp", () => {
-		const [bar, legend] = renderJevBar({ choice: "ask", probabilities: { allow: 35, ask: 63, deny: 2 }, confidence: 45, concern: null, rest: "" }, 40, fakeTheme);
+	test("renderJevBar: largest-remainder cells, bold chosen label, all-zero muted bar, width clamp, confidence bar + floor tick", () => {
+		const j = { choice: "ask", probabilities: { allow: 35, ask: 63, deny: 2 }, confidence: 45, concern: null, rest: "" } as const;
+		const [bar, conf, legend] = renderJevBar(j, 50, 40, fakeTheme);
 		expect(bar).toBe(`<success>${"█".repeat(14)}</success><warning>${"█".repeat(25)}</warning><error>█</error>`);
+		expect(conf).toBe(`<border>${"━".repeat(18)}</border><dim>──</dim><text>┃</text><dim>${"─".repeat(19)}</dim>`);
 		expect(legend).toContain("*<warning>ask 63%</warning>*");
 		expect(legend).not.toContain("*<success>");
-		expect(legend).toContain("<muted>confidence 45%</muted>");
-		const zero = renderJevBar({ choice: "ask", probabilities: { allow: 0, ask: 0, deny: 0 }, confidence: 0, concern: null, rest: "" }, 40, fakeTheme)[0];
+		expect(legend).toContain("<muted>confidence 45% · min 50%</muted>");
+		const [, confOff, legendOff] = renderJevBar(j, null, 40, fakeTheme);
+		expect(confOff).toBe(`<border>${"━".repeat(18)}</border><dim>${"─".repeat(22)}</dim>`);
+		expect(legendOff).toContain("<muted>confidence 45%</muted>");
+		expect(legendOff).not.toContain("min");
+		const [, confIn] = renderJevBar({ ...j, confidence: 80 }, 50, 40, fakeTheme);
+		expect(confIn).toBe(`<border>${"━".repeat(20)}</border><text>┃</text><border>${"━".repeat(11)}</border><dim>${"─".repeat(8)}</dim>`);
+		const [, confMax] = renderJevBar({ ...j, confidence: 100 }, 100, 40, fakeTheme);
+		expect(confMax.endsWith("<text>┃</text>")).toBe(true);
+		expect(count(confMax, "━")).toBe(39);
+		const zero = renderJevBar({ choice: "ask", probabilities: { allow: 0, ask: 0, deny: 0 }, confidence: 0, concern: null, rest: "" }, null, 40, fakeTheme)[0];
 		expect(zero).toBe(`<muted>${"░".repeat(40)}</muted>`);
-		expect(count(renderJevBar({ choice: "allow", probabilities: { allow: 100, ask: 0, deny: 0 }, confidence: 100, concern: null, rest: "" }, 200, fakeTheme)[0], "█")).toBe(48);
+		expect(count(renderJevBar({ choice: "allow", probabilities: { allow: 100, ask: 0, deny: 0 }, confidence: 100, concern: null, rest: "" }, null, 200, fakeTheme)[0], "█")).toBe(48);
 	});
 
 	test("approveCodeMarkdown: fence outgrows body backticks, language from path, edit cap, line cap", () => {
@@ -2576,6 +2587,17 @@ describe("approve dialog routing", () => {
 		expect(rendered[0]).toContain("concern: network operation");
 		expect(rendered[0]).toContain("allow 35%");
 		expect(rendered[0]).toContain("█");
+		expect(rendered[0]).toContain("━");
+	});
+
+	test("rich dialog: the confidence floor shows as a tick and in the legend", async () => {
+		const h = session({ classifierMinConfidence: 40 });
+		h.responses = [{ text: "<verdict>ask</verdict> jev: ask 63% (confidence 45%; allow 35%, deny 2%)" }];
+		const rendered: string[] = [];
+		driveDialog(h, ["\x1b"], rendered);
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(rendered[0]).toContain("┃");
+		expect(rendered[0]).toContain("confidence 45% · min 40%");
 	});
 });
 
