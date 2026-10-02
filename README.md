@@ -78,8 +78,8 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `/automode on`
 - `/automode off`
 - `ctrl+shift+a` — toggle the master switch silently (the always-on footer is the only feedback; rebind or disable via `toggleShortcut`)
-- `/verdict [user|local]` — edit the list rules (`allow`, `deny`, `denyPaths`, `tools`, `rules`) of the global (`user`) or project (`local`) config interactively: add / edit / remove entries, saved to disk and applied to the running session at once; also hosts the `gateOmpDir` on/off switch. Other scalar keys stay hand-edited
-- footer always shows `auto mode on` (green) / `auto mode off` (yellow)
+- `/verdict [user|local]` — edit the list rules (`allow`, `deny`, `denyPaths`, `tools`, `rules`) of the global (`user`) or project (`local`) config interactively: add / edit / remove entries, saved to disk and applied to the running session at once; also hosts the `gateOmpDir` on/off switch and the `footer` style. Other scalar keys stay hand-edited
+- footer status (`footer` key): `full` = Nerd Font powerline blocks (gate state, risky settings, classifier model, verdict counters, badges), `compact` = one plain line, `off` = none; a switched-off gate always shows as `AUTO OFF · ungated`
 
 | Option | Default | Description |
 |---|---|---|
@@ -105,6 +105,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
   ],
   "builtinDenyFloor": true,
   "gateOmpDir": true,
+  "footer": "full",
   "classifierModel": null,
   "explainGateModel": null,
   "explainGatePrompt": null,
@@ -123,6 +124,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `denyPaths` are plain paths you declare **protected** — touches trigger a terminal ask you adjudicate (non-interactive → deny); the classifier never learns the paths themselves, only that they exist. `grep`/`find`/`ls` compare their whole **search scope**: an omitted `path` (pi's default: the current directory) or a parent directory of a declared path triggers the ask as well. A fresh install pre-fills a **starter list** (`~/.ssh/`, `~/.gnupg`, `~/.mc`, shell rc/profile files), active from the first session after the initial run (any config change applies to new sessions) — a pre-filled *user declaration*, not a built-in floor: edit or empty it freely, add your own (`~/Documents/private`, …) alongside; existing configs are never rewritten
 - `builtinDenyFloor: false` turns off the built-in danger/path floor (your risk)
 - `gateOmpDir` (default `true`) is the **forced `.omp` gate**: any file-tool path or bash command touching a `.omp` directory (lexical or symlink-resolved; `~/.omp`, `<project>/.omp`, …) triggers a terminal ask you adjudicate (non-interactive → deny). It runs after the built-in floor and your `deny` rules and before `denyPaths`/`allow`, so an `allow` regex cannot skip it. `false` disables it; toggle it from `/verdict`. `grep`/`find`/`ls` are checked on their own target only (a recursive search that merely traverses a nested `.omp` is not an access)
+- `footer` (default `"full"`): style of the footer status. `"full"` renders Nerd Font powerline blocks — gate state, risky settings (`floor off`, `.omp gate off`), the classifier model (`↺` = inherited session model, `⚠ ↺` = configured model unavailable so the session model is used, `↳ <id>·shadow|enforce` = fallback model), per-session verdict counters (allow / ask / deny: final pipeline verdicts of root-session calls, reset at session start) and info badges (`≥N%` for `classifierMinConfidence`, `autoDeny off`, `subagent normal|auto`). `"compact"` is one plain text line with the same content minus counters; `"off"` clears the status. Hosts whose theme lacks `bg`/`getBgAnsi` render compact. The footer never shows command or path text (ADR-0002). Editable from `/verdict`; an invalid value warns and falls back to `"full"`.
 - `classifierModel` pins the classifier model, e.g. `"zai/glm-5.3-flash:low"` (thinking suffix supported; default: session model with thinking off)
 - `classifierModel: "typesafe/jev-latest"` opts into the bundled **jev decisions adapter** — gray-zone verdicts via TypeSafe's jev (OpenRouter by default, or TypeSafe's official API directly with `PI_VERDICT_JEV_TRANSPORT=typesafe`); experimental, see [ADR-0003](docs/adr/0003-jev-decisions-adapter.md)
 - `explainGateModel` / `explainGatePrompt` configure the **EXPLAIN-GATE role** behind two extra options of the interactive ask dialog. **Explain…** asks an optional question of the EXPLAIN-GATE model (default: session model; `provider/id[:thinking]`) together with the held action and the gate's stated reason; the answer appears in the re-opened dialog (advisory — never sent to the agent), and with an empty question the default prompt (`explainGatePrompt`, built-in: "Explain what this action does and why the gate held it for confirmation.") is used. **No, with explanation…** declines and tells the agent why (`user declined, saying: "…"`). Explain is **not offered for protected-path asks** (`denyPaths`, `.omp` gate) because their path plaintext must not reach a model provider ([ADR-0002](docs/adr/0002-deny-paths-deterministic-ask.md)). RPC mode and hosts without the rich dialog keep the plain Yes/No confirm

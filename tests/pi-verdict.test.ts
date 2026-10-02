@@ -121,7 +121,7 @@ const clearAudit = () => fs.rmSync(VERDICTS(), { recursive: true, force: true })
 beforeAll(() => { process.env.PI_CODING_AGENT_DIR = TMP_AGENT; });
 afterAll(() => { delete process.env.PI_CODING_AGENT_DIR; });
 
-function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; explainGateModel?: string | null; explainGatePrompt?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: boolean; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
+function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; explainGateModel?: string | null; explainGatePrompt?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; footer?: unknown; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; classifierMinConfidence?: unknown; classifierFallbackMode?: unknown; autoDeny?: boolean; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
 	config = { allow: cfg.allow ?? [], deny: cfg.deny ?? [] };
 	const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
 	fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -139,6 +139,7 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 	if (cfg.classifierMinConfidence !== undefined) raw.classifierMinConfidence = cfg.classifierMinConfidence;
 	if (cfg.classifierFallbackMode !== undefined) raw.classifierFallbackMode = cfg.classifierFallbackMode;
 	if (cfg.autoDeny !== undefined) raw.autoDeny = cfg.autoDeny;
+	if (cfg.footer !== undefined) raw.footer = cfg.footer;
 	if (cfg.subagentGate !== undefined) raw.subagentGate = cfg.subagentGate;
 	if (cfg.subagentAskTimeoutMs !== undefined) raw.subagentAskTimeoutMs = cfg.subagentAskTimeoutMs;
 	// denyPaths (ADR-0002): unknown[] lets negative tests mix in non-string entries
@@ -781,10 +782,11 @@ describe("toggle shortcut", () => {
 	test("footer status colors: on → success, off → warning", async () => {
 		const h = session({});
 		await h.handlers.session_start({}, h.ctx); // on (default)
-		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "auto mode on"]);
-		expect(h.fgCalls.at(-1)).toEqual(["success", "auto mode on"]); // green: gate active
+		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "● auto · ↺ mock/glm"]);
+		expect(h.fgCalls).toContainEqual(["success", "● auto"]); // green: gate active
 		h.shortcuts["ctrl+shift+a"].handler(h.ctx); // silent toggle off
-		expect(h.fgCalls.at(-1)).toEqual(["warning", "auto mode off"]); // yellow: a note, not a fault
+		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "○ auto off · ungated"]);
+		expect(h.fgCalls.at(-1)).toEqual(["warning", "○ auto off · ungated"]); // yellow: a note, not a fault
 	});
 	test("/automode bare call shows toggle hint; hidden when disabled", () => {
 		const h = session({});
@@ -2479,6 +2481,127 @@ describe("/verdict config editor", () => {
 		await run(h, "user", { picks: ["gateOmpDir", "Done"] });
 		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("gateOmpDir") && m.includes("not a boolean"))).toBe(true);
+	});
+});
+
+// ── Footer status ───────────────────────────────────────
+
+describe("footer status", () => {
+	const lastStatus = (h: Harness): string | undefined => h.statusSets.at(-1)?.[1];
+	/** A theme with the powerline surface (bg + getBgAnsi) so the full style renders blocks */
+	const withBg = (h: Harness): void => {
+		h.ctx.ui.theme = {
+			fg: (_c: string, s: string) => s,
+			bold: (s: string) => s,
+			bg: (c: string, s: string) => `<${c}>${s}</${c}>`,
+			getBgAnsi: (c: string) => "\x1b[48;5;" + c.length + "m",
+		};
+	};
+
+	test("risky settings render before the model, in red/yellow", async () => {
+		const h = session({ builtinDenyFloor: false, gateOmpDir: false });
+		await h.handlers.session_start({}, h.ctx);
+		const s = lastStatus(h)!;
+		expect(s).toContain("⚠ floor off · ⚠ .omp gate off");
+		expect(s.indexOf("⚠ floor off")).toBeLessThan(s.indexOf("↺ mock/glm"));
+		expect(h.fgCalls).toContainEqual(["error", "⚠ floor off"]);
+		expect(h.fgCalls).toContainEqual(["warning", "⚠ .omp gate off"]);
+	});
+
+	test('footer:"off" clears the status', async () => {
+		const h = session({ footer: "off" });
+		await h.handlers.session_start({}, h.ctx);
+		expect(h.statusSets.at(-1)).toEqual(["auto-mode", undefined]);
+	});
+
+	test("invalid footer value is reported and the default style renders", async () => {
+		const h = session({ footer: "bogus" });
+		await h.handlers.session_start({}, h.ctx);
+		expect(h.notifies.some(([m]) => m.includes('footer: "bogus"'))).toBe(true);
+		expect(lastStatus(h)).toBe("● auto · ↺ mock/glm");
+	});
+
+	test("full style: powerline blocks, per-session counters reset on session start", async () => {
+		const h = session({});
+		withBg(h);
+		await h.handlers.session_start({}, h.ctx);
+		expect(lastStatus(h)).toContain("\uF00C 0");
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		await toolCall(h, "bash", { command: "curl example.com" });
+		const s = lastStatus(h)!;
+		expect(s).toContain("\uF00C 1");
+		expect(s).toContain("\uF128 0");
+		expect(s).toContain("\uF05E 0");
+		expect(s).toContain("\uE0B0");
+		expect(s).toContain("\x1b[38;5;");
+		await h.handlers.session_start({}, h.ctx);
+		expect(lastStatus(h)).toContain("\uF00C 0");
+	});
+
+	test("counters count the final verdict: mechanical deny and ask-once", async () => {
+		const h = session({});
+		withBg(h);
+		await h.handlers.session_start({}, h.ctx);
+		await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" });
+		expect(lastStatus(h)).toContain("\uF05E 1");
+		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
+		h.confirmAnswer = true;
+		await toolCall(h, "bash", { command: "curl example.com" });
+		expect(lastStatus(h)).toContain("\uF128 1");
+		expect(lastStatus(h)).toContain("\uF00C 0");
+	});
+
+	test("unavailable classifier model falls back to the session model with a warning marker", async () => {
+		const h = session({ classifierModel: "nope/x" });
+		h.findMap = {};
+		await h.handlers.session_start({}, h.ctx);
+		expect(lastStatus(h)).toContain("⚠ ↺ mock/glm");
+	});
+
+	test("configured classifier shows its own id (and thinking level); no session-model marker", async () => {
+		const h = session({ classifierModel: "zai/flash:low" });
+		h.findMap = { "zai/flash": { id: "glm-4-flash" } };
+		await h.handlers.session_start({}, h.ctx);
+		expect(lastStatus(h)).toBe("● auto · glm-4-flash:low");
+	});
+
+	test("fallback model + mode and the confidence floor show as badges", async () => {
+		const h = session({ classifierFallbackModel: "p/fb", classifierFallbackMode: "enforce", classifierMinConfidence: 70 });
+		h.findMap = { "p/fb": { id: "fb" } };
+		await h.handlers.session_start({}, h.ctx);
+		expect(lastStatus(h)).toContain("↳ fb·enforce");
+		expect(lastStatus(h)).toContain("≥70%");
+		const missing = session({ classifierFallbackModel: "p/gone" });
+		missing.findMap = {};
+		await missing.handlers.session_start({}, missing.ctx);
+		expect(lastStatus(missing)).toContain("↳ ⚠ unavailable·shadow");
+	});
+
+	test("no session model and no classifier → fail-closed label", async () => {
+		const h = session({});
+		h.ctx.model = null;
+		await h.handlers.session_start({}, h.ctx);
+		expect(lastStatus(h)).toContain("no model · fail-closed");
+	});
+
+	test("master switch off renders a single ungated block (full) / line (compact)", async () => {
+		const h = session({});
+		withBg(h);
+		await h.handlers.session_start({}, h.ctx);
+		h.shortcuts["ctrl+shift+a"].handler(h.ctx);
+		const s = lastStatus(h)!;
+		expect(s).toContain("AUTO OFF · ungated");
+		expect(s).not.toContain("\uF00C");
+	});
+
+	test("/verdict footer edit persists and redraws immediately", async () => {
+		const h = session({ footer: "off" });
+		await h.handlers.session_start({}, h.ctx);
+		expect(h.statusSets.at(-1)).toEqual(["auto-mode", undefined]);
+		h.selectPicks = ["footer", "compact", "Done"];
+		await h.commands.verdict.handler("user", h.ctx);
+		expect(JSON.parse(fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8")).footer).toBe("compact");
+		expect(lastStatus(h)).toMatch(/^● auto/);
 	});
 });
 
