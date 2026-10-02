@@ -107,3 +107,7 @@ A human-invoked model role behind the "Explain…" option of the ask dialog. It 
 ### 回退分类器 (fallback classifier)
 
 级联的第二层(`classifierFallbackModel` 配置),仅在置信降级或第一层 fail-closed 时参与。shadow 模式(默认)只记录意见——结果落审计记录的 `fallback` 子对象与 `/automode` 会话计数,降级调用仍由人工裁决,fail-closed 的 deny 照旧;enforce 模式**全权裁决**(de novo),唯一例外:降级 deny 不可被翻成自动 allow,转人工。fallback 调用失败或不可解析时,该级联调用转人工(非交互降级 deny)——该裁决的层级已失效,人工是下一级。审计顶层恒为第一层语义(`demoted: true` 标记降级),生效裁决在 `fallback.effective`(仅 enforce 行)。jev 侧 confidence 为硬要求(契约保证,缺失即 fail-closed)。
+
+### 子代理门禁 (subagent gate)
+
+仅 omp:子代理会话无自带 UI,其 ask 由 `subagentGate` 决定去向——`off`(默认)子代理内门禁惰性;`normal` 呈现于根会话 UI(带子代理标签),`subagentAskTimeoutMs` 内无人应答或根无 UI 则「无人裁决」;`auto` 始终无人裁决。无人裁决时仅分类器产生的 ask 才咨询回退分类器,且只有其明确 allow 放行,其余一律 deny;protected-path、`.omp` 门禁及仅因 `autoDeny:false` 产生的 ask 永远 deny。
