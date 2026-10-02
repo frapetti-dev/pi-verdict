@@ -68,6 +68,10 @@ Opt-out rule-layer gate (`gateOmpDir`, default on): any tool call whose file pat
 
 分类器的默认模型来源:继承当前会话正在使用的 provider/model 发起裁决调用(而非固定外部模型)。
 
+### EXPLAIN-GATE role
+
+A human-invoked model role behind the "Explain…" option of the ask dialog. It receives the held action, the transcript and the gate's stated reason and writes an advisory explanation for the human (a fixed system prompt plus a default task, or the human's own question). Configured by `explainGateModel` (default: the session model) and `explainGatePrompt`. Its output is display-only: it never reaches the agent, the verdict, the audit log or the classifier. Not offered for protected-path asks (ADR-0002: path plaintext stays off the model channel).
+
 ### jev 适配器 (jev adapter)
 
 随包分发的伴生扩展:在 pi 模型注册表中把 typesafe 的 jev 呈现为一个模型(`typesafe/jev-latest`),将分类器的模型调用翻译为 decisions 请求(默认 OpenRouter 端点,或 `PI_VERDICT_JEV_TRANSPORT=typesafe` 直连官方 v1 API)、把类型化决策合成为裁决前缀契约文本。仅在 `classifierModel` 指向它且凭证可解析时参与判定,否则惰性无效(分类器按既有逻辑回退)。凭证均经 provider 凭证管道:openrouter transport 沿用 pi 的 OpenRouter 登录态,typesafe transport 读 `TYPESAFE_API_KEY`(pi 无 typesafe 登录可复用);不经扩展自带通道。
