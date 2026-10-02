@@ -1639,6 +1639,8 @@ export interface AdjudicateEnv {
 	host: PipelineHost;
 	signal?: AbortSignal;
 	getFallbackModel?: () => { model: NonNullable<ExtensionContext["model"]>; thinking: ThinkingLevel } | null;
+	/** Live-status hook: called right before each gray-zone model call; UI-free (the handler renders it). */
+	onPhase?: (phase: "classifier" | "fallback", modelId: string) => void;
 }
 
 /** #67: the confidence floor. Below it the first layer abstains and the call cascades —
@@ -1702,6 +1704,7 @@ async function runConfidenceCascade(
 	};
 	const resolved = getFb();
 	if (!resolved) return failed(rules.classifierFallbackModel, "fallback model unresolvable (not found or no configured auth)");
+	env.onPhase?.("fallback", resolved.model.id);
 	const outcome = await classifyWithModel(env.host, env.signal, env.complete, resolved.model, actionLine, resolved.thinking, denyPathsActive, FALLBACK_TIMEOUT_MS, state.userRules.classifierRules);
 	if (outcome.source !== "model") return failed(resolved.model.id, outcome.reason);
 	state.fallback.note(first?.verdict ?? null, outcome.verdict);
@@ -1845,6 +1848,7 @@ export async function adjudicate(
 	const ctxKey = shadowContextKey(env.host);
 	const probe = state.shadow.probe(cmdKey, ctxKey);
 
+	env.onPhase?.("classifier", resolved.model.id);
 	const outcome = await classifyWithModel(env.host, env.signal, env.complete, resolved.model, actionLine, resolved.thinking, state.userRules.denyPaths.length > 0, CLASSIFIER_TIMEOUT_MS, state.userRules.classifierRules);
 
 	// 影子回记:真实模型 allow/deny 入缓存;ask 与 fail-closed 不入(#5 定案);
@@ -2193,8 +2197,44 @@ function isAskChoice(x: unknown): x is AskChoice {
 	return typeof x === "string" && Object.hasOwn(ASK_LABELS, x);
 }
 
+/** 0-based dialog line under 0-based terminal row `screenRow`, or null when the host
+ *  exposes no layout (`children`/`terminal.rows`) or the row is outside the dialog. */
+function dialogLineAtRow(tui: unknown, root: PiTui.Component, width: number, screenRow: number): number | null {
+	try {
+		if (!tui || typeof tui !== "object" || !("children" in tui) || !Array.isArray(tui.children)) return null;
+		const rows = "terminal" in tui && tui.terminal && typeof tui.terminal === "object" && "rows" in tui.terminal ? tui.terminal.rows : undefined;
+		if (typeof rows !== "number") return null;
+		const offsetOf = (components: readonly PiTui.Component[]): number | null => {
+			let acc = 0;
+			for (const c of components) {
+				if (c === root) return acc;
+				if ("children" in c && Array.isArray(c.children)) {
+					const inner = offsetOf(c.children);
+					if (inner !== null) return acc + inner;
+				}
+				acc += c.render(width).length;
+			}
+			return null;
+		};
+		const hostChildren: PiTui.Component[] = tui.children;
+		const offset = offsetOf(hostChildren);
+		if (offset === null) return null;
+		let total = 0;
+		for (const c of hostChildren) total += c.render(width).length;
+		// Alt-screen exposes `viewportTop`; the main screen shows the bottom `rows` lines [INFERENCE: short content starts at row 0].
+		const top = "viewportTop" in tui && typeof tui.viewportTop === "number" ? tui.viewportTop : Math.max(0, total - rows);
+		const line = screenRow - (offset - top);
+		return line >= 0 && line < root.render(width).length ? line : null;
+	} catch {
+		return null;
+	}
+}
+
 /** Selector-style dialog mirroring ExtensionSelectorComponent. Resolves `done(undefined)`
- *  with an empty container if construction throws, so the caller falls back to `confirm`. */
+ *  with an empty container if construction throws, so the caller falls back to `confirm`.
+ *  Left clicks are handled when the host forwards SGR mouse input to the dialog (a click highlights
+ *  an option, a second click on the same mouse-highlighted option confirms it); the dialog never
+ *  enables mouse tracking itself. */
 export function buildApproveDialog(
 	mods: DialogModules,
 	tui: { requestRender(): void },
@@ -2247,7 +2287,55 @@ export function buildApproveDialog(
 		root.addChild(new Text(`${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`, 1, 0));
 		root.addChild(new Spacer(1));
 		root.addChild(new DynamicBorder());
+		// Record which choice each rendered line belongs to, so a click row can be mapped back to an option.
+		let lastWidth: number | undefined;
+		let optionAtLine: (number | undefined)[] = [];
+		(root as { render(w: number): string[] }).render = (width: number): string[] => {
+			const lines: string[] = [];
+			const map: (number | undefined)[] = [];
+			for (const child of root.children) {
+				if (child === list) {
+					list.children.forEach((opt, j) => {
+						for (const l of opt.render(width)) {
+							lines.push(l);
+							map.push(j);
+						}
+					});
+				} else {
+					for (const l of child.render(width)) {
+						lines.push(l);
+						map.push(undefined);
+					}
+				}
+			}
+			lastWidth = width;
+			optionAtLine = map;
+			return lines;
+		};
+		let armed: number | undefined; // choice highlighted by the immediately preceding mouse click
+		const onMouse = (button: number, y: number, press: boolean): void => {
+			if (!press || (button & ~(4 | 8 | 16)) !== 0) return; // left button only (modifiers ok); no release/motion/wheel
+			if (lastWidth === undefined) return;
+			const line = dialogLineAtRow(tui, root, lastWidth, y - 1);
+			const choice = line === null ? undefined : optionAtLine[line];
+			if (choice === undefined) return;
+			if (armed === choice && index === choice) {
+				done(choices[choice]);
+				return;
+			}
+			index = choice;
+			armed = choice;
+			updateList();
+			tui.requestRender();
+		};
 		root.handleInput = (data: string): void => {
+			const m = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
+			if (m) {
+				onMouse(Number(m[1]), Number(m[3]), m[4] === "M");
+				return;
+			}
+			if (data.startsWith("\x1b[M")) return; // legacy X10 mouse: ignore, never treat as keys
+			armed = undefined;
 			const kb = getKeybindings();
 			if (kb.matches(data, "tui.select.up") || data === "k") {
 				index = Math.max(0, index - 1);
@@ -2344,6 +2432,9 @@ async function confirmAsk(ui: UiContext, spec: ApproveDialogSpec, opts: { signal
 // ============================================================================
 
 type UiContext = ExtensionContext["ui"];
+
+/** Widget key of the live classifier-status row. */
+const STATUS_WIDGET_KEY = "verdict";
 
 /** omp-only: `ctx.agent = { kind: "main" | "sub", id, name, … }` (pi's ExtensionContext has no `agent`).
  *  Returns the subagent's identity, or null for a root session / pi. */
@@ -2913,6 +3004,17 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const call = { toolName: event.toolName, input };
 		const action = describeAction(event.toolName, input);
 
+		// Live status (root session + UI only): one widget row above the editor while a model call runs.
+		// Text is phase + tool name + model id only; never command or path text (ADR-0002).
+		const statusUi = !sub && ctx.hasUI && typeof ctx.ui.setWidget === "function" ? ctx.ui : null;
+		let statusShown = false;
+		const onPhase = statusUi
+			? (phase: "classifier" | "fallback", modelId: string): void => {
+					statusShown = true;
+					statusUi.setWidget(STATUS_WIDGET_KEY, [statusUi.theme.fg("warning", phase === "classifier" ? `🛡️ verdict: classifying ${event.toolName} via ${modelId}…` : `🛡️ verdict: fallback classifier ${modelId} on ${event.toolName}…`)]);
+				}
+			: undefined;
+
 		// 判定管线(零 UI)→ 呈现(source × degraded 模板)
 		const env: AdjudicateEnv = {
 			cwd: ctx.cwd,
@@ -2923,8 +3025,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			host: ctx.sessionManager,
 			signal: ctx.signal,
 			getFallbackModel: () => resolveFallbackClassifier(ctx),
+			...(onPhase ? { onPhase } : {}),
 		};
-		const verdict = await adjudicate(state, call, env);
+		let verdict: Verdict;
+		try {
+			verdict = await adjudicate(state, call, env);
+		} finally {
+			if (statusShown) statusUi?.setWidget(STATUS_WIDGET_KEY, undefined);
+		}
 		const warn = (msg: string): void => (ui ?? ctx.ui).notify(label && !msg.startsWith("🛡️") ? `[${label}] ${msg}` : msg, "warning");
 		const auditWarning = state.audit?.drainWarning(); // #54: fail-soft one-shot warning
 		if (auditWarning) warn(`pi-verdict: ${auditWarning}`);
