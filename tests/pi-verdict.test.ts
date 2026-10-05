@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
 
 // ── 桩设施 ──────────────────────────────────────────────
 
@@ -95,7 +95,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 	};
 	h.ctx = ctx;
 
-	h.install = (opts?: { flag?: boolean; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> }) => {
+	h.install = (opts?: { flag?: boolean; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }>; ompHost?: boolean }) => {
 		flags = { "auto-mode": opts?.flag ?? true, "auto-mode-debug": opts?.debug ?? false, ...(opts?.modelFlag ? { "auto-mode-model": opts.modelFlag } : {}) };
 		const prev = process.env.PI_AUTO_MODE_DEBUG;
 		if (opts?.debug) process.env.PI_AUTO_MODE_DEBUG = "1"; else delete process.env.PI_AUTO_MODE_DEBUG;
@@ -105,6 +105,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 			on: (e: string, fn: any) => { handlers[e] = fn; },
 			registerCommand: (n: string, c: any) => { commands[n] = c; },
 			registerShortcut: (k: string, o: any) => { shortcuts[k] = o; },
+			...(opts?.ompHost ? { logger: {}, typebox: {} } : {}),
 		} as any, opts?.compatLoader ? { compatLoader: opts.compatLoader } : {});
 		if (prev !== undefined) process.env.PI_AUTO_MODE_DEBUG = prev; else delete process.env.PI_AUTO_MODE_DEBUG;
 	};
@@ -2538,6 +2539,45 @@ describe("footer status", () => {
 		expect(lastStatus(h)).toContain("\uF00C 0");
 	});
 
+	describe("status bar styling", () => {
+		const info = { enabled: true, classifier: { id: "m", thinking: "off", state: "inherited" as const }, fallback: null, counts: { allow: 0, ask: 2, deny: 0 }, floorOff: true, ompGateOff: false, minConfidence: null, autoDenyOff: false, subagentGate: "off" as const };
+		const rgb: Record<string, string> = { success: "0;255;136", warning: "255;179;71", error: "255;71;87", accent: "0;180;255", muted: "1;1;1", dim: "2;2;2" };
+		/** omp-like theme: statusLine* names resolve; `hostNames:false` mimics pi, whose theme throws on them */
+		const theme = (hostNames: boolean) => ({
+			fg: (c: string, s: string) => {
+				const v = rgb[c] ?? (hostNames ? "9;9;9" : undefined);
+				if (!v) throw new Error(`unknown color ${c}`);
+				return `\x1b[38;2;${v}m${s}\x1b[39m`;
+			},
+			bold: (s: string) => s,
+			getFgAnsi: (c: string) => `\x1b[38;2;${rgb[c]}m`,
+			getBgAnsi: (c: string) => {
+				if (c === "statusLineBg" && !hostNames) throw new Error("unknown bg");
+				return c === "statusLineBg" ? "\x1b[48;2;15;18;22m" : "\x1b[48;2;30;30;30m";
+			},
+		});
+
+		test("state chips are solid status-color blocks with bar-colored text; items sit on the bar background", () => {
+			const s = renderFooter(info, theme(true), "full");
+			expect(s).toContain("\x1b[48;2;0;255;136m \x1b[38;2;15;18;22m\uF132 AUTO"); // gate chip: success as bg, bar color as text
+			expect(s).toContain("\x1b[48;2;255;71;87m \x1b[38;2;15;18;22m\uF071 floor off"); // risk chip: error as bg
+			expect(s).toContain("\x1b[48;2;15;18;22m \x1b[38;2;9;9;9m\uF2DB"); // items on the statusLineBg bar, colored text
+			expect(s).toContain("\uE0B1"); // thin arrow between item groups
+			expect(s.endsWith("\uE0B0\x1b[39m\x1b[0m")).toBe(true); // end cap
+		});
+
+		test("a theme that rejects statusLine* names (pi) falls back to generic names and the neutral bar background", () => {
+			const s = renderFooter(info, theme(false), "full");
+			expect(s).toContain("\x1b[48;2;30;30;30m"); // customMessageBg stands in for statusLineBg
+			expect(s).toContain("\x1b[38;2;0;180;255m\uF2DB\x1b[39m \x1b[38;2;0;180;255m↺ m"); // accent stands in for statusLineModel
+			expect(s).toContain("\x1b[38;2;2;2;2m\uE0B1"); // dim stands in for statusLineSep
+		});
+
+		test("a transparent bar (no bg escape) degrades to the compact line", () => {
+			expect(renderFooter(info, { ...theme(true), getBgAnsi: () => "\x1b[49m" }, "full").replace(/\x1b\[[0-9;]*m/g, "")).toBe("● auto · ⚠ floor off · ↺ m");
+		});
+	});
+
 	test("counters count the final verdict: mechanical deny and ask-once", async () => {
 		const h = session({});
 		withBg(h);
@@ -2592,6 +2632,35 @@ describe("footer status", () => {
 		const s = lastStatus(h)!;
 		expect(s).toContain("AUTO OFF · ungated");
 		expect(s).not.toContain("\uF00C");
+	});
+
+	test("omp host: footer goes to a below-editor widget (omp strips ANSI from setStatus); pi keeps setStatus", async () => {
+		setConfig({});
+		const omp = makeHarness("/proj");
+		omp.install({ ompHost: true });
+		omp.ctx.ui.theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s, getBgAnsi: () => "\x1b[48;2;1;2;3m", getFgAnsi: () => "\x1b[38;2;4;5;6m" };
+		let opts: unknown;
+		omp.ctx.ui.setWidget = (key: string, content: string[] | undefined, o: unknown) => { omp.widgetSets.push([key, content]); opts = o; };
+		await omp.handlers.session_start({}, omp.ctx);
+		const w = omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)!;
+		expect(w[1]![0]).toContain("\uF132 AUTO");
+		expect(opts).toEqual({ placement: "belowEditor" });
+		expect(omp.statusSets.every(([, t]) => t === undefined)).toBe(true); // no duplicate plain line
+		omp.shortcuts["ctrl+shift+a"].handler(omp.ctx);
+		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("AUTO OFF");
+
+		const pi = session({});
+		await pi.handlers.session_start({}, pi.ctx);
+		expect(pi.widgetSets.filter(([k]) => k === "auto-mode")).toEqual([]);
+		expect(pi.statusSets.at(-1)![0]).toBe("auto-mode");
+	});
+
+	test('omp host: footer:"off" clears the widget', async () => {
+		setConfig({ footer: "off" });
+		const omp = makeHarness("/proj");
+		omp.install({ ompHost: true });
+		await omp.handlers.session_start({}, omp.ctx);
+		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)).toEqual(["auto-mode", undefined]);
 	});
 
 	test("/verdict footer edit persists and redraws immediately", async () => {

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Changed
+
+- Footer `"full"` style now mirrors the host prompt status bar: state is shown as solid status-color chips (gate `AUTO` in the `success` color, `AUTO OFF · ungated` in `warning`, each risky setting in `error`/`warning`) with bar-colored bold text, followed by one block on the host's `statusLineBg` carrying colored-text items (classifier model in `statusLineModel`, allow/ask/deny counters in `success`/`warning`/`error`, zeroed counters dimmed, info badges muted) separated by thin powerline arrows (`\uE0B1`, colored `statusLineSep`), with solid powerline arrows between blocks and an end cap. Hosts whose theme rejects the omp-only `statusLine*` names (pi) fall back to `accent`/`dim`/`customMessageBg`; a transparent bar or a theme without `getBgAnsi` degrades to the `"compact"` line. No config or ADR-0002 change: still no command/path text in the footer.
+
+### Fixed
+
+- Footer colors never reached the screen on omp: omp runs every `ctx.ui.setStatus` text through `sanitizeStatusText`, which strips all ANSI, so the `"full"` blocks (and the `"compact"` colors) rendered as plain text. On omp (detected by `"logger" in pi && "typebox" in pi`, same test as the jev adapter) the footer is now a below-editor widget (`ctx.ui.setWidget("auto-mode", […], { placement: "belowEditor" })`, rendered through `Text`, SGR preserved) and `setStatus("auto-mode")` is cleared; pi keeps `setStatus`. `footer: "off"` clears the widget. Verified in a live omp session.
+
 ## [0.16.0] - 2026-10-02
 
 ### Added

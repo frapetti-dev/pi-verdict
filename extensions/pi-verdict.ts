@@ -2459,6 +2459,8 @@ type UiContext = ExtensionContext["ui"];
 
 /** Widget key of the live classifier-status row. */
 const STATUS_WIDGET_KEY = "verdict";
+/** Widget key of the omp footer (see refreshStatus). */
+const FOOTER_WIDGET_KEY = "auto-mode";
 
 /** omp-only: `ctx.agent = { kind: "main" | "sub", id, name, … }` (pi's ExtensionContext has no `agent`).
  *  Returns the subagent's identity, or null for a root session / pi. */
@@ -2527,7 +2529,8 @@ export interface FooterInfo {
 }
 
 type ThemeBg = Parameters<Theme["bg"]>[0];
-type FooterTheme = Pick<Theme, "fg" | "bold"> & Partial<Pick<Theme, "bg" | "getBgAnsi">>;
+type ThemeFg = Parameters<Theme["fg"]>[0];
+type FooterTheme = Pick<Theme, "fg" | "bold"> & Partial<Pick<Theme, "getBgAnsi" | "getFgAnsi">>;
 
 // Nerd Font (nf-fa) code points
 const NF_SEP = "\uE0B0"; // powerline right arrow
@@ -2538,6 +2541,7 @@ const NF_CHECK = "\uF00C"; // allow count
 const NF_ASK = "\uF128"; // ask count
 const NF_BAN = "\uF05E"; // deny count
 const NF_INFO = "\uF05A"; // info block
+const NF_THIN = "\uE0B1"; // powerline thin arrow: separator between items inside one block
 
 export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full" | "compact"): string {
 	const { classifier, fallback } = info;
@@ -2555,35 +2559,63 @@ export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full"
 	if (info.floorOff) risks.push({ text: "floor off", color: "error" });
 	if (info.ompGateOff) risks.push({ text: ".omp gate off", color: "warning" });
 
-	const bgFn = theme.bg;
+	// "full" mimics the host prompt status bar: solid colored chips for state (gate, risks), one bar-colored block carrying
+	// colored-text items (model, counters, badges) split by thin arrows, powerline arrows between blocks and an end cap.
+	// It needs the theme's bg escape; hosts without it (or with a transparent bar) fall back to compact.
 	const bgAnsi = theme.getBgAnsi;
-	if (style === "full" && typeof bgFn === "function" && typeof bgAnsi === "function") {
-		const bg = (c: ThemeBg, s: string): string => bgFn.call(theme, c, s);
-		// The arrow glyph is drawn in the previous block's background color: turn its bg escape into a fg escape
-		const bgAsFg = (c: ThemeBg): string | null => {
-			const bgEsc = bgAnsi.call(theme, c);
-			const fgEsc = bgEsc.replace("\x1b[48;", "\x1b[38;");
-			return fgEsc === bgEsc ? null : fgEsc;
+	const fgAnsi = theme.getFgAnsi;
+	const safe = <T>(f: () => T): T | null => {
+		try {
+			return f();
+		} catch {
+			return null; // color name unknown to this host's theme
+		}
+	};
+	const bgEsc = (c: string): string | null => {
+		const e = typeof bgAnsi === "function" ? safe(() => bgAnsi.call(theme, c as ThemeBg)) : null;
+		return typeof e === "string" && e.startsWith("\x1b[48;") ? e : null;
+	};
+	// First color name the host theme knows (statusLine* are omp-only; pi falls through to its generic names)
+	const fgAny = (names: string[], text: string): string => {
+		for (const n of names) {
+			const r = safe(() => theme.fg(n as ThemeFg, text));
+			if (r !== null) return r;
+		}
+		return text;
+	};
+	const barBg = style === "full" ? ["statusLineBg", "customMessageBg", "userMessageBg"].map(bgEsc).find((e) => e !== null) ?? null : null;
+	if (style === "full" && barBg) {
+		const toFg = (e: string): string => e.replace("\x1b[48;", "\x1b[38;");
+		const barFg = toFg(barBg);
+		type Block = { bg: string; body: string };
+		// Solid chip: the status color as background with bar-colored bold text; hosts without getFgAnsi keep the tinted tool bg + colored text
+		const chip = (color: "success" | "warning" | "error", fallbackBg: ThemeBg, text: string): Block => {
+			const e = typeof fgAnsi === "function" ? safe(() => fgAnsi.call(theme, color)) : null;
+			if (typeof e === "string" && e.startsWith("\x1b[38;")) return { bg: e.replace("\x1b[38;", "\x1b[48;"), body: ` ${barFg}${theme.bold(text)}\x1b[39m ` };
+			return { bg: bgEsc(fallbackBg) ?? barBg, body: ` ${theme.fg(color, theme.bold(text))} ` };
 		};
-		const segs: { bg: ThemeBg; body: string }[] = [];
+		const blocks: Block[] = [];
 		if (!info.enabled) {
-			segs.push({ bg: "toolPendingBg", body: theme.fg("warning", theme.bold(` ${NF_WARN} AUTO OFF · ungated `)) });
+			blocks.push(chip("warning", "toolPendingBg", `${NF_WARN} AUTO OFF · ungated`));
 		} else {
-			segs.push({ bg: "toolSuccessBg", body: theme.fg("success", theme.bold(` ${NF_SHIELD} AUTO `)) });
-			if (risks.length > 0) segs.push({ bg: "toolErrorBg", body: ` ${NF_WARN} ${risks.map((r) => theme.fg(r.color, r.text)).join("  ")} ` });
-			segs.push({ bg: "selectedBg", body: ` ${NF_CHIP} ${theme.fg(modelColor, modelLabel)}${fallbackText ? ` ${theme.fg(fallbackColor, fallbackText)}` : ""} ` });
-			segs.push({ bg: "customMessageBg", body: ` ${theme.fg("success", `${NF_CHECK} ${info.counts.allow}`)}  ${theme.fg("warning", `${NF_ASK} ${info.counts.ask}`)}  ${theme.fg("error", `${NF_BAN} ${info.counts.deny}`)} ` });
-			if (infoItems.length > 0) segs.push({ bg: "userMessageBg", body: ` ${NF_INFO} ${infoItems.map((i) => theme.fg("muted", i)).join("  ")} ` });
+			blocks.push(chip("success", "toolSuccessBg", `${NF_SHIELD} AUTO`));
+			for (const r of risks) blocks.push(chip(r.color, r.color === "error" ? "toolErrorBg" : "toolPendingBg", `${NF_WARN} ${r.text}`));
+			const thinSep = fgAny(["statusLineSep", "dim"], NF_THIN);
+			const count = (color: "success" | "warning" | "error", icon: string, n: number): string => theme.fg(n === 0 ? "dim" : color, `${icon} ${n}`);
+			const modelColors = classifier.state === "none" ? ["error"] : classifier.state === "unavailable" ? ["warning"] : ["statusLineModel", "accent"];
+			const items = [
+				`${fgAny(modelColors, NF_CHIP)} ${fgAny(modelColors, modelLabel)}${fallbackText ? ` ${theme.fg(fallbackColor, fallbackText)}` : ""}`,
+				`${count("success", NF_CHECK, info.counts.allow)} ${count("warning", NF_ASK, info.counts.ask)} ${count("error", NF_BAN, info.counts.deny)}`,
+			];
+			if (infoItems.length > 0) items.push(`${theme.fg("muted", NF_INFO)} ${infoItems.map((i) => theme.fg("muted", i)).join(" ")}`);
+			blocks.push({ bg: barBg, body: ` ${items.join(` ${thinSep} `)} ` });
 		}
 		let out = "";
-		segs.forEach((seg, i) => {
-			out += bg(seg.bg, seg.body);
-			const next = segs[i + 1];
-			const fgEsc = bgAsFg(seg.bg);
-			if (next) out += bg(next.bg, fgEsc ? `${fgEsc}${NF_SEP}\x1b[39m` : NF_SEP);
-			else out += fgEsc ? `${fgEsc}${NF_SEP}\x1b[39m` : NF_SEP;
+		blocks.forEach((b, i) => {
+			// The arrow glyph is drawn in this block's color on the next block's background (terminal default after the last one)
+			out += `${b.bg}${b.body}${blocks[i + 1]?.bg ?? "\x1b[49m"}${toFg(b.bg)}${NF_SEP}\x1b[39m`;
 		});
-		return out;
+		return `${out}\x1b[0m`;
 	}
 
 	// compact (also the full-style fallback on hosts whose theme lacks bg/getBgAnsi)
@@ -2716,14 +2748,19 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		};
 	}
 
-	// Footer status: full = powerline blocks, compact = plain line, off = cleared; see renderFooter
+	// Footer status: full = powerline blocks, compact = plain line, off = cleared; see renderFooter.
+	// omp strips every ANSI escape from setStatus text (sanitizeStatusText), which would reduce the colored blocks to plain
+	// text, so on omp the footer is a below-editor widget (rendered through Text, SGR preserved). pi keeps setStatus.
+	const isOmpHost = "logger" in pi && "typebox" in pi;
 	function refreshStatus(ctx: ExtensionContext): void {
 		const style = state.userRules.footer;
-		if (style === "off") {
+		const text = style === "off" ? undefined : renderFooter(footerInfo(ctx), ctx.ui.theme, style);
+		if (isOmpHost && typeof ctx.ui.setWidget === "function") {
 			ctx.ui.setStatus("auto-mode", undefined);
+			ctx.ui.setWidget(FOOTER_WIDGET_KEY, text === undefined ? undefined : [text], { placement: "belowEditor" });
 			return;
 		}
-		ctx.ui.setStatus("auto-mode", renderFooter(footerInfo(ctx), ctx.ui.theme, style));
+		ctx.ui.setStatus("auto-mode", text);
 	}
 
 	/** 主开关设定(共用,#15):/automode 命令与 toggle 快捷键同一入口,不因操作面引入额外规则 */
