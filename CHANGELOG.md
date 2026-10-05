@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-05
+
 ### Added
 
 - Approve dialog references the transcript block instead of repeating its code: on the root session the ask dialog now names the call's block (`↑ bash · call 2 of 3 above · 2 lines`, plus the first non-blank line or the `path` as a one-line preview) using the call's position in its assistant message, recorded into `SessionState` (`notePosition`/`takePosition`, capped at 256 entries) from the streamed `message_update` `toolcall_end` event (omp dispatches `tool_call` before the assistant `message_end`) and from `message_end` for hosts that order it the other way. An unknown tool call id and every subagent ask keep the full code view. When the host exposes `ui.getToolsExpanded`/`setToolsExpanded`, the dialog hints `ctrl+o` `expand above` (pi delivers the key to the dialog, which toggles the expansion; omp toggles natively in a global listener) and restores the transcript expansion state seen at open when the dialog closes, whichever side toggled it. The protected-path dialog still shows `Protected path: <detail>` (ADR-0002).
