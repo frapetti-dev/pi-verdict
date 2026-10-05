@@ -2181,12 +2181,45 @@ export function blockReference(toolName: string, input: Record<string, unknown>,
 	return { title, preview };
 }
 
-/** Three lines: a probability bar (allow/ask/deny cells, largest-remainder rounding), a confidence bar (fill to jev confidence, tick at the confidence floor), and the legend. */
-export function renderJevBar(j: JevReason, minConfidence: number | null, width: number, theme: Pick<Theme, "fg" | "bold">): string[] {
+type ThemeFg = Parameters<Theme["fg"]>[0];
+
+type LabelItem = { center: number; text: string; color: ThemeFg; bold: boolean; priority: number };
+
+/** Places labels on one line of `cells` columns, each centered on `center` where possible, shifted to avoid overlap (one-space gap). Lowest-priority labels are dropped when they cannot all fit. */
+function placeLabels(items: LabelItem[], cells: number, theme: Pick<Theme, "fg" | "bold">): string {
+	const kept = [...items];
+	while (kept.length > 1 && kept.reduce((a, x) => a + [...x.text].length, 0) + kept.length - 1 > cells) {
+		let drop = 0;
+		for (let i = 1; i < kept.length; i++) if (kept[i].priority < kept[drop].priority) drop = i;
+		kept.splice(drop, 1);
+	}
+	const n = kept.length;
+	const len = kept.map((x) => [...x.text].length);
+	const start = kept.map((x, i) => Math.max(0, Math.min(Math.round(x.center - len[i] / 2), cells - len[i])));
+	for (let i = 1; i < n; i++) start[i] = Math.max(start[i], start[i - 1] + len[i - 1] + 1);
+	for (let i = n - 1; i >= 0; i--) {
+		const limit = i === n - 1 ? cells - len[i] : start[i + 1] - 1 - len[i];
+		start[i] = Math.max(0, Math.min(start[i], limit));
+	}
+	let out = "";
+	let pos = 0;
+	for (let i = 0; i < n; i++) {
+		out += " ".repeat(Math.max(0, start[i] - pos));
+		const s = theme.fg(kept[i].color, kept[i].text);
+		out += kept[i].bold ? theme.bold(s) : s;
+		pos = start[i] + len[i];
+	}
+	return out;
+}
+
+/** Four lines: probability labels (icon + %, centered on each segment), probability bar (allow/ask/deny cells, largest-remainder rounding, min 1 cell per non-zero verdict, pill caps with Nerd Font), confidence labels (confidence % centered on the fill, floor % on the tick), and the confidence bar (fill to jev confidence, tick at the confidence floor). */
+export function renderJevBar(j: JevReason, minConfidence: number | null, width: number, theme: Pick<Theme, "fg" | "bold">, nerdFont: boolean): string[] {
 	const cells = Math.max(10, Math.min(48, width));
 	const names = ["allow", "ask", "deny"] as const;
 	const colors = { allow: "success", ask: "warning", deny: "error" } as const;
+	const icons = nerdFont ? { allow: NF_CHECK, ask: NF_ASK, deny: NF_BAN } : { allow: "✓", ask: "?", deny: "✗" };
 	const sum = j.probabilities.allow + j.probabilities.ask + j.probabilities.deny;
+	let probLabels = "";
 	let bar: string;
 	if (sum === 0) {
 		bar = theme.fg("muted", "░".repeat(cells));
@@ -2200,14 +2233,37 @@ export function renderJevBar(j: JevReason, minConfidence: number | null, width: 
 			counts[i]++;
 			left--;
 		}
-		bar = names.map((k, i) => (counts[i] > 0 ? theme.fg(colors[k], "█".repeat(counts[i])) : "")).join("");
+		names.forEach((k, i) => {
+			if (j.probabilities[k] > 0 && counts[i] === 0) {
+				counts[counts.indexOf(Math.max(...counts))]--;
+				counts[i] = 1;
+			}
+		});
+		const cellColors: ThemeFg[] = [];
+		const items: LabelItem[] = [];
+		names.forEach((k, i) => {
+			if (counts[i] <= 0) return;
+			const p = j.probabilities[k];
+			items.push({ center: cellColors.length + counts[i] / 2, text: `${icons[k]} ${p}%`, color: colors[k], bold: k === j.choice, priority: k === j.choice ? Infinity : p });
+			for (let c = 0; c < counts[i]; c++) cellColors.push(colors[k]);
+		});
+		const glyphs = cellColors.map(() => "█");
+		if (nerdFont) {
+			glyphs[0] = NF_CAP_L;
+			glyphs[cells - 1] = NF_CAP_R;
+		}
+		bar = "";
+		for (let c = 0; c < cells; ) {
+			let e = c;
+			while (e < cells && cellColors[e] === cellColors[c]) e++;
+			bar += theme.fg(cellColors[c], glyphs.slice(c, e).join(""));
+			c = e;
+		}
+		probLabels = placeLabels(items, cells, theme);
 	}
-	const label = (k: (typeof names)[number]): string => {
-		const s = theme.fg(colors[k], `${k} ${j.probabilities[k]}%`);
-		return k === j.choice ? theme.bold(s) : s;
-	};
 	const filled = Math.round((Math.max(0, Math.min(100, j.confidence)) / 100) * cells);
 	const tick = minConfidence === null ? -1 : Math.min(cells - 1, Math.round((minConfidence / 100) * cells));
+	const fillColor: ThemeFg = minConfidence === null ? "accent" : j.confidence >= minConfidence ? "success" : "warning";
 	const runs: { kind: "fill" | "track" | "tick"; n: number }[] = [];
 	for (let i = 0; i < cells; i++) {
 		const kind = i === tick ? "tick" : i < filled ? "fill" : "track";
@@ -2218,15 +2274,16 @@ export function renderJevBar(j: JevReason, minConfidence: number | null, width: 
 	const confBar = runs
 		.map(({ kind, n }) =>
 			kind === "fill"
-				? theme.fg("border", "━".repeat(n))
+				? theme.fg(fillColor, "━".repeat(n))
 				: kind === "track"
-					? theme.fg("dim", "─".repeat(n))
-					: theme.fg("text", "┃".repeat(n)),
+					? theme.fg("borderMuted", "─".repeat(n))
+					: theme.bold(theme.fg("text", "┃".repeat(n))),
 		)
 		.join("");
-	const confText = minConfidence === null ? `confidence ${j.confidence}%` : `confidence ${j.confidence}% · min ${minConfidence}%`;
-	const legend = [...names.map(label), theme.fg("muted", confText)].join("  ");
-	return [bar, confBar, legend];
+	const confItems: LabelItem[] = [{ center: filled / 2, text: `${j.confidence}%`, color: fillColor, bold: false, priority: Infinity }];
+	if (minConfidence !== null) confItems.push({ center: tick + 0.5, text: `min ${minConfidence}%`, color: "muted", bold: false, priority: 0 });
+	confItems.sort((a, b) => a.center - b.center);
+	return [probLabels, bar, placeLabels(confItems, cells, theme), confBar];
 }
 
 type DialogModules = { tui: typeof PiTui; agent: typeof PiAgent };
@@ -2256,6 +2313,8 @@ interface ApproveDialogSpec {
 	jev: JevReason | null;
 	/** confidence floor (classifierMinConfidence) drawn as a tick on the jev confidence bar; null = floor off */
 	minConfidence: number | null;
+	/** footer === "full": Nerd Font glyphs in the jev bars */
+	nerdFont: boolean;
 	/** exact plain-text confirm() message used when the rich dialog is unavailable */
 	fallbackMessage: string;
 	/** offer the "Explain…" option (EXPLAIN-GATE role) */
@@ -2353,7 +2412,7 @@ export function buildApproveDialog(
 		root.addChild(new Spacer(1));
 		const jev = spec.jev;
 		if (jev) {
-			root.addChild({ render: (w: number) => renderJevBar(jev, spec.minConfidence, w - 2, theme).map((l) => ` ${l}`), invalidate() {} });
+			root.addChild({ render: (w: number) => renderJevBar(jev, spec.minConfidence, w - 2, theme, spec.nerdFont).map((l) => ` ${l}`), invalidate() {} });
 			if (jev.concern) root.addChild(new Text(theme.fg("muted", "concern: ") + jev.concern, 1, 0));
 			if (jev.rest) root.addChild(new Text(theme.fg("muted", displaySafe(jev.rest)), 1, 0));
 		} else {
@@ -2611,7 +2670,7 @@ export interface FooterInfo {
 }
 
 type ThemeBg = Parameters<Theme["bg"]>[0];
-type ThemeFg = Parameters<Theme["fg"]>[0];
+
 type FooterTheme = Pick<Theme, "fg" | "bold"> & Partial<Pick<Theme, "getBgAnsi" | "getFgAnsi">>;
 
 // Nerd Font (nf-fa) code points
@@ -2624,6 +2683,8 @@ const NF_ASK = "\uF128"; // ask count
 const NF_BAN = "\uF05E"; // deny count
 const NF_INFO = "\uF05A"; // info block
 const NF_THIN = "\uE0B1"; // powerline thin arrow: separator between items inside one block
+const NF_CAP_L = "\uE0B6"; // powerline left half-circle: probability bar cap
+const NF_CAP_R = "\uE0B4"; // powerline right half-circle: probability bar cap
 
 export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full" | "compact"): string {
 	const { classifier, fallback } = info;
@@ -2769,6 +2830,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				question: "Allow this access?",
 				jev: null,
 				minConfidence: null,
+				nerdFont: state.userRules.footer === "full",
 				fallbackMessage: `${action}\n\n${v.reason}\n\nProtected path: ${v.detail ?? "(see pi-verdict.json)"}\n\nAllow this access?`,
 				...(opts.blockRef ? { blockRef: opts.blockRef } : {}),
 			}, { signal: opts.signal });
@@ -2791,6 +2853,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			question: "Allow execution?",
 			jev: v.source === "classifier" ? parseJevReason(v.reason) : null,
 			minConfidence: state.userRules.classifierMinConfidence,
+			nerdFont: state.userRules.footer === "full",
 			fallbackMessage: `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`,
 			...(opts.blockRef ? { blockRef: opts.blockRef } : {}),
 		}, { signal: opts.signal, explain: (question) => explainAsk(opts.ctx, call, action, reasonLine, question) });
