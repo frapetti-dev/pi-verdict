@@ -1583,11 +1583,47 @@ export class SessionState {
 	private readonly agentDir: string | null;
 	/** Final pipeline verdicts this session (root calls only; an ask counts once whatever the user answers). Reset on session start, kept across /verdict reloads. */
 	verdictCounts = { allow: 0, ask: 0, deny: 0 };
+	/** Position of each tool call in its assistant message (from `message_end`), consumed once by the ask dialog. */
+	private readonly toolPositions = new Map<string, { index: number; total: number }>();
+	/** Result trailer per allowed tool call, consumed once by `tool_result`. */
+	private readonly trailers = new Map<string, string>();
 
 	constructor(userRules: UserRules = loadUserRules().rules, agentDir: string | null = null) {
 		this.userRules = userRules;
 		this.agentDir = agentDir;
 		this.audit = this.makeAudit(userRules);
+	}
+
+	/** Insert-or-replace with a hard cap: blocked calls never reach `tool_result` and headless sessions never open a dialog, so unconsumed entries are dropped oldest-first. */
+	private remember<V>(map: Map<string, V>, key: string, value: V): void {
+		map.set(key, value);
+		while (map.size > 256) {
+			const oldest = map.keys().next();
+			if (oldest.done) break;
+			map.delete(oldest.value);
+		}
+	}
+
+	notePosition(id: string, pos: { index: number; total: number }): void {
+		this.remember(this.toolPositions, id, pos);
+	}
+
+	/** Get-and-delete the batch position of tool call `id`. */
+	takePosition(id: string): { index: number; total: number } | undefined {
+		const pos = this.toolPositions.get(id);
+		this.toolPositions.delete(id);
+		return pos;
+	}
+
+	noteTrailer(id: string, text: string): void {
+		this.remember(this.trailers, id, text);
+	}
+
+	/** Get-and-delete the result trailer of tool call `id`. */
+	takeTrailer(id: string): string | undefined {
+		const text = this.trailers.get(id);
+		this.trailers.delete(id);
+		return text;
 	}
 
 	/** #54: the audit flag follows the rules (applies to new sessions); the dir is anchored to the install path */
@@ -1612,6 +1648,8 @@ export class SessionState {
 		this.shadow.reset();
 		this.fallback.reset();
 		this.verdictCounts = { allow: 0, ask: 0, deny: 0 };
+		this.toolPositions.clear();
+		this.trailers.clear();
 		return report;
 	}
 
@@ -2105,6 +2143,9 @@ export function approveCodeMarkdown(
 	if (typeof input.command === "string") {
 		return { header: displaySafe(toolName), markdown: fencedBlock(input.command, "bash") };
 	}
+	if (typeof input.code === "string") {
+		return { header: displaySafe(toolName), markdown: fencedBlock(input.code, input.language === "py" ? "python" : input.language === "js" ? "javascript" : "") };
+	}
 	if (typeof input.path === "string" && typeof input.content === "string") {
 		return { header: displaySafe(`${toolName}: ${input.path}`), markdown: fencedBlock(input.content, langFromPath(input.path) ?? "") };
 	}
@@ -2119,6 +2160,25 @@ export function approveCodeMarkdown(
 		return { header: displaySafe(`${toolName}: ${input.path} (${n} edit${n === 1 ? "" : "s"})`), markdown: parts.join("\n\n") };
 	}
 	return null;
+}
+
+/** Reference to the tool call's block already shown in the host transcript above the dialog (the code is not repeated).
+ *  `pos` is the call's position in its assistant message, so parallel calls stay distinguishable. */
+export function blockReference(toolName: string, input: Record<string, unknown>, pos: { index: number; total: number }): { title: string; preview: string | null } {
+	const body = [input.command, input.code, input.content].find((v): v is string => typeof v === "string") ?? null;
+	const lineCount = body === null ? 0 : body.split("\n").length;
+	const title = `↑ ${displaySafe(toolName)}${pos.total > 1 ? ` · call ${pos.index + 1} of ${pos.total}` : ""} above${lineCount > 1 ? ` · ${lineCount} lines` : ""}`;
+	let preview: string | null = null;
+	if (typeof input.path === "string") {
+		preview = displaySafe(input.path);
+	} else if (body !== null) {
+		const first = body.split("\n").find((l) => l.trim() !== "");
+		if (first !== undefined) {
+			const t = displaySafe(first.trim());
+			preview = t.length > 100 ? `${t.slice(0, 100)}…` : t;
+		}
+	}
+	return { title, preview };
 }
 
 /** Three lines: a probability bar (allow/ask/deny cells, largest-remainder rounding), a confidence bar (fill to jev confidence, tick at the confidence floor), and the legend. */
@@ -2202,6 +2262,10 @@ interface ApproveDialogSpec {
 	explain?: boolean;
 	/** latest EXPLAIN-GATE answer, rendered between the reason and the options */
 	explanation?: string;
+	/** The call's block is in the root transcript above the dialog: show this reference instead of repeating the code. */
+	blockRef?: { title: string; preview: string | null };
+	/** Toggles the host's tool-output expansion (ctrl+o inside the dialog; only offered together with `blockRef`). */
+	toggleExpanded?: () => void;
 }
 
 /** What the dialog resolves with: the two plain answers, or a request for follow-up input. */
@@ -2274,12 +2338,17 @@ export function buildApproveDialog(
 		root.addChild(new Spacer(1));
 		root.addChild(new Text(theme.fg("accent", theme.bold(displaySafe(spec.title))), 1, 0));
 		root.addChild(new Spacer(1));
-		const code = approveCodeMarkdown(spec.toolName, spec.input, getLanguageFromPath);
-		if (code) {
-			root.addChild(new Text(theme.fg("toolTitle", theme.bold(code.header)), 1, 0));
-			root.addChild(new Markdown(code.markdown, 1, 0, getMarkdownTheme()));
+		if (spec.blockRef) {
+			root.addChild(new Text(theme.fg("toolTitle", theme.bold(spec.blockRef.title)), 1, 0));
+			if (spec.blockRef.preview !== null) root.addChild(new Text(theme.fg("muted", spec.blockRef.preview), 1, 0));
 		} else {
-			root.addChild(new Text(displaySafe(spec.action), 1, 0));
+			const code = approveCodeMarkdown(spec.toolName, spec.input, getLanguageFromPath);
+			if (code) {
+				root.addChild(new Text(theme.fg("toolTitle", theme.bold(code.header)), 1, 0));
+				root.addChild(new Markdown(code.markdown, 1, 0, getMarkdownTheme()));
+			} else {
+				root.addChild(new Text(displaySafe(spec.action), 1, 0));
+			}
 		}
 		root.addChild(new Spacer(1));
 		const jev = spec.jev;
@@ -2308,7 +2377,8 @@ export function buildApproveDialog(
 		updateList();
 		root.addChild(list);
 		root.addChild(new Spacer(1));
-		root.addChild(new Text(`${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`, 1, 0));
+		const expandHint = spec.blockRef && spec.toggleExpanded ? `  ${rawKeyHint("ctrl+o", "expand above")}` : "";
+		root.addChild(new Text(`${rawKeyHint("↑↓", "navigate")}${expandHint}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`, 1, 0));
 		root.addChild(new Spacer(1));
 		root.addChild(new DynamicBorder());
 		// Record which choice each rendered line belongs to, so a click row can be mapped back to an option.
@@ -2360,6 +2430,12 @@ export function buildApproveDialog(
 			}
 			if (data.startsWith("\x1b[M")) return; // legacy X10 mouse: ignore, never treat as keys
 			armed = undefined;
+			// ctrl+o reaches the focused dialog, never the host's own expand binding
+			if (spec.toggleExpanded && (typeof mods.tui.matchesKey === "function" ? mods.tui.matchesKey(data, "ctrl+o") : data === "\x0f")) {
+				spec.toggleExpanded();
+				tui.requestRender();
+				return;
+			}
 			const kb = getKeybindings();
 			if (kb.matches(data, "tui.select.up") || data === "k") {
 				index = Math.max(0, index - 1);
@@ -2393,16 +2469,22 @@ async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSig
 	let finish: ((r: AskChoice | undefined) => void) | undefined;
 	const onAbort = (): void => finish?.(undefined);
 	signal?.addEventListener("abort", onAbort, { once: true });
+	// ctrl+o expands the transcript block the dialog points at. pi delivers the key to the focused dialog (spec.toggleExpanded);
+	// omp toggles natively in a global input listener before the dialog sees it. Either way the user's view is restored on close.
+	const canToggle = !!spec.blockRef && typeof ui.getToolsExpanded === "function" && typeof ui.setToolsExpanded === "function";
+	const initialExpanded = canToggle ? ui.getToolsExpanded() : undefined;
+	const shown: ApproveDialogSpec = canToggle ? { ...spec, toggleExpanded: () => ui.setToolsExpanded(!ui.getToolsExpanded()) } : spec;
 	try {
 		const r = await ui.custom<AskChoice | undefined>((tui, theme, _kb, done) => {
 			finish = done;
-			const dialog = buildApproveDialog(mods, tui, theme, spec, done);
+			const dialog = buildApproveDialog(mods, tui, theme, shown, done);
 			if (signal?.aborted) queueMicrotask(() => done(undefined));
 			return dialog;
 		});
 		return isAskChoice(r) ? r : undefined;
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
+		if (initialExpanded !== undefined && ui.getToolsExpanded() !== initialExpanded) ui.setToolsExpanded(initialExpanded);
 	}
 }
 
@@ -2640,7 +2722,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Verdict → UI(本扩展唯一的裁决呈现点):按 source × degraded 查模板,文案与
 	 *  重构前逐字节一致。受保护路径分支的通知永不携带路径明文与 action 行
 	 *  (ADR-0002 story 11:通知与 block reason 回流 agent context)。 */
-	async function presentVerdict(v: Verdict, call: { toolName: string; input: Record<string, unknown> }, action: string, ui: UiContext, opts: { label: string | null; signal?: AbortSignal; ctx: ExtensionContext }): Promise<{ block: true; reason: string } | undefined | "aborted"> {
+	async function presentVerdict(v: Verdict, call: { toolName: string; input: Record<string, unknown> }, action: string, ui: UiContext, opts: { label: string | null; signal?: AbortSignal; ctx: ExtensionContext; blockRef?: { title: string; preview: string | null } }): Promise<{ block: true; reason: string } | undefined | "aborted"> {
 		const note = (msg: string, level: "info" | "warning" | "error"): void => ui.notify(opts.label ? msg.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : msg, level);
 		const titled = (t: string): string => (opts.label ? t.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : t);
 		if (v.verdict === "allow") {
@@ -2688,6 +2770,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				jev: null,
 				minConfidence: null,
 				fallbackMessage: `${action}\n\n${v.reason}\n\nProtected path: ${v.detail ?? "(see pi-verdict.json)"}\n\nAllow this access?`,
+				...(opts.blockRef ? { blockRef: opts.blockRef } : {}),
 			}, { signal: opts.signal });
 			if (d === "aborted") return "aborted";
 			if (d.allow) {
@@ -2709,6 +2792,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			jev: v.source === "classifier" ? parseJevReason(v.reason) : null,
 			minConfidence: state.userRules.classifierMinConfidence,
 			fallbackMessage: `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`,
+			...(opts.blockRef ? { blockRef: opts.blockRef } : {}),
 		}, { signal: opts.signal, explain: (question) => explainAsk(opts.ctx, call, action, reasonLine, question) });
 		if (d === "aborted") return "aborted";
 		return d.allow ? undefined : { block: true, reason: blockedReason("user-declined", declineDetail("user declined", d.reason)) };
@@ -3210,6 +3294,30 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		return toolCallLine(toolName, input);
 	}
 
+	// Batch position of every tool call, so an ask dialog can say "call 2 of 3" instead of repeating the code.
+	// Runs even while disabled: cheap, and keeps positions right after a toggle.
+	const noteBatch = (raw: unknown): void => {
+		const message = raw as { role?: unknown; content?: unknown } | undefined;
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+		const ids = (message.content as { type?: unknown; id?: unknown }[]).filter((c) => c?.type === "toolCall" && typeof c.id === "string").map((c) => c.id as string);
+		ids.forEach((id, index) => state.notePosition(id, { index, total: ids.length }));
+	};
+	// omp dispatches `tool_call` (via `beforeToolCall`) BEFORE the assistant message's `message_end`, so the streamed
+	// `toolcall_end` update is the first point where the batch is known; `message_end` covers hosts that order it the other way.
+	pi.on("message_update", (event) => {
+		if ((event.assistantMessageEvent as { type?: unknown } | undefined)?.type === "toolcall_end") noteBatch(event.message);
+	});
+	pi.on("message_end", (event) => noteBatch(event.message));
+
+	// Verdict status inside the block: a trailer content item on the result of every allowed gated call.
+	// No reason text and no path, so nothing protected reaches the agent (ADR-0002).
+	pi.on("tool_result", (event) => {
+		const t = typeof event.toolCallId === "string" ? state.takeTrailer(event.toolCallId) : undefined;
+		if (t === undefined) return undefined;
+		// leading newline: omp concatenates a result's text items without a separator
+		return { content: [...event.content, { type: "text" as const, text: `\n${t}` }] };
+	});
+
 	pi.on("tool_call", async (event, ctx) => {
 		if (!enabled) return undefined;
 
@@ -3223,6 +3331,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const input = event.input as Record<string, unknown>;
 		const call = { toolName: event.toolName, input };
 		const action = describeAction(event.toolName, input);
+		const callId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+		// Root asks point at the call's block in the transcript (subagent blocks are not there: they keep the full code)
+		const pos = callId === undefined || sub ? undefined : state.takePosition(callId);
+		const blockRef = pos ? blockReference(event.toolName, input, pos) : undefined;
+		const allowedTrailer = (v: Verdict): string => (v.verdict === "ask" ? "[auto-mode] approved by user" : v.source === "classifier" ? "[auto-mode] allowed: classifier" : "[auto-mode] allowed: rule");
+		const noteAllowed = (text: string): void => {
+			if (callId !== undefined) state.noteTrailer(callId, text);
+		};
 
 		// Live status (root session + UI only): one widget row above the editor while a model call runs.
 		// Text is phase + tool name + model id only; never command or path text (ADR-0002).
@@ -3270,9 +3386,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const lateWarning = state.audit?.drainWarning();
 			if (lateWarning) warn(`pi-verdict: ${lateWarning}`);
 		};
-		const present = async (signal?: AbortSignal): Promise<{ block: true; reason: string } | undefined | "aborted"> => {
+		type Presented = { block: true; reason: string } | undefined | "aborted";
+		const present = async (signal?: AbortSignal): Promise<Presented> => {
 			try {
-				return await presentVerdict(verdict, call, action, ui ?? ctx.ui, { label, signal, ctx });
+				return await presentVerdict(verdict, call, action, ui ?? ctx.ui, { label, signal, ctx, ...(blockRef ? { blockRef } : {}) });
 			} catch (err) {
 				if (verdict.pendingAudit) state.audit?.append(verdict.pendingAudit);
 				throw err;
@@ -3285,14 +3402,24 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 		// Root session (and pi): unchanged behavior; no signal is passed, so "aborted" cannot occur
 		if (!sub) {
-			const r = await present();
+			// the awaiting row names the tool only (never command or path text, ADR-0002)
+			const awaiting = verdict.verdict === "ask" && statusUi !== null;
+			if (awaiting) statusUi.setWidget(STATUS_WIDGET_KEY, [statusUi.theme.fg("warning", `🛡️ verdict: awaiting your approval · ${event.toolName}`)]);
+			let r: Presented;
+			try {
+				r = await present();
+			} finally {
+				if (awaiting) statusUi.setWidget(STATUS_WIDGET_KEY, undefined);
+			}
 			const presented = r === "aborted" ? { block: true as const, reason: blockedReason("user-declined", "user declined") } : r;
 			finalize(answerAudit(presented));
+			if (presented === undefined) noteAllowed(allowedTrailer(verdict));
 			return presented;
 		}
 
 		if (verdict.verdict !== "ask") {
 			const r = await present();
+			if (r === undefined) noteAllowed(allowedTrailer(verdict));
 			return r === "aborted" ? undefined : r;
 		}
 
@@ -3303,6 +3430,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const out = (ui ?? ctx.ui).notify.bind(ui ?? ctx.ui);
 			if (res.verdict === "allow") {
 				if (debug || state.userRules.notifyAllows) out(`🛡️ [${label}] allow (second model, no human): ${res.reason}\n  ${action}`, "info");
+				noteAllowed("[auto-mode] allowed: second model (no human)");
 				return undefined;
 			}
 			// no path plaintext in notifications (ADR-0002): protected-path asks omit the action line
@@ -3316,6 +3444,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const r = await present(signal);
 			if (r !== "aborted") {
 				finalize({ ...answerAudit(r), subagent: { ...sub, resolution: "human" } });
+				if (r === undefined) noteAllowed("[auto-mode] approved by user");
 				return r;
 			}
 			if (ctx.signal?.aborted) {

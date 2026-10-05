@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, blockReference, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
 
 // ── 桩设施 ──────────────────────────────────────────────
 
@@ -151,7 +151,26 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 }
 
 const userMsg = (h: Harness, t: string) => h.branch.push({ type: "message", message: { role: "user", content: t } });
-const toolCall = (h: Harness, toolName: string, input: any) => h.handlers.tool_call({ toolName, input }, h.ctx);
+const toolCall = (h: Harness, toolName: string, input: any, toolCallId?: string) => h.handlers.tool_call({ toolName, input, ...(toolCallId === undefined ? {} : { toolCallId }) }, h.ctx);
+
+const ANSI = /\x1b\[[0-9;]*m/g;
+type DialogComponent = { render(width: number): string[]; handleInput(data: string): void };
+type DialogFactory = (tui: { requestRender(): void }, theme: { fg(c: string, t: string): string; bold(t: string): string }, kb: undefined, done: (r: unknown) => void) => DialogComponent;
+
+/** Each ui.custom call replays the next key script against the real dialog component and records its render; an exhausted script list presses Escape. */
+function driveDialogs(h: Harness, scripts: string[][], rendered: string[]): void {
+	h.ctx.ui.custom = async (factory: DialogFactory) => {
+		const { initTheme } = await import("@earendil-works/pi-coding-agent");
+		initTheme("dark", false);
+		const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+		const keys = scripts.shift() ?? ["\x1b"];
+		return new Promise((resolve) => {
+			const component = factory({ requestRender() {} }, fakeTheme, undefined, resolve);
+			rendered.push(component.render(80).join("\n").replace(ANSI, ""));
+			for (const k of keys) component.handleInput(k);
+		});
+	};
+}
 
 /** 开一个会话:按 cfg 写真实配置 → 建 harness → 装载扩展。顺序约束(配置先于装载)
  *  内化于此;opts 统一收纳全部变体:cwd/ompRegistry 给 makeHarness,
@@ -2800,27 +2819,8 @@ describe("approve dialog routing", () => {
 });
 
 describe("EXPLAIN-GATE role and decline explanation", () => {
-	const ANSI = /\x1b\[[0-9;]*m/g;
 	const DOWN = "\x1b[B";
 	const ASK = { text: "<verdict>ask</verdict> needs a human" };
-
-	type DialogComponent = { render(width: number): string[]; handleInput(data: string): void };
-	type DialogFactory = (tui: { requestRender(): void }, theme: { fg(c: string, t: string): string; bold(t: string): string }, kb: undefined, done: (r: unknown) => void) => DialogComponent;
-
-	/** Each ui.custom call replays the next key script against the real dialog component and records its render; an exhausted script list presses Escape. */
-	function driveDialogs(h: Harness, scripts: string[][], rendered: string[]): void {
-		h.ctx.ui.custom = async (factory: DialogFactory) => {
-			const { initTheme } = await import("@earendil-works/pi-coding-agent");
-			initTheme("dark", false);
-			const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
-			const keys = scripts.shift() ?? ["\x1b"];
-			return new Promise((resolve) => {
-				const component = factory({ requestRender() {} }, fakeTheme, undefined, resolve);
-				rendered.push(component.render(80).join("\n").replace(ANSI, ""));
-				for (const k of keys) component.handleInput(k);
-			});
-		};
-	}
 
 	test("the dialog offers the explanation-decline option; Explain only for asks whose content may reach a model", async () => {
 		const h = session({});
@@ -3325,7 +3325,7 @@ describe("live classifier status widget", () => {
 		expect(h.widgetSets.at(-1)).toEqual(CLEAR);
 	});
 
-	test("row is cleared before the confirm dialog opens", async () => {
+	test("row shows awaiting approval while the dialog is open, cleared after", async () => {
 		const h = session({});
 		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
 		let atConfirm: Array<[string, string[] | undefined]> = [];
@@ -3336,7 +3336,9 @@ describe("live classifier status widget", () => {
 		};
 		await toolCall(h, "bash", { command: "cargo build" });
 		expect(h.confirms).toBe(1);
-		expect(atConfirm.at(-1)).toEqual(CLEAR);
+		expect(atConfirm.at(-1)![1]![0]).toContain("awaiting your approval · bash");
+		expect(JSON.stringify(atConfirm)).not.toContain("cargo build");
+		expect(h.widgetSets.at(-1)).toEqual(CLEAR);
 	});
 
 	test("fallback cascade shows a second row naming the fallback model", async () => {
@@ -3346,9 +3348,10 @@ describe("live classifier status widget", () => {
 		h.confirmAnswer = true;
 		await toolCall(h, "bash", { command: "ls -la /tmp" });
 		const rows = h.widgetSets.filter(([, c]) => c !== undefined).map(([, c]) => c![0]);
-		expect(rows).toHaveLength(2);
+		expect(rows).toHaveLength(3);
 		expect(rows[0]).toContain("classifying bash via mock/glm");
 		expect(rows[1]).toContain("fallback classifier fb-model");
+		expect(rows[2]).toContain("awaiting your approval"); // the demoted allow becomes an ask
 		expect(h.widgetSets.at(-1)).toEqual(CLEAR);
 	});
 
@@ -3376,5 +3379,132 @@ describe("live classifier status widget", () => {
 		} finally {
 			await root.handlers["session_shutdown"]({}, root.ctx);
 		}
+	});
+});
+
+describe("approve dialog block reference and verdict trailer", () => {
+	const ASK = { text: "<verdict>ask</verdict> needs a human" };
+	const CODE = "echo a\necho MARKER2";
+	const batch = (h: Harness, ids: string[]) =>
+		h.handlers.message_end({ message: { role: "assistant", content: [{ type: "text", text: "go" }, ...ids.map((id) => ({ type: "toolCall", id, name: "bash", arguments: {} }))] } }, h.ctx);
+	const result = (h: Harness, id: string) => h.handlers.tool_result({ toolCallId: id, toolName: "bash", content: [{ type: "text", text: "out" }], isError: false }, h.ctx);
+
+	test("the dialog names the block by its position in the batch and does not repeat the code", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		batch(h, ["t1", "t2", "t3"]);
+		const rendered: string[] = [];
+		driveDialogs(h, [["\r"]], rendered);
+		const r = await toolCall(h, "bash", { command: CODE }, "t2");
+		expect(r).toBeUndefined();
+		expect(rendered[0]).toContain("↑ bash · call 2 of 3 above · 2 lines");
+		expect(rendered[0]).toContain("echo a");
+		expect(rendered[0]).not.toContain("MARKER2");
+	});
+
+	test("unknown call id falls back to the full code", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		const rendered: string[] = [];
+		driveDialogs(h, [["\r"]], rendered);
+		await toolCall(h, "bash", { command: CODE }, "zz");
+		expect(rendered[0]).toContain("MARKER2");
+		expect(rendered[0]).not.toContain("above");
+	});
+
+	test("rule allow appends a trailer item once", async () => {
+		const h = session({ allow: ["^ls\\b"] });
+		expect(await toolCall(h, "bash", { command: "ls" }, "c1")).toBeUndefined();
+		const r = await result(h, "c1");
+		expect(r.content).toHaveLength(2);
+		expect(r.content[0].text).toBe("out");
+		expect(r.content[1]).toEqual({ type: "text", text: "\n[auto-mode] allowed: rule" });
+		expect(await result(h, "c1")).toBeUndefined();
+	});
+
+	test("classifier allow and user approval are told apart; denied calls leave no trailer", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>allow</verdict> fine" }];
+		await toolCall(h, "bash", { command: "cargo check" }, "c1");
+		expect((await result(h, "c1")).content[1].text).toBe("\n[auto-mode] allowed: classifier");
+
+		h.responses = [ASK];
+		driveDialogs(h, [["\r"]], []);
+		expect(await toolCall(h, "bash", { command: "cargo build" }, "c2")).toBeUndefined();
+		expect((await result(h, "c2")).content[1].text).toBe("\n[auto-mode] approved by user");
+
+		const denied = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }, "c3");
+		expect(denied?.block).toBe(true);
+		expect(await result(h, "c3")).toBeUndefined();
+
+		h.responses = [ASK];
+		driveDialogs(h, [["\x1b"]], []); // Escape = No
+		expect((await toolCall(h, "bash", { command: "cargo build" }, "c4"))?.block).toBe(true);
+		expect(await result(h, "c4")).toBeUndefined();
+	});
+
+	test("ctrl+o toggles the host's tool expansion inside the dialog and restores it on close", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		batch(h, ["t1", "t2"]);
+		let expanded = false;
+		const sets: boolean[] = [];
+		h.ctx.ui.getToolsExpanded = () => expanded;
+		h.ctx.ui.setToolsExpanded = (v: boolean) => {
+			expanded = v;
+			sets.push(v);
+		};
+		const rendered: string[] = [];
+		driveDialogs(h, [["\x0f", "\r"]], rendered);
+		expect(await toolCall(h, "bash", { command: CODE }, "t1")).toBeUndefined();
+		expect(rendered[0]).toContain("expand above");
+		expect(sets).toEqual([true, false]);
+	});
+
+	test("expansion the host toggles natively while the dialog is open (omp) is restored on close", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		batch(h, ["t1"]);
+		let expanded = false;
+		const sets: boolean[] = [];
+		h.ctx.ui.getToolsExpanded = () => expanded;
+		h.ctx.ui.setToolsExpanded = (v: boolean) => {
+			expanded = v;
+			sets.push(v);
+		};
+		driveDialogs(h, [["\r"]], []);
+		const drive = h.ctx.ui.custom;
+		h.ctx.ui.custom = (factory: DialogFactory) => {
+			const wrapped: DialogFactory = (tui, theme, kb, done) => {
+				expanded = true; // the host's own ctrl+o listener fired; the dialog never saw the key
+				return factory(tui, theme, kb, done);
+			};
+			return drive(wrapped);
+		};
+		expect(await toolCall(h, "bash", { command: CODE }, "t1")).toBeUndefined();
+		expect(expanded).toBe(false);
+		expect(sets).toEqual([false]);
+	});
+
+	test("no expand hint when the host cannot toggle expansion", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		batch(h, ["t1"]);
+		const rendered: string[] = [];
+		driveDialogs(h, [["\r"]], rendered);
+		await toolCall(h, "bash", { command: CODE }, "t1");
+		expect(rendered[0]).toContain("↑ bash above · 2 lines"); // single call: no ordinal
+		expect(rendered[0]).not.toContain("expand above");
+	});
+
+	test("blockReference: path preview, long first line cut, no body", () => {
+		expect(blockReference("write", { path: "/proj/a.ts", content: "x\ny\nz" }, { index: 0, total: 2 })).toEqual({ title: "↑ write · call 1 of 2 above · 3 lines", preview: "/proj/a.ts" });
+		expect(blockReference("bash", { command: "\n  " + "x".repeat(130) }, { index: 0, total: 1 }).preview).toBe("x".repeat(100) + "…");
+		expect(blockReference("read", {}, { index: 0, total: 1 })).toEqual({ title: "↑ read above", preview: null });
+	});
+
+	test("eval code is shown as a fenced block", () => {
+		const md = approveCodeMarkdown("eval", { language: "py", code: "print(1)" }, () => undefined)!.markdown;
+		expect(md).toContain("```python\nprint(1)");
 	});
 });
