@@ -40,7 +40,13 @@ interface Harness {
 	inputs: Array<string | undefined>;
 	editors: Array<string | undefined>;
 	findMap: Record<string, any> | undefined;
-	install: (opts?: { flag?: boolean; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> }) => void;
+	/** `pi.sendMessage` calls (omp label path) */
+	sent: Array<{ message: any; options: any }>;
+	/** `pi.appendEntry` calls (pi label path) */
+	entries: Array<[string, any]>;
+	messageRenderers: Record<string, any>;
+	entryRenderers: Record<string, any>;
+	install: (opts?: { flag?: boolean; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }>; ompHost?: boolean }) => void;
 }
 
 function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): Harness {
@@ -53,7 +59,11 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 	const fgCalls: Array<[string, string]> = [];
 	let flags: Record<string, unknown> = {};
 	const branch: any[] = [];
-	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined };
+	const sent: Array<{ message: any; options: any }> = [];
+	const entries: Array<[string, any]> = [];
+	const messageRenderers: Record<string, any> = {};
+	const entryRenderers: Record<string, any> = {};
+	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined };
 	h.widgetSets = widgetSets;
 
 	const ctx: any = {
@@ -105,7 +115,10 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 			on: (e: string, fn: any) => { handlers[e] = fn; },
 			registerCommand: (n: string, c: any) => { commands[n] = c; },
 			registerShortcut: (k: string, o: any) => { shortcuts[k] = o; },
-			...(opts?.ompHost ? { logger: {}, typebox: {} } : {}),
+			registerMessageRenderer: (t: string, r: any) => { messageRenderers[t] = r; },
+			sendMessage: (message: any, options: any) => { sent.push({ message, options }); },
+			appendEntry: (t: string, data: any) => { entries.push([t, data]); },
+			...(opts?.ompHost ? { logger: {}, typebox: {} } : { registerEntryRenderer: (t: string, r: any) => { entryRenderers[t] = r; } }),
 		} as any, opts?.compatLoader ? { compatLoader: opts.compatLoader } : {});
 		if (prev !== undefined) process.env.PI_AUTO_MODE_DEBUG = prev; else delete process.env.PI_AUTO_MODE_DEBUG;
 	};
@@ -175,10 +188,10 @@ function driveDialogs(h: Harness, scripts: string[][], rendered: string[]): void
 /** 开一个会话:按 cfg 写真实配置 → 建 harness → 装载扩展。顺序约束(配置先于装载)
  *  内化于此;opts 统一收纳全部变体:cwd/ompRegistry 给 makeHarness,
  *  invalid/flag/debug/modelFlag/compatLoader 分别传给 setConfig 与 install。 */
-function session(cfg: Parameters<typeof setConfig>[0], opts: { cwd?: string; ompRegistry?: boolean; invalid?: string[]; flag?: boolean; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> } = {}): Harness {
+function session(cfg: Parameters<typeof setConfig>[0], opts: { cwd?: string; ompRegistry?: boolean; ompHost?: boolean; invalid?: string[]; flag?: boolean; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> } = {}): Harness {
 	setConfig(cfg, opts.invalid);
 	const h = makeHarness(opts.cwd, { ompRegistry: opts.ompRegistry });
-	h.install({ flag: opts.flag, debug: opts.debug, modelFlag: opts.modelFlag, compatLoader: opts.compatLoader });
+	h.install({ flag: opts.flag, debug: opts.debug, modelFlag: opts.modelFlag, compatLoader: opts.compatLoader, ompHost: opts.ompHost });
 	return h;
 }
 
@@ -3420,7 +3433,7 @@ describe("live classifier status widget", () => {
 	});
 });
 
-describe("approve dialog block reference and verdict trailer", () => {
+describe("approve dialog block reference and verdict label", () => {
 	const ASK = { text: "<verdict>ask</verdict> needs a human" };
 	const CODE = "echo a\necho MARKER2";
 	const batch = (h: Harness, ids: string[]) =>
@@ -3450,26 +3463,30 @@ describe("approve dialog block reference and verdict trailer", () => {
 		expect(rendered[0]).not.toContain("above");
 	});
 
-	test("rule allow appends a trailer item once", async () => {
+	const LABEL_THEME = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+	const JEV_ALLOW_92 = "<verdict>allow</verdict> jev: allow 92% (confidence 85%; ask 5%, deny 3%)";
+
+	test("pi: rule allow records one TUI-only label entry and leaves the result untouched", async () => {
 		const h = session({ allow: ["^ls\\b"] });
 		expect(await toolCall(h, "bash", { command: "ls" }, "c1")).toBeUndefined();
-		const r = await result(h, "c1");
-		expect(r.content).toHaveLength(2);
-		expect(r.content[0].text).toBe("out");
-		expect(r.content[1]).toEqual({ type: "text", text: "\n[auto-mode] allowed: rule" });
 		expect(await result(h, "c1")).toBeUndefined();
+		expect(h.entries).toEqual([["pi-verdict-label", { tool: "bash", how: "rule", jev: null }]]);
+		expect(await result(h, "c1")).toBeUndefined();
+		expect(h.entries).toHaveLength(1);
+		expect(h.sent).toEqual([]);
 	});
 
-	test("classifier allow and user approval are told apart; denied calls leave no trailer", async () => {
+	test("pi: classifier allow and user approval are told apart; denied calls leave no label", async () => {
 		const h = session({});
 		h.responses = [{ text: "<verdict>allow</verdict> fine" }];
 		await toolCall(h, "bash", { command: "cargo check" }, "c1");
-		expect((await result(h, "c1")).content[1].text).toBe("\n[auto-mode] allowed: classifier");
+		await result(h, "c1");
 
 		h.responses = [ASK];
 		driveDialogs(h, [["\r"]], []);
 		expect(await toolCall(h, "bash", { command: "cargo build" }, "c2")).toBeUndefined();
-		expect((await result(h, "c2")).content[1].text).toBe("\n[auto-mode] approved by user");
+		await result(h, "c2");
+		expect(h.entries.map((e) => e[1].how)).toEqual(["classifier", "user"]);
 
 		const denied = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }, "c3");
 		expect(denied?.block).toBe(true);
@@ -3479,6 +3496,56 @@ describe("approve dialog block reference and verdict trailer", () => {
 		driveDialogs(h, [["\x1b"]], []); // Escape = No
 		expect((await toolCall(h, "bash", { command: "cargo build" }, "c4"))?.block).toBe(true);
 		expect(await result(h, "c4")).toBeUndefined();
+		expect(h.entries).toHaveLength(2);
+	});
+
+	test("omp: rule allow sends an aside custom message, never a pi entry", async () => {
+		const h = session({ allow: ["^ls\\b"] }, { ompHost: true });
+		expect(await toolCall(h, "bash", { command: "ls" }, "c1")).toBeUndefined();
+		expect(await result(h, "c1")).toBeUndefined();
+		expect(h.sent).toEqual([
+			{
+				message: { customType: "pi-verdict-label", content: "[auto-mode] bash allowed: rule", display: true, details: { tool: "bash", how: "rule", jev: null } },
+				options: { deliverAs: "aside" },
+			},
+		]);
+		expect(h.entries).toEqual([]);
+	});
+
+	test("omp: jev verdict carries numbers and renders a bar that drops on narrow widths", async () => {
+		const h = session({}, { ompHost: true });
+		h.responses = [{ text: JEV_ALLOW_92 }];
+		await toolCall(h, "bash", { command: "cargo check" }, "c1");
+		await result(h, "c1");
+		const msg = h.sent[0].message;
+		expect(msg.content).toBe("[auto-mode] bash allowed: classifier · jev allow 92%");
+		expect(msg.details.jev).toEqual({ choice: "allow", probabilities: { allow: 92, ask: 5, deny: 3 }, confidence: 85 });
+		const component = h.messageRenderers["pi-verdict-label"](msg, { expanded: false }, LABEL_THEME);
+		const wide = component.render(80)[0];
+		for (const s of ["\uF132", "bash", "classifier", "allow 92%", "\uE0B6", "\uE0B4"]) expect(wide).toContain(s);
+		const narrow = component.render(30)[0];
+		expect(narrow).toContain("classifier");
+		expect(narrow).not.toContain("92%");
+	});
+
+	test("omp: compact footer uses emoji and a 10-cell 8/1/1 bar", async () => {
+		const h = session({ footer: "compact" }, { ompHost: true });
+		h.responses = [{ text: JEV_ALLOW_92 }];
+		await toolCall(h, "bash", { command: "cargo check" }, "c1");
+		await result(h, "c1");
+		const row = h.messageRenderers["pi-verdict-label"](h.sent[0].message, { expanded: false }, LABEL_THEME).render(80)[0];
+		expect(row).toContain("🛡️");
+		expect(row).toContain("🤖");
+		expect(row).not.toContain("\uF132");
+		expect(row.split("█")).toHaveLength(11);
+	});
+
+	test("persisted junk renders nothing instead of throwing", () => {
+		const h = session({ allow: ["^ls\\b"] });
+		const render = h.entryRenderers["pi-verdict-label"];
+		expect(render({ data: { tool: 1 } }, { expanded: false }, LABEL_THEME)).toBeUndefined();
+		expect(render({ data: null }, { expanded: false }, LABEL_THEME)).toBeUndefined();
+		expect(render({ data: { tool: "bash", how: "rule", jev: { choice: "allow", probabilities: { allow: "x" }, confidence: 1 } } }, { expanded: false }, LABEL_THEME)).toBeUndefined();
 	});
 
 	test("ctrl+o toggles the host's tool expansion inside the dialog and restores it on close", async () => {

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Changed
+
+- Verdict label moved out of the tool block: the `[auto-mode] allowed: …` result trailer (0.17.0) is removed and every allowed gated call now gets a separate compact row after its block — shield, tool name, how it passed (`rule`, `classifier`, `approved`, `2nd model`, each with an icon), and for jev verdicts a 10-cell allow/ask/deny probability bar (shared with the approve dialog via `jevCellCounts`/`paintJevCells`) plus the chosen verdict's `%`. Nerd Font glyphs with `footer: "full"`, emoji otherwise; the jev part, then the whole row, is dropped when the width is too small. Delivery is host-specific: pi records a TUI-only custom entry (`appendEntry` + `registerEntryRenderer`, persisted, never in the LLM context); omp sends an `aside` custom message (`sendMessage` + `registerMessageRenderer`, drained at the next step boundary, so with parallel calls the rows appear after the whole batch, each naming its tool) whose text (`[auto-mode] bash allowed: classifier · jev allow 92%`) is model-visible and is the default card on hosts that cannot render it. Hosts with neither API show no label. The label carries no reason text and no path (ADR-0002) and has no config switch; tool results are no longer modified. `SessionState.noteTrailer`/`takeTrailer` are replaced by `noteLabel`/`takeLabel`.
+
 ## [0.17.0] - 2026-10-05
 
 ### Added

@@ -1585,8 +1585,8 @@ export class SessionState {
 	verdictCounts = { allow: 0, ask: 0, deny: 0 };
 	/** Position of each tool call in its assistant message (from `message_end`), consumed once by the ask dialog. */
 	private readonly toolPositions = new Map<string, { index: number; total: number }>();
-	/** Result trailer per allowed tool call, consumed once by `tool_result`. */
-	private readonly trailers = new Map<string, string>();
+	/** Verdict label per allowed tool call, consumed once by `tool_result`. */
+	private readonly labels = new Map<string, VerdictLabel>();
 
 	constructor(userRules: UserRules = loadUserRules().rules, agentDir: string | null = null) {
 		this.userRules = userRules;
@@ -1615,15 +1615,15 @@ export class SessionState {
 		return pos;
 	}
 
-	noteTrailer(id: string, text: string): void {
-		this.remember(this.trailers, id, text);
+	noteLabel(id: string, label: VerdictLabel): void {
+		this.remember(this.labels, id, label);
 	}
 
-	/** Get-and-delete the result trailer of tool call `id`. */
-	takeTrailer(id: string): string | undefined {
-		const text = this.trailers.get(id);
-		this.trailers.delete(id);
-		return text;
+	/** Get-and-delete the verdict label of tool call `id`. */
+	takeLabel(id: string): VerdictLabel | undefined {
+		const label = this.labels.get(id);
+		this.labels.delete(id);
+		return label;
 	}
 
 	/** #54: the audit flag follows the rules (applies to new sessions); the dir is anchored to the install path */
@@ -1649,7 +1649,7 @@ export class SessionState {
 		this.fallback.reset();
 		this.verdictCounts = { allow: 0, ask: 0, deny: 0 };
 		this.toolPositions.clear();
-		this.trailers.clear();
+		this.labels.clear();
 		return report;
 	}
 
@@ -2212,53 +2212,72 @@ function placeLabels(items: LabelItem[], cells: number, theme: Pick<Theme, "fg" 
 	return out;
 }
 
+const JEV_NAMES = ["allow", "ask", "deny"] as const;
+const JEV_COLORS = { allow: "success", ask: "warning", deny: "error" } as const;
+
+/** Cells per verdict (allow/ask/deny order): largest-remainder rounding, min 1 cell per non-zero verdict. `null` when all probabilities are 0. */
+function jevCellCounts(p: JevReason["probabilities"], cells: number): number[] | null {
+	const sum = p.allow + p.ask + p.deny;
+	if (sum === 0) return null;
+	const exact = JEV_NAMES.map((k) => (p[k] / sum) * cells);
+	const counts = exact.map(Math.floor);
+	let left = cells - counts.reduce((a, b) => a + b, 0);
+	const order = exact.map((e, i) => ({ i, frac: e - Math.floor(e) })).sort((a, b) => b.frac - a.frac || a.i - b.i);
+	for (const { i } of order) {
+		if (left <= 0) break;
+		counts[i]++;
+		left--;
+	}
+	JEV_NAMES.forEach((k, i) => {
+		if (p[k] > 0 && counts[i] === 0) {
+			counts[counts.indexOf(Math.max(...counts))]--;
+			counts[i] = 1;
+		}
+	});
+	return counts;
+}
+
+/** Paint probability-bar cells from `jevCellCounts` output: one `theme.fg` call per same-colour run, pill caps on the first/last cell with Nerd Font. */
+function paintJevCells(counts: readonly number[], theme: Pick<Theme, "fg">, nerdFont: boolean): string {
+	const cellColors: ThemeFg[] = [];
+	JEV_NAMES.forEach((k, i) => {
+		for (let c = 0; c < counts[i]; c++) cellColors.push(JEV_COLORS[k]);
+	});
+	const cells = cellColors.length;
+	const glyphs = cellColors.map(() => "█");
+	if (nerdFont && cells > 0) {
+		glyphs[0] = NF_CAP_L;
+		glyphs[cells - 1] = NF_CAP_R;
+	}
+	let bar = "";
+	for (let c = 0; c < cells; ) {
+		let e = c;
+		while (e < cells && cellColors[e] === cellColors[c]) e++;
+		bar += theme.fg(cellColors[c], glyphs.slice(c, e).join(""));
+		c = e;
+	}
+	return bar;
+}
+
 /** Four lines: probability labels (icon + %, centered on each segment), probability bar (allow/ask/deny cells, largest-remainder rounding, min 1 cell per non-zero verdict, pill caps with Nerd Font), confidence labels (confidence % centered on the fill, floor % on the tick), and the confidence bar (fill to jev confidence, tick at the confidence floor). */
 export function renderJevBar(j: JevReason, minConfidence: number | null, width: number, theme: Pick<Theme, "fg" | "bold">, nerdFont: boolean): string[] {
 	const cells = Math.max(10, Math.min(48, width));
-	const names = ["allow", "ask", "deny"] as const;
-	const colors = { allow: "success", ask: "warning", deny: "error" } as const;
 	const icons = nerdFont ? { allow: NF_CHECK, ask: NF_ASK, deny: NF_BAN } : { allow: "✓", ask: "?", deny: "✗" };
-	const sum = j.probabilities.allow + j.probabilities.ask + j.probabilities.deny;
+	const counts = jevCellCounts(j.probabilities, cells);
 	let probLabels = "";
 	let bar: string;
-	if (sum === 0) {
+	if (!counts) {
 		bar = theme.fg("muted", "░".repeat(cells));
 	} else {
-		const exact = names.map((k) => (j.probabilities[k] / sum) * cells);
-		const counts = exact.map(Math.floor);
-		let left = cells - counts.reduce((a, b) => a + b, 0);
-		const order = exact.map((e, i) => ({ i, frac: e - Math.floor(e) })).sort((a, b) => b.frac - a.frac || a.i - b.i);
-		for (const { i } of order) {
-			if (left <= 0) break;
-			counts[i]++;
-			left--;
-		}
-		names.forEach((k, i) => {
-			if (j.probabilities[k] > 0 && counts[i] === 0) {
-				counts[counts.indexOf(Math.max(...counts))]--;
-				counts[i] = 1;
-			}
-		});
-		const cellColors: ThemeFg[] = [];
 		const items: LabelItem[] = [];
-		names.forEach((k, i) => {
+		let offset = 0;
+		JEV_NAMES.forEach((k, i) => {
 			if (counts[i] <= 0) return;
 			const p = j.probabilities[k];
-			items.push({ center: cellColors.length + counts[i] / 2, text: `${icons[k]} ${p}%`, color: colors[k], bold: k === j.choice, priority: k === j.choice ? Infinity : p });
-			for (let c = 0; c < counts[i]; c++) cellColors.push(colors[k]);
+			items.push({ center: offset + counts[i] / 2, text: `${icons[k]} ${p}%`, color: JEV_COLORS[k], bold: k === j.choice, priority: k === j.choice ? Infinity : p });
+			offset += counts[i];
 		});
-		const glyphs = cellColors.map(() => "█");
-		if (nerdFont) {
-			glyphs[0] = NF_CAP_L;
-			glyphs[cells - 1] = NF_CAP_R;
-		}
-		bar = "";
-		for (let c = 0; c < cells; ) {
-			let e = c;
-			while (e < cells && cellColors[e] === cellColors[c]) e++;
-			bar += theme.fg(cellColors[c], glyphs.slice(c, e).join(""));
-			c = e;
-		}
+		bar = paintJevCells(counts, theme, nerdFont);
 		probLabels = placeLabels(items, cells, theme);
 	}
 	const filled = Math.round((Math.max(0, Math.min(100, j.confidence)) / 100) * cells);
@@ -2284,6 +2303,67 @@ export function renderJevBar(j: JevReason, minConfidence: number | null, width: 
 	if (minConfidence !== null) confItems.push({ center: tick + 0.5, text: `min ${minConfidence}%`, color: "muted", bold: false, priority: 0 });
 	confItems.sort((a, b) => a.center - b.center);
 	return [probLabels, bar, placeLabels(confItems, cells, theme), confBar];
+}
+
+export const VERDICT_LABEL_TYPE = "pi-verdict-label";
+/** Status row after an allowed call's block. Carries no reason text and no path (ADR-0002): tool name, how it passed, jev numbers only. */
+export interface VerdictLabel {
+	tool: string;
+	how: "rule" | "classifier" | "user" | "second-model";
+	jev: { choice: "allow" | "ask" | "deny"; probabilities: Record<"allow" | "ask" | "deny", number>; confidence: number } | null;
+}
+
+const LABEL_HOWS: readonly VerdictLabel["how"][] = ["rule", "classifier", "user", "second-model"];
+const LABEL_OUTCOME: Record<VerdictLabel["how"], string> = { rule: "allowed: rule", classifier: "allowed: classifier", user: "approved by user", "second-model": "allowed: second model (no human)" };
+const LABEL_SHORT: Record<VerdictLabel["how"], string> = { rule: "rule", classifier: "classifier", user: "approved", "second-model": "2nd model" };
+const LABEL_BAR_CELLS = 10;
+
+function verdictLabelFor(tool: string, how: VerdictLabel["how"], reason: string): VerdictLabel {
+	const j = parseJevReason(reason);
+	return { tool, how, jev: j ? { choice: j.choice, probabilities: { ...j.probabilities }, confidence: j.confidence } : null };
+}
+
+/** Model-visible text of the label (omp `content`). */
+export function verdictLabelText(l: VerdictLabel): string {
+	const base = `[auto-mode] ${l.tool} ${LABEL_OUTCOME[l.how]}`;
+	return l.jev ? `${base} · jev ${l.jev.choice} ${l.jev.probabilities[l.jev.choice]}%` : base;
+}
+
+/** Validates persisted label data; anything malformed yields `null`. */
+function asVerdictLabel(x: unknown): VerdictLabel | null {
+	if (typeof x !== "object" || x === null) return null;
+	const o = x as Record<string, unknown>;
+	if (typeof o.tool !== "string" || !LABEL_HOWS.includes(o.how as VerdictLabel["how"])) return null;
+	if (o.jev === null) return { tool: o.tool, how: o.how as VerdictLabel["how"], jev: null };
+	if (typeof o.jev !== "object" || o.jev === undefined) return null;
+	const j = o.jev as Record<string, unknown>;
+	const p = j.probabilities as Record<string, unknown> | null | undefined;
+	if (!(JEV_NAMES as readonly unknown[]).includes(j.choice) || typeof p !== "object" || p === null) return null;
+	if (![p.allow, p.ask, p.deny, j.confidence].every((n) => typeof n === "number" && Number.isFinite(n))) return null;
+	return {
+		tool: o.tool,
+		how: o.how as VerdictLabel["how"],
+		jev: { choice: j.choice as "allow" | "ask" | "deny", probabilities: { allow: p.allow as number, ask: p.ask as number, deny: p.deny as number }, confidence: j.confidence as number },
+	};
+}
+
+/** One compact row: shield, tool, how it passed (icon + short text), and for jev verdicts a 10-cell probability bar plus the chosen verdict's %. Drops the jev part, then everything, when `width` is too small. */
+export function renderVerdictLabel(l: VerdictLabel, theme: Pick<Theme, "fg" | "bold">, nerdFont: boolean, width: number): string[] {
+	const shield = nerdFont ? NF_SHIELD : "🛡️";
+	const icon = nerdFont ? { rule: NF_GAVEL, classifier: NF_CHIP, "second-model": NF_CHIP, user: NF_USER }[l.how] : { rule: "📜", classifier: "🤖", "second-model": "🤖", user: "👤" }[l.how];
+	const iconW = nerdFont ? 1 : 2;
+	const short = LABEL_SHORT[l.how];
+	const tool = displaySafe(l.tool);
+	const base = " " + theme.fg("success", shield) + " " + theme.fg("toolTitle", tool) + " " + theme.fg("muted", `${icon} ${short}`);
+	const baseWidth = 1 + iconW + 1 + tool.length + 1 + iconW + 1 + short.length;
+	if (!l.jev) return baseWidth + 1 <= width ? [base] : [];
+	const pctText = `${l.jev.choice} ${l.jev.probabilities[l.jev.choice]}%`;
+	const counts = jevCellCounts(l.jev.probabilities, LABEL_BAR_CELLS);
+	const bar = counts ? paintJevCells(counts, theme, nerdFont) : theme.fg("muted", "░".repeat(LABEL_BAR_CELLS));
+	const jev = " " + bar + " " + theme.bold(theme.fg(JEV_COLORS[l.jev.choice], pctText));
+	const fullWidth = baseWidth + 1 + LABEL_BAR_CELLS + 1 + pctText.length;
+	if (fullWidth + 1 <= width) return [base + jev];
+	return baseWidth + 1 <= width ? [base] : [];
 }
 
 type DialogModules = { tui: typeof PiTui; agent: typeof PiAgent };
@@ -2685,6 +2765,8 @@ const NF_INFO = "\uF05A"; // info block
 const NF_THIN = "\uE0B1"; // powerline thin arrow: separator between items inside one block
 const NF_CAP_L = "\uE0B6"; // powerline left half-circle: probability bar cap
 const NF_CAP_R = "\uE0B4"; // powerline right half-circle: probability bar cap
+const NF_GAVEL = "\uF0E3"; // rule verdict
+const NF_USER = "\uF007"; // user-approved verdict
 
 export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full" | "compact"): string {
 	const { classifier, fallback } = info;
@@ -3371,14 +3453,36 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if ((event.assistantMessageEvent as { type?: unknown } | undefined)?.type === "toolcall_end") noteBatch(event.message);
 	});
 	pi.on("message_end", (event) => noteBatch(event.message));
+	// Verdict label sink: a separate transcript row after the tool block.
+	// pi: TUI-only custom entry (persisted, not in LLM context). omp: `aside` custom message (model-visible, drained at the next step boundary; steer would abort the in-flight tool batch).
+	type LabelComponent = { render(width: number): string[]; invalidate(): void };
+	type LabelRenderer = (data: unknown, theme: Theme) => LabelComponent | undefined;
+	const labelComponent: LabelRenderer = (data, theme) => {
+		const l = asVerdictLabel(data);
+		return l ? { render: (w: number) => renderVerdictLabel(l, theme, state.userRules.footer === "full", w), invalidate() {} } : undefined;
+	};
+	type OmpSendMessage = (message: { customType: string; content: string; display: boolean; details: VerdictLabel }, options: { deliverAs: "aside" }) => void;
+	const labelHost = pi as unknown as {
+		registerEntryRenderer?: (type: string, renderer: (entry: { data?: unknown }, options: unknown, theme: Theme) => LabelComponent | undefined) => void;
+		appendEntry?: (type: string, data: unknown) => void;
+		registerMessageRenderer?: (type: string, renderer: (message: { details?: unknown }, options: unknown, theme: Theme) => LabelComponent | undefined) => void;
+		sendMessage?: OmpSendMessage;
+	};
+	let labelSink: ((l: VerdictLabel) => void) | null = null;
+	if (typeof labelHost.registerEntryRenderer === "function" && typeof labelHost.appendEntry === "function") {
+		labelHost.registerEntryRenderer(VERDICT_LABEL_TYPE, (entry, _o, theme) => labelComponent(entry.data, theme));
+		labelSink = (l) => labelHost.appendEntry?.call(pi, VERDICT_LABEL_TYPE, l);
+	} else if (isOmpHost && typeof labelHost.sendMessage === "function" && typeof labelHost.registerMessageRenderer === "function") {
+		labelHost.registerMessageRenderer(VERDICT_LABEL_TYPE, (message, _o, theme) => labelComponent(message.details, theme));
+		labelSink = (l) => labelHost.sendMessage?.call(pi, { customType: VERDICT_LABEL_TYPE, content: verdictLabelText(l), display: true, details: l }, { deliverAs: "aside" });
+	}
 
-	// Verdict status inside the block: a trailer content item on the result of every allowed gated call.
-	// No reason text and no path, so nothing protected reaches the agent (ADR-0002).
+	// Verdict label after the block: a separate transcript row (pi: TUI-only custom entry; omp: aside custom message, model-visible).
+	// No reason text, no path (ADR-0002). The result content stays untouched.
 	pi.on("tool_result", (event) => {
-		const t = typeof event.toolCallId === "string" ? state.takeTrailer(event.toolCallId) : undefined;
-		if (t === undefined) return undefined;
-		// leading newline: omp concatenates a result's text items without a separator
-		return { content: [...event.content, { type: "text" as const, text: `\n${t}` }] };
+		const l = typeof event.toolCallId === "string" ? state.takeLabel(event.toolCallId) : undefined;
+		if (l && labelSink) labelSink(l);
+		return undefined;
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -3398,10 +3502,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		// Root asks point at the call's block in the transcript (subagent blocks are not there: they keep the full code)
 		const pos = callId === undefined || sub ? undefined : state.takePosition(callId);
 		const blockRef = pos ? blockReference(event.toolName, input, pos) : undefined;
-		const allowedTrailer = (v: Verdict): string => (v.verdict === "ask" ? "[auto-mode] approved by user" : v.source === "classifier" ? "[auto-mode] allowed: classifier" : "[auto-mode] allowed: rule");
-		const noteAllowed = (text: string): void => {
-			if (callId !== undefined) state.noteTrailer(callId, text);
+		const noteAllowed = (label: VerdictLabel): void => {
+			if (callId !== undefined) state.noteLabel(callId, label);
 		};
+		const allowedHow = (v: Verdict): VerdictLabel["how"] => (v.verdict === "ask" ? "user" : v.source === "classifier" ? "classifier" : "rule");
 
 		// Live status (root session + UI only): one widget row above the editor while a model call runs.
 		// Text is phase + tool name + model id only; never command or path text (ADR-0002).
@@ -3476,13 +3580,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 			const presented = r === "aborted" ? { block: true as const, reason: blockedReason("user-declined", "user declined") } : r;
 			finalize(answerAudit(presented));
-			if (presented === undefined) noteAllowed(allowedTrailer(verdict));
+			if (presented === undefined) noteAllowed(verdictLabelFor(event.toolName, allowedHow(verdict), verdict.reason));
 			return presented;
 		}
 
 		if (verdict.verdict !== "ask") {
 			const r = await present();
-			if (r === undefined) noteAllowed(allowedTrailer(verdict));
+			if (r === undefined) noteAllowed(verdictLabelFor(event.toolName, allowedHow(verdict), verdict.reason));
 			return r === "aborted" ? undefined : r;
 		}
 
@@ -3493,7 +3597,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const out = (ui ?? ctx.ui).notify.bind(ui ?? ctx.ui);
 			if (res.verdict === "allow") {
 				if (debug || state.userRules.notifyAllows) out(`🛡️ [${label}] allow (second model, no human): ${res.reason}\n  ${action}`, "info");
-				noteAllowed("[auto-mode] allowed: second model (no human)");
+				noteAllowed(verdictLabelFor(event.toolName, "second-model", res.reason));
 				return undefined;
 			}
 			// no path plaintext in notifications (ADR-0002): protected-path asks omit the action line
@@ -3507,7 +3611,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const r = await present(signal);
 			if (r !== "aborted") {
 				finalize({ ...answerAudit(r), subagent: { ...sub, resolution: "human" } });
-				if (r === undefined) noteAllowed("[auto-mode] approved by user");
+				if (r === undefined) noteAllowed(verdictLabelFor(event.toolName, "user", verdict.reason));
 				return r;
 			}
 			if (ctx.signal?.aborted) {
