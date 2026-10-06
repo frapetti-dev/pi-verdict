@@ -22,6 +22,7 @@ import jevAdapter, {
 	VERDICT_QUESTIONS,
 	parseJevConfidence,
 	parseJevReason,
+	parseVerdictChoices,
 	verdictText,
 	wireModel,
 } from "../extensions/jev-adapter.ts";
@@ -177,7 +178,7 @@ describe("streamDecisions via createJevProvider", () => {
 		const calls: Array<{ url: string; init: RequestInit }> = [];
 		const fetcher = (async (url: string, init: RequestInit) => {
 			calls.push({ url, init });
-			return new Response(JSON.stringify(decisionResponse("deny", { deny: 0.96, allow: 0.04 }, 0.29)), { status: 200 });
+			return new Response(JSON.stringify(decisionResponse("deny", { deny: 0.96, allow: 0.04, ask: 0 }, 0.29)), { status: 200 });
 		}) as typeof fetch;
 		const provider = createJevProvider(async () => "sk-or-live", fetcher);
 		const model = provider.getModels()[0];
@@ -435,12 +436,12 @@ describe("concern question + reason (approve dialog)", () => {
 	});
 
 	test("parseJevReason splits the jev segment, concern, and trailing cascade suffix; free text → null", () => {
-		expect(parseJevReason("jev: ask 63% (confidence 45%; allow 35%, deny 2%) — concern: network operation (confidence 45% is below your classifierMinConfidence of 50%)")).toEqual({
+		expect(parseJevReason("jev: ask 63% (confidence 45%; allow 35%, deny 2%) — concern: network operation (confidence 45% is below your confidenceThreshold of 50%)")).toEqual({
 			choice: "ask",
 			probabilities: { allow: 35, ask: 63, deny: 2 },
 			confidence: 45,
 			concern: "network operation",
-			rest: "(confidence 45% is below your classifierMinConfidence of 50%)",
+			rest: "(confidence 45% is below your confidenceThreshold of 50%)",
 		});
 		expect(parseJevReason("jev: deny 96% (confidence 94%; allow 1%, ask 3%)")).toMatchObject({ concern: null, rest: "" });
 		expect(parseJevReason("needs a human")).toBeNull();
@@ -452,5 +453,55 @@ describe("concern question + reason (approve dialog)", () => {
 			expect(parsed?.concern).toBe(key === "none" ? null : label);
 			expect(parsed?.rest).toBe("");
 		}
+	});
+});
+
+describe("restricted verdict sets (approval modes)", () => {
+	test("parseVerdictChoices reads the marker line; absent marker → all three", () => {
+		expect(parseVerdictChoices("intro\nAllowed verdicts: allow, deny\n\nformat")).toEqual(["allow", "deny"]);
+		expect(parseVerdictChoices("Allowed verdicts: allow, ask")).toEqual(["allow", "ask"]);
+		expect(parseVerdictChoices("plain prompt")).toEqual(["allow", "ask", "deny"]);
+		expect(parseVerdictChoices("Allowed verdicts: allow, bogus")).toEqual(["allow", "ask", "deny"]);
+	});
+
+	test("yolo (no ask): only allow/deny criteria; allow absorbs the ask criterion; no-human instruction replaces prefer-ask", () => {
+		const body = buildDecisionsBody("state", "m", undefined, ["allow", "deny"]) as { questions: { verdict: { criteria: Record<string, string>; instructions: string } } };
+		const v = body.questions.verdict;
+		expect(Object.keys(v.criteria)).toEqual(["allow", "deny"]);
+		expect(v.criteria.allow).toContain("no human is available to confirm");
+		expect(v.instructions.endsWith("No human is available to confirm: choose deny only when a deny criterion clearly applies, otherwise allow.")).toBe(true);
+		expect(v.instructions).not.toContain("prefer ask");
+	});
+
+	test("noAutoDeny (no deny): ask absorbs the deny criterion; instructions unchanged; extra rules still appended", () => {
+		const body = buildDecisionsBody("state", "m", "RULES", ["allow", "ask"]) as { questions: { verdict: { criteria: Record<string, string>; instructions: string } } };
+		const v = body.questions.verdict;
+		expect(Object.keys(v.criteria)).toEqual(["allow", "ask"]);
+		expect(v.criteria.ask).toContain(`and anything that would otherwise be denied: ${VERDICT_QUESTIONS.verdict.criteria.deny}`);
+		expect(v.instructions).toBe(`${VERDICT_QUESTIONS.verdict.instructions}\n\nRULES`);
+	});
+
+	test("three choices stay byte-identical to the canonical questions", () => {
+		expect(buildDecisionsBody("s", "m", undefined, ["allow", "ask", "deny"])).toEqual({ model: "m", state: "s", questions: VERDICT_QUESTIONS });
+	});
+
+	test("streamDecisions posts the restricted criteria named by the system prompt marker", async () => {
+		const calls: Array<{ init: RequestInit }> = [];
+		const fetcher = (async (_url: string, init: RequestInit) => {
+			calls.push({ init });
+			return new Response(JSON.stringify(decisionResponse("allow", { allow: 0.7, ask: 0.3 }, 0.65)), { status: 200 });
+		}) as typeof fetch;
+		const provider = createJevProvider(async () => "sk", fetcher);
+		const message = await provider
+			.streamSimple(provider.getModels()[0], { systemPrompt: "intro\nAllowed verdicts: allow, ask\n\nformat", messages: [{ role: "user", content: "User: hi\nbash: ls" }] } as any, { apiKey: "sk" })
+			.result();
+		const body = JSON.parse(String(calls[0].init.body));
+		expect(Object.keys(body.questions.verdict.criteria)).toEqual(["allow", "ask"]);
+		expect(message.content[0]).toEqual({ type: "text", text: "<verdict>allow</verdict> jev: allow 70% (confidence 65%; ask 30%)" });
+	});
+
+	test("verdictText with two-key probabilities lists only the present verdict", () => {
+		expect(verdictText(decisionResponse("allow", { allow: 0.7, deny: 0.3 }, 0.65))).toBe("<verdict>allow</verdict> jev: allow 70% (confidence 65%; deny 30%)");
+		expect(parseJevReason(verdictText(decisionResponse("allow", { allow: 0.7, deny: 0.3 }, 0.65)))).toMatchObject({ choice: "allow", probabilities: { allow: 70, ask: 0, deny: 30 } });
 	});
 });

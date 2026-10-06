@@ -8,9 +8,9 @@
 
 本产品(pi-verdict)的核心裁决模式:工具调用的权限不由人工逐次批准,也不全然放行(Pi 默认的 YOLO 行为),而是由**规则层 + 模型分类器**自动判定。语义对齐 Claude Code 的 Auto Mode,但方向相反:Claude Code 是"默认提示 → 分类器自动批准",Pi 是"默认放行 → 分类器自动拦截"。命名分层:扩展实体与持久物(包、入口文件、配置文件)用产品名 pi-verdict;运行时接口(CLI flag、`/automode` 命令、env 变量)用功能名 auto-mode 前缀。
 
-### 主开关 (master switch)
+### 审批模式 (approval mode)
 
-Auto Mode 门禁的启用状态:会话内存态,默认开启。有三个操作面——CLI flag(跨会话)、`/automode` 命令(会话内)、toggle 快捷键(会话内,用户可配可禁用)——三者**语义等价**:同一状态的不同入口,不因入口不同而引入额外规则(无运行中限制、无确认弹窗、无持久化写回)。差异仅在反馈:命令显式提示,快捷键静默切换,状态可见性由 footer 始终显示承载。
+工具调用审批的总体姿态,四档:`default`(deny/ask/allow)、`yolo`(deny/allow,永不弹确认——本应 ask 的一律转为「解释或改写」式拦截)、`noAutoDeny`(ask/allow,自动 deny 转为人工 ask)、`off`(门禁停用,仅会话级)。每个审批键可在 user / project(受信项目)/ session 三个作用域设定,session > project > user > 默认;session 作用域按会话 id 持久化。操作面——`--verdict-mode` flag、`/automode` 命令与面板、快捷键轮换——都写入 session 作用域,语义等价,无确认弹窗;状态可见性由 footer 的模式 chip 承载。
 
 ### 判定管线 (adjudication pipeline)
 
@@ -102,7 +102,7 @@ A human-invoked model role behind the "Explain…" option of the ask dialog. It 
 
 ### 置信降级 (confidence demotion)
 
-置信地板(`classifierMinConfidence`,ADR-0004 amendment)触发时第一层裁决被降级的机制:jev 裁决的 confidence 严格低于地板时,**无论 allow/ask/deny 一律降级**——级联到回退分类器(若配置),否则转人工 ask(非交互降级 deny)。不低于地板时第一层完全自主。地板可独立采用(无需第二层);LLM 第一层无数值置信度,地板对其惰性。
+置信地板(`confidenceThreshold`,ADR-0004 amendment)触发时第一层裁决被降级的机制:jev 裁决的 confidence 严格低于地板时,**无论 allow/ask/deny 一律降级**——级联到回退分类器(若配置),否则转人工 ask(非交互降级 deny)。不低于地板时第一层完全自主。地板可独立采用(无需第二层);LLM 第一层无数值置信度,地板对其惰性。
 
 ### 回退分类器 (fallback classifier)
 
@@ -110,4 +110,4 @@ A human-invoked model role behind the "Explain…" option of the ask dialog. It 
 
 ### 子代理门禁 (subagent gate)
 
-仅 omp:子代理会话无自带 UI,其 ask 由 `subagentGate` 决定去向——`off`(默认)子代理内门禁惰性;`normal` 呈现于根会话 UI(带子代理标签),`subagentAskTimeoutMs` 内无人应答或根无 UI 则「无人裁决」;`auto` 始终无人裁决。无人裁决时仅分类器产生的 ask 才咨询回退分类器,且只有其明确 allow 放行,其余一律 deny;protected-path、`.omp` 门禁及仅因 `autoDeny:false` 产生的 ask 永远 deny。
+仅 omp:子代理会话无自带 UI,其 ask 由 `subagentGate` 决定去向——`off`(默认)子代理内门禁惰性;`normal` 呈现于根会话 UI(带子代理标签),`subagentAskTimeoutMs` 内无人应答或根无 UI 则「无人裁决」;`auto` 始终无人裁决。无人裁决时仅分类器产生的 ask 才咨询回退分类器,且只有其明确 allow 放行,其余一律 deny;protected-path、`.omp` 门禁及仅因 `mode: "noAutoDeny"` 产生的 ask 永远 deny。
