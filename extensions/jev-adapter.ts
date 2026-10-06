@@ -104,8 +104,8 @@ export function wireModel(transport: Transport = activeTransport()): string {
 	return TRANSPORT_DEFAULTS[transport].wireModel;
 }
 
-const VERDICTS = ["allow", "ask", "deny"] as const;
-type Verdict = (typeof VERDICTS)[number];
+export const VERDICTS = ["allow", "ask", "deny"] as const;
+export type Verdict = (typeof VERDICTS)[number];
 
 /** Criteria mirror the LLM classifier's system prompt (CLASSIFIER_SYSTEM):
  * same three-way semantics, same evidence-not-instruction discipline, same
@@ -169,13 +169,32 @@ export function extractState(context: { messages: unknown[] }): string {
 	return state;
 }
 
-export function buildDecisionsBody(state: string, model: string = wireModel(), extraInstructions?: string): Record<string, unknown> {
-	if (!extraInstructions) return { model, state, questions: VERDICT_QUESTIONS };
-	return {
-		model,
-		state,
-		questions: { ...VERDICT_QUESTIONS, verdict: { ...VERDICT_QUESTIONS.verdict, instructions: `${VERDICT_QUESTIONS.verdict.instructions}\n\n${extraInstructions}` } },
-	};
+/** Marker line the classifier system prompt carries when the approval mode restricts the
+ *  verdict set (yolo: no ask, noAutoDeny: no deny). `streamDecisions` re-reads it so the
+ *  jev `choice` question offers only the allowed verdicts. */
+export const VERDICT_CHOICES_PREFIX = "Allowed verdicts: ";
+
+/** Listed verdicts of the `Allowed verdicts:` marker line, or all three when absent. */
+export function parseVerdictChoices(systemPrompt: string): Verdict[] {
+	const m = /^Allowed verdicts: ((?:allow|ask|deny)(?:, (?:allow|ask|deny))*)$/m.exec(systemPrompt);
+	return m ? (m[1].split(", ") as Verdict[]) : [...VERDICTS];
+}
+
+const NO_ASK_INSTRUCTIONS_TAIL = "No human is available to confirm: choose deny only when a deny criterion clearly applies, otherwise allow.";
+
+export function buildDecisionsBody(state: string, model: string = wireModel(), extraInstructions?: string, choices: readonly Verdict[] = VERDICTS): Record<string, unknown> {
+	if (!extraInstructions && choices.length === VERDICTS.length) return { model, state, questions: VERDICT_QUESTIONS };
+	const base = VERDICT_QUESTIONS.verdict;
+	const criteria: Record<string, string> = {};
+	for (const v of choices) criteria[v] = base.criteria[v];
+	if (!choices.includes("deny") && choices.includes("ask")) criteria.ask = `${base.criteria.ask} — and anything that would otherwise be denied: ${base.criteria.deny}`;
+	let instructions: string = base.instructions;
+	if (!choices.includes("ask")) {
+		criteria.allow = `${base.criteria.allow}; also potentially risky but plausibly intended actions (deletion, writes outside the project, network operations, package installs, environment/state changes) — no human is available to confirm`;
+		instructions = instructions.replace(/When unsure, prefer ask\.$/, NO_ASK_INSTRUCTIONS_TAIL);
+	}
+	if (extraInstructions) instructions = `${instructions}\n\n${extraInstructions}`;
+	return { model, state, questions: { ...VERDICT_QUESTIONS, verdict: { ...base, instructions, criteria } } };
 }
 
 interface DecisionAnswer {
@@ -206,9 +225,9 @@ export function verdictText(parsed: unknown): string {
 	}
 	const probs = (answer?.probabilities ?? {}) as Record<string, unknown>;
 	const pct = (n: unknown): string => `${Math.round((typeof n === "number" && Number.isFinite(n) ? n : 0) * 100)}%`;
-	const rest = VERDICTS.filter((v) => v !== choice)
-		.map((v) => `${v} ${pct(probs[v])}`)
-		.join(", ");
+	const others = VERDICTS.filter((v) => v !== choice);
+	const present = others.filter((v) => Object.hasOwn(probs, v));
+	const rest = (present.length > 0 ? present : others).map((v) => `${v} ${pct(probs[v])}`).join(", ");
 	// The confidence segment floors instead of rounding: the cascade gate parses it back
 	// with a strict-below threshold, and overstating a 49.6% as 50% would slip past a 50
 	// gate. The 1e-9 epsilon only absorbs FP representation error (0.29*100 = 28.999…).
@@ -294,7 +313,7 @@ export function streamDecisions(transport: Transport, model: Model<string>, cont
 			const response = await fetcher(decisionsUrl(transport), {
 				method: "POST",
 				headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-				body: JSON.stringify(buildDecisionsBody(extractState(context), wireModel(transport), extra)),
+				body: JSON.stringify(buildDecisionsBody(extractState(context), wireModel(transport), extra, parseVerdictChoices(spJoined))),
 				signal: options?.signal,
 			});
 			const text = await response.text();
