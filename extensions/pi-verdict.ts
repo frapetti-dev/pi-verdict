@@ -43,7 +43,7 @@
  *
  * Configuration:
  *   --auto-mode / --no-auto-mode   CLI flag, master switch (default on)
- *   ctrl+shift+a                   master-switch toggle shortcut (default; silent
+ *   ctrl+shift+y                   master-switch toggle shortcut (default; silent
  *                                   toggle, footer always visible as the only
  *                                   feedback; config toggleShortcut rebinds/null
  *                                   disables, new session applies)
@@ -210,12 +210,12 @@ const pathStartsWith = (child: string, base: string): boolean => fold(child).sta
 // 与 /automode 命令语义等价:同一翻转入口,不因操作面引入额外规则
 // (运行中生效 / 无确认弹窗 / 无持久化写回——写回会模糊「仅用户手编」边界)。
 // 反馈静默:footer 始终显示(auto-mode 双态)是唯一反馈,不 notify。
-// 键位:config 的 toggleShortcut 字段,缺省 ctrl+shift+a(与 pi 全部默认键位无冲突,
+// 键位:config 的 toggleShortcut 字段,缺省 ctrl+shift+y(与 pi 全部默认键位无冲突,
 // 双修饰降误触,避开依赖 Kitty 协议的 super);null/空串禁用;新会话生效。
 // ============================================================================
 
-/** toggle 快捷键默认键位:主编辑器上下文空闲、语义好记(A for Auto)、不易误触 */
-const DEFAULT_TOGGLE_SHORTCUT = "ctrl+shift+a";
+/** toggle 快捷键默认键位:主编辑器上下文空闲、与 Windows Terminal 默认键位无冲突(ctrl+shift+a 为全选)、不易误触 */
+const DEFAULT_TOGGLE_SHORTCUT = "ctrl+shift+y";
 
 /** 键名词表(功能键与特殊键;词表对齐 pi keybindings 文档) */
 const KEY_NAME_ALT = "f(?:[1-9]|1[0-2])|escape|esc|enter|return|tab|space|backspace|delete|insert|clear|home|end|pageup|pagedown|up|down|left|right";
@@ -2416,6 +2416,8 @@ export function buildPercentSlider(
 export interface PanelEnv {
 	state: SessionState;
 	scopes: readonly PanelScope[];
+	/** shortcut registered per approval key at load; absent = none (only `mode` has one) */
+	shortcuts: Partial<Record<ApprovalKey, string>>;
 	/** the object stored at a scope (session overrides / project file / user file) */
 	stored(scope: PanelScope): Record<string, unknown>;
 	/** persist + reload; `undefined` drops the key; null = ok, else an error message */
@@ -2433,6 +2435,15 @@ function panelEffective(state: SessionState, spec: PanelItemSpec): string {
 	const v = state.userRules[spec.key];
 	const shown = v === null ? "off" : typeof v === "number" ? `${v}%` : String(v);
 	return `Effective: ${shown} (${state.approvalSources[spec.key]}) — ${spec.meaning}`;
+}
+
+/** Column (0-based, inside the label cell) where a row's cycle shortcut starts; fits under the 36-col label cap and the widest label (27). */
+const PANEL_SHORTCUT_COL = 8;
+
+/** Row label with the registered cycle shortcut (#15) aligned at `PANEL_SHORTCUT_COL`; plain text, since `SettingsList` pads by visible width. */
+function panelLabel(spec: PanelItemSpec, env: PanelEnv): string {
+	const k = env.shortcuts[spec.key];
+	return k ? `${spec.label.padEnd(PANEL_SHORTCUT_COL)}[${k}]` : spec.label;
 }
 
 /** Interactive settings panel: rich `SettingsList` when the host supports `ui.custom`, else a select/input loop. */
@@ -2456,7 +2467,7 @@ export async function runApprovalPanel(ctx: ExtensionContext, env: PanelEnv): Pr
 			const items: Array<PiTui.SettingItem & { spec?: PanelItemSpec }> = [
 				{ id: "scope", label: "scope", currentValue: scope, values: [...env.scopes], description: "Where changes are stored: session (this session only, wins), project (trusted project config), user (global config)" },
 				...PANEL_ITEMS.map((spec): PiTui.SettingItem & { spec?: PanelItemSpec } => {
-					const base = { id: spec.key, label: spec.label, spec, currentValue: panelStoredText(env.stored(scope), spec.key, scope), description: panelEffective(env.state, spec) };
+					const base = { id: spec.key, label: panelLabel(spec, env), spec, currentValue: panelStoredText(env.stored(scope), spec.key, scope), description: panelEffective(env.state, spec) };
 					return spec.values
 						? { ...base, values: panelValues(spec, scope) }
 						: { ...base, submenu: (current, close) => buildPercentSlider(mods, theme, spec.label, current, scope !== "user", close) };
@@ -2506,7 +2517,7 @@ export async function runApprovalPanel(ctx: ExtensionContext, env: PanelEnv): Pr
 	for (;;) {
 		const rows = [
 			`scope: ${scope}`,
-			...PANEL_ITEMS.map((spec) => `${spec.label}: ${panelStoredText(env.stored(scope), spec.key, scope)}`),
+			...PANEL_ITEMS.map((spec) => `${panelLabel(spec, env)}: ${panelStoredText(env.stored(scope), spec.key, scope)}`),
 		];
 		const picked = await ctx.ui.select("pi-verdict: approval settings", [...rows, "Done"]);
 		if (picked === undefined || picked === "Done") return;
@@ -3519,9 +3530,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	function refreshStatus(ctx: ExtensionContext): void {
 		const style = state.userRules.footer;
 		const text = style === "off" ? undefined : renderFooter(footerInfo(ctx), ctx.ui.theme, style);
-		// The mode chip rides the prompt status bar on omp (the footer is a below-editor widget there) and whenever the footer is off;
-		// on pi with the footer on, the footer already sits in the status bar.
-		ctx.ui.setStatus(MODE_STATUS_KEY, isOmpHost || style === "off" ? modeStatusText(state.userRules.mode, ctx.ui.theme) : undefined);
+		// The mode chip rides the prompt status bar only when the footer is off; with the footer on (status bar on pi, below-editor
+		// widget on omp) the footer already shows the mode, so a chip would duplicate it.
+		ctx.ui.setStatus(MODE_STATUS_KEY, style === "off" ? modeStatusText(state.userRules.mode, ctx.ui.theme) : undefined);
 		if (isOmpHost && typeof ctx.ui.setWidget === "function") {
 			ctx.ui.setStatus("auto-mode", undefined);
 			ctx.ui.setWidget(FOOTER_WIDGET_KEY, text === undefined ? undefined : [text], { placement: "belowEditor" });
@@ -3648,6 +3659,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const fileOf = (scope: "project" | "user"): { file: string; kind: "user" | "local" } | null =>
 			scope === "user" ? { file: userConfigPath(), kind: "user" } : projectFile === null ? null : { file: projectFile, kind: "local" };
 		await runApprovalPanel(ctx, {
+			shortcuts: registeredToggleKey ? { mode: registeredToggleKey } : {},
 			state,
 			scopes,
 			stored: (scope) => {

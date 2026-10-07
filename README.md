@@ -77,7 +77,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `/automode` — open the quick settings panel (cycling toggles for the mode and the enum keys, a slider for every percent threshold; a `scope` row picks session / project / user); without a UI it prints the status
 - `/automode status` — read-only status: effective approval mode and where it comes from, thresholds, shadow-cache stats
 - `/automode default|yolo|noautodeny|off` — set the **approval mode** for this session (persisted per session id)
-- `ctrl+shift+a` — cycle the session mode `default → yolo → noAutoDeny → off → default` silently (the footer is the only feedback; rebind or disable via `toggleShortcut`)
+- `ctrl+shift+y` — cycle the session mode `default → yolo → noAutoDeny → off → default` silently (the footer is the only feedback; rebind or disable via `toggleShortcut`)
 - `/verdict [user|local]` — edit the list rules (`allow`, `deny`, `denyPaths`, `tools`, `rules`) of the global (`user`) or project (`local`) config interactively: add / edit / remove entries, saved to disk and applied to the running session at once; also hosts the `gateOmpDir` on/off switch and the `footer` style. Other scalar keys stay hand-edited
 - footer status (`footer` key): `full` = Nerd Font powerline blocks (gate state, risky settings, classifier model, verdict counters, badges), `compact` = one plain line, `off` = none; a switched-off gate always shows as `AUTO OFF · ungated`
 
@@ -109,7 +109,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
   "classifierModel": null,
   "explainGateModel": null,
   "explainGatePrompt": null,
-  "toggleShortcut": "ctrl+shift+a",
+  "toggleShortcut": "ctrl+shift+y",
   "audit": false,
   "notifyAllows": false,
   "mode": "default",

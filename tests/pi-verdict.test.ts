@@ -773,13 +773,13 @@ describe("/automode command", () => {
 	});
 });
 
-// ── 6.5 toggle 快捷键(#15:默认 ctrl+shift+a,可配可禁用)──
+// ── 6.5 toggle 快捷键(#15:默认 ctrl+shift+y,可配可禁用)──
 
 describe("toggle shortcut", () => {
-	test("default installs ctrl+shift+a with description", () => {
+	test("default installs ctrl+shift+y with description", () => {
 		const h = session({});
-		expect(Object.keys(h.shortcuts)).toEqual(["ctrl+shift+a"]);
-		expect(h.shortcuts["ctrl+shift+a"].description).toContain("Cycle approval mode");
+		expect(Object.keys(h.shortcuts)).toEqual(["ctrl+shift+y"]);
+		expect(h.shortcuts["ctrl+shift+y"].description).toContain("Cycle approval mode");
 	});
 	test("custom key from config wins; default not registered", () => {
 		const h = session({ toggleShortcut: "ctrl+shift+x" });
@@ -804,7 +804,7 @@ describe("toggle shortcut", () => {
 	});
 	test("handler cycles default → yolo → noAutoDeny → off → default silently", async () => {
 		const h = session({});
-		const pressKey = () => h.shortcuts["ctrl+shift+a"].handler(h.ctx);
+		const pressKey = () => h.shortcuts["ctrl+shift+y"].handler(h.ctx);
 		const press = () => {
 			const n = h.notifies.length;
 			pressKey();
@@ -832,21 +832,21 @@ describe("toggle shortcut", () => {
 		await h.handlers.session_start({}, h.ctx);
 		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "● auto · ↺ mock/glm"]);
 		expect(h.fgCalls).toContainEqual(["success", "● auto"]);
-		h.shortcuts["ctrl+shift+a"].handler(h.ctx); // yolo
+		h.shortcuts["ctrl+shift+y"].handler(h.ctx); // yolo
 		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "● yolo · ↺ mock/glm"]);
 		expect(h.fgCalls.at(-1)![0]).not.toBe("success");
 		expect(h.fgCalls).toContainEqual(["error", "● yolo"]);
-		h.shortcuts["ctrl+shift+a"].handler(h.ctx); // noAutoDeny
+		h.shortcuts["ctrl+shift+y"].handler(h.ctx); // noAutoDeny
 		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "● no-autodeny · ↺ mock/glm"]);
 		expect(h.fgCalls).toContainEqual(["warning", "● no-autodeny"]);
-		h.shortcuts["ctrl+shift+a"].handler(h.ctx); // off
+		h.shortcuts["ctrl+shift+y"].handler(h.ctx); // off
 		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "○ auto off · ungated"]);
 		expect(h.fgCalls.at(-1)).toEqual(["warning", "○ auto off · ungated"]); // yellow: a note, not a fault
 	});
 	test("/automode status shows toggle hint; hidden when disabled", () => {
 		const h = session({});
 		h.commands.automode.handler("status", h.ctx);
-		expect(h.notifies.at(-1)![0]).toContain("toggle: ctrl+shift+a");
+		expect(h.notifies.at(-1)![0]).toContain("toggle: ctrl+shift+y");
 		const h2 = session({ toggleShortcut: null });
 		h2.commands.automode.handler("status", h2.ctx);
 		expect(h2.notifies.at(-1)![0].includes("toggle:")).toBe(false);
@@ -856,7 +856,7 @@ describe("toggle shortcut", () => {
 		const h = makeHarness(); h.install(); // 无既有配置 → loadUserRules 生成模板
 		const raw = fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8");
 		expect(raw).toContain("toggleShortcut");
-		expect(raw).toContain("ctrl+shift+a");
+		expect(raw).toContain("ctrl+shift+y");
 		expect(raw).toContain("toggleShortcut sets the key that cycles the session approval mode"); // _hint 说明文案
 		expect(JSON.parse(raw)).toMatchObject({ mode: "default", confidenceThreshold: null, yoloDenyPaths: "deny", yoloOmpDir: "deny" });
 		expect("autoDeny" in JSON.parse(raw)).toBe(false);
@@ -2704,10 +2704,10 @@ describe("footer status", () => {
 		expect(w[1]![0]).toContain("\uF132 AUTO");
 		expect(opts).toEqual({ placement: "belowEditor" });
 		expect(omp.statusSets.filter(([k]) => k === "auto-mode").every(([, t]) => t === undefined)).toBe(true); // no duplicate plain line
-		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)).toEqual(["verdict-mode", "🛡 AUTO"]); // omp: mode chip rides the prompt status bar
+		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined(); // omp with the footer on: the widget already shows the mode, no chip
 		await omp.commands.automode.handler("yolo", omp.ctx);
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("YOLO");
-		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)).toEqual(["verdict-mode", "🛡 YOLO"]);
+		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined();
 		await omp.commands.automode.handler("off", omp.ctx);
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("AUTO OFF");
 
@@ -2724,6 +2724,7 @@ describe("footer status", () => {
 		omp.install({ ompHost: true });
 		await omp.handlers.session_start({}, omp.ctx);
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)).toEqual(["auto-mode", undefined]);
+		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)).toEqual(["verdict-mode", "🛡 AUTO"]); // footer off: the chip is the only indicator
 	});
 
 	test("/verdict footer edit persists and redraws immediately", async () => {
@@ -3904,6 +3905,22 @@ describe("approval modes", () => {
 			const user = JSON.parse(fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8"));
 			expect(user.mode).toBe("yolo");
 			expect(await statusText(h)).toContain("Approval mode: yolo (user)");
+		});
+		test("the mode row shows the registered toggle shortcut at a fixed column; other rows and a disabled key stay bare", async () => {
+			const h = session({});
+			const rendered: string[] = [];
+			drivePanel(h, ["\x1b"], rendered);
+			await h.commands.automode.handler("", h.ctx);
+			const rows = rendered[0].split("\n");
+			const modeRow = rows.find((l) => l.includes("[ctrl+shift+y]"))!;
+			expect(modeRow).toBeDefined();
+			expect(modeRow).toContain("mode    [ctrl+shift+y]"); // key starts 8 columns into the label
+			expect(rows.filter((l) => l.includes("[ctrl+")).length).toBe(1);
+			const h2 = session({ toggleShortcut: null });
+			const rendered2: string[] = [];
+			drivePanel(h2, ["\x1b"], rendered2);
+			await h2.commands.automode.handler("", h2.ctx);
+			expect(rendered2[0].includes("[ctrl+")).toBe(false);
 		});
 		test("without ui.custom the panel falls back to select/input", async () => {
 			const h = session({});

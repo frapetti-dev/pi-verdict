@@ -31,7 +31,7 @@ Everything the gate reads from disk lives in `<agentDir>/config/pi-verdict.json`
   "classifierModel": null,
   "explainGateModel": null,
   "explainGatePrompt": null,
-  "toggleShortcut": "ctrl+shift+a",
+  "toggleShortcut": "ctrl+shift+y",
   "rules": []
 }
 ```
