@@ -1793,8 +1793,6 @@ export class SessionState {
 	private readonly agentDir: string | null;
 	/** Final pipeline verdicts this session (root calls only; an ask counts once whatever the user answers). Reset on session start, kept across /verdict reloads. */
 	verdictCounts = { allow: 0, ask: 0, deny: 0 };
-	/** Position of each tool call in its assistant message (from `message_end`), consumed once by the ask dialog. */
-	private readonly toolPositions = new Map<string, { index: number; total: number }>();
 	/** Verdict label per allowed tool call, consumed once by `tool_result`. */
 	private readonly labels = new Map<string, VerdictLabel>();
 
@@ -1812,17 +1810,6 @@ export class SessionState {
 			if (oldest.done) break;
 			map.delete(oldest.value);
 		}
-	}
-
-	notePosition(id: string, pos: { index: number; total: number }): void {
-		this.remember(this.toolPositions, id, pos);
-	}
-
-	/** Get-and-delete the batch position of tool call `id`. */
-	takePosition(id: string): { index: number; total: number } | undefined {
-		const pos = this.toolPositions.get(id);
-		this.toolPositions.delete(id);
-		return pos;
 	}
 
 	noteLabel(id: string, label: VerdictLabel): void {
@@ -1860,7 +1847,6 @@ export class SessionState {
 		this.shadow.reset();
 		this.fallback.reset();
 		this.verdictCounts = { allow: 0, ask: 0, deny: 0 };
-		this.toolPositions.clear();
 		this.labels.clear();
 		return report;
 	}
@@ -2621,13 +2607,13 @@ const MAX_DIALOG_CODE_LINES = 40;
 const MAX_DIALOG_EDIT_BLOCKS = 3;
 
 /** One fenced code block; the fence outgrows any backtick run in the body so the body cannot close it. */
-function fencedBlock(body: string, lang: string): string {
+function fencedBlock(body: string, lang: string, full: boolean): string {
 	let text = displaySafe(body);
-	if (text.length > MAX_DIALOG_CODE_CHARS) {
+	if (!full && text.length > MAX_DIALOG_CODE_CHARS) {
 		text = `${text.slice(0, 2400)}\n… [${text.length - MAX_DIALOG_CODE_CHARS} chars truncated] …\n${text.slice(-1600)}`;
 	}
 	const lines = text.split("\n");
-	if (lines.length > MAX_DIALOG_CODE_LINES) {
+	if (!full && lines.length > MAX_DIALOG_CODE_LINES) {
 		text = [...lines.slice(0, 30), `… [${lines.length - MAX_DIALOG_CODE_LINES} lines omitted] …`, ...lines.slice(-10)].join("\n");
 	}
 	const longestRun = Math.max(0, ...(text.match(/`+/g) ?? []).map((r) => r.length));
@@ -2636,20 +2622,22 @@ function fencedBlock(body: string, lang: string): string {
 }
 
 /** Code view of a tool call for the approve dialog: bash `command`, write `content`, or edit
- *  `newText` blocks, as Markdown with fenced code. null → the dialog shows the one-line action. */
+ *  `newText` blocks, as Markdown with fenced code. null → the dialog shows the one-line action.
+ *  `full` disables every truncation (long code, long lines, edit-block cap). */
 export function approveCodeMarkdown(
 	toolName: string,
 	input: Record<string, unknown>,
 	langFromPath: (p: string) => string | undefined,
+	full = false,
 ): { header: string; markdown: string } | null {
 	if (typeof input.command === "string") {
-		return { header: displaySafe(toolName), markdown: fencedBlock(input.command, "bash") };
+		return { header: displaySafe(toolName), markdown: fencedBlock(input.command, "bash", full) };
 	}
 	if (typeof input.code === "string") {
-		return { header: displaySafe(toolName), markdown: fencedBlock(input.code, input.language === "py" ? "python" : input.language === "js" ? "javascript" : "") };
+		return { header: displaySafe(toolName), markdown: fencedBlock(input.code, input.language === "py" ? "python" : input.language === "js" ? "javascript" : "", full) };
 	}
 	if (typeof input.path === "string" && typeof input.content === "string") {
-		return { header: displaySafe(`${toolName}: ${input.path}`), markdown: fencedBlock(input.content, langFromPath(input.path) ?? "") };
+		return { header: displaySafe(`${toolName}: ${input.path}`), markdown: fencedBlock(input.content, langFromPath(input.path) ?? "", full) };
 	}
 	if (typeof input.path === "string" && Array.isArray(input.edits)) {
 		const texts = input.edits.map((e) => (e as { newText?: unknown } | null)?.newText).filter((t): t is string => typeof t === "string");
@@ -2657,30 +2645,12 @@ export function approveCodeMarkdown(
 		const n = texts.length;
 		const lang = langFromPath(input.path) ?? "";
 		const parts: string[] = [];
-		texts.slice(0, MAX_DIALOG_EDIT_BLOCKS).forEach((t, i) => parts.push(`edit ${i + 1} of ${n}`, fencedBlock(t, lang)));
-		if (n > MAX_DIALOG_EDIT_BLOCKS) parts.push(`… ${n - MAX_DIALOG_EDIT_BLOCKS} more edits not shown`);
+		const shown = full ? texts : texts.slice(0, MAX_DIALOG_EDIT_BLOCKS);
+		shown.forEach((t, i) => parts.push(`edit ${i + 1} of ${n}`, fencedBlock(t, lang, full)));
+		if (!full && n > MAX_DIALOG_EDIT_BLOCKS) parts.push(`… ${n - MAX_DIALOG_EDIT_BLOCKS} more edits not shown`);
 		return { header: displaySafe(`${toolName}: ${input.path} (${n} edit${n === 1 ? "" : "s"})`), markdown: parts.join("\n\n") };
 	}
 	return null;
-}
-
-/** Reference to the tool call's block already shown in the host transcript above the dialog (the code is not repeated).
- *  `pos` is the call's position in its assistant message, so parallel calls stay distinguishable. */
-export function blockReference(toolName: string, input: Record<string, unknown>, pos: { index: number; total: number }): { title: string; preview: string | null } {
-	const body = [input.command, input.code, input.content].find((v): v is string => typeof v === "string") ?? null;
-	const lineCount = body === null ? 0 : body.split("\n").length;
-	const title = `↑ ${displaySafe(toolName)}${pos.total > 1 ? ` · call ${pos.index + 1} of ${pos.total}` : ""} above${lineCount > 1 ? ` · ${lineCount} lines` : ""}`;
-	let preview: string | null = null;
-	if (typeof input.path === "string") {
-		preview = displaySafe(input.path);
-	} else if (body !== null) {
-		const first = body.split("\n").find((l) => l.trim() !== "");
-		if (first !== undefined) {
-			const t = displaySafe(first.trim());
-			preview = t.length > 100 ? `${t.slice(0, 100)}…` : t;
-		}
-	}
-	return { title, preview };
 }
 
 type ThemeFg = Parameters<Theme["fg"]>[0];
@@ -2903,10 +2873,8 @@ interface ApproveDialogSpec {
 	explain?: boolean;
 	/** latest EXPLAIN-GATE answer, rendered between the reason and the options */
 	explanation?: string;
-	/** The call's block is in the root transcript above the dialog: show this reference instead of repeating the code. */
-	blockRef?: { title: string; preview: string | null };
-	/** Toggles the host's tool-output expansion (ctrl+o inside the dialog; only offered together with `blockRef`). */
-	toggleExpanded?: () => void;
+	/** Code-view expansion (ctrl+o). Absent → the dialog keeps its own collapsed/expanded state. */
+	expansion?: { get(): boolean; toggle(): void };
 }
 
 /** What the dialog resolves with: the two plain answers, or a request for follow-up input. */
@@ -2979,17 +2947,30 @@ export function buildApproveDialog(
 		root.addChild(new Spacer(1));
 		root.addChild(new Text(theme.fg("accent", theme.bold(displaySafe(spec.title))), 1, 0));
 		root.addChild(new Spacer(1));
-		if (spec.blockRef) {
-			root.addChild(new Text(theme.fg("toolTitle", theme.bold(spec.blockRef.title)), 1, 0));
-			if (spec.blockRef.preview !== null) root.addChild(new Text(theme.fg("muted", spec.blockRef.preview), 1, 0));
+		let localExpanded = false;
+		const isExpanded = (): boolean => (spec.expansion ? spec.expansion.get() : localExpanded);
+		const toggle = (): void => {
+			if (spec.expansion) spec.expansion.toggle();
+			else localExpanded = !localExpanded;
+		};
+		let expandable = false;
+		const collapsed = approveCodeMarkdown(spec.toolName, spec.input, getLanguageFromPath);
+		if (collapsed) {
+			const full = approveCodeMarkdown(spec.toolName, spec.input, getLanguageFromPath, true)!;
+			expandable = full.markdown !== collapsed.markdown;
+			const collapsedMd = new Markdown(collapsed.markdown, 1, 0, getMarkdownTheme());
+			const fullMd = new Markdown(full.markdown, 1, 0, getMarkdownTheme());
+			root.addChild(new Text(theme.fg("toolTitle", theme.bold(collapsed.header)), 1, 0));
+			// Picks the view at render time: the host may flip its expansion state without going through handleInput (omp).
+			root.addChild({
+				render: (w: number) => (isExpanded() ? fullMd : collapsedMd).render(w),
+				invalidate() {
+					fullMd.invalidate();
+					collapsedMd.invalidate();
+				},
+			});
 		} else {
-			const code = approveCodeMarkdown(spec.toolName, spec.input, getLanguageFromPath);
-			if (code) {
-				root.addChild(new Text(theme.fg("toolTitle", theme.bold(code.header)), 1, 0));
-				root.addChild(new Markdown(code.markdown, 1, 0, getMarkdownTheme()));
-			} else {
-				root.addChild(new Text(displaySafe(spec.action), 1, 0));
-			}
+			root.addChild(new Text(displaySafe(spec.action), 1, 0));
 		}
 		root.addChild(new Spacer(1));
 		const jev = spec.jev;
@@ -3018,8 +2999,14 @@ export function buildApproveDialog(
 		updateList();
 		root.addChild(list);
 		root.addChild(new Spacer(1));
-		const expandHint = spec.blockRef && spec.toggleExpanded ? `  ${rawKeyHint("ctrl+o", "expand above")}` : "";
-		root.addChild(new Text(`${rawKeyHint("↑↓", "navigate")}${expandHint}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`, 1, 0));
+		// Rebuilt at render time so the label follows host-native toggles that never reach handleInput.
+		root.addChild({
+			render: (w: number) => {
+				const expandHint = expandable ? `  ${rawKeyHint("ctrl+o", isExpanded() ? "collapse" : "expand")}` : "";
+				return new Text(`${rawKeyHint("↑↓", "navigate")}${expandHint}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`, 1, 0).render(w);
+			},
+			invalidate() {},
+		});
 		root.addChild(new Spacer(1));
 		root.addChild(new DynamicBorder());
 		// Record which choice each rendered line belongs to, so a click row can be mapped back to an option.
@@ -3072,8 +3059,8 @@ export function buildApproveDialog(
 			if (data.startsWith("\x1b[M")) return; // legacy X10 mouse: ignore, never treat as keys
 			armed = undefined;
 			// ctrl+o reaches the focused dialog, never the host's own expand binding
-			if (spec.toggleExpanded && (typeof mods.tui.matchesKey === "function" ? mods.tui.matchesKey(data, "ctrl+o") : data === "\x0f")) {
-				spec.toggleExpanded();
+			if (expandable && (typeof mods.tui.matchesKey === "function" ? mods.tui.matchesKey(data, "ctrl+o") : data === "\x0f")) {
+				toggle();
 				tui.requestRender();
 				return;
 			}
@@ -3110,11 +3097,12 @@ async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSig
 	let finish: ((r: AskChoice | undefined) => void) | undefined;
 	const onAbort = (): void => finish?.(undefined);
 	signal?.addEventListener("abort", onAbort, { once: true });
-	// ctrl+o expands the transcript block the dialog points at. pi delivers the key to the focused dialog (spec.toggleExpanded);
-	// omp toggles natively in a global input listener before the dialog sees it. Either way the user's view is restored on close.
-	const canToggle = !!spec.blockRef && typeof ui.getToolsExpanded === "function" && typeof ui.setToolsExpanded === "function";
+	// ctrl+o expands/collapses the dialog's own code view. pi delivers the key to the focused dialog (expansion.toggle);
+	// omp toggles tool expansion natively in a global input listener before the dialog sees it, and the dialog reads
+	// expansion.get() at render time, so both hosts expand the dialog's code. The transcript's expansion state is restored on close.
+	const canToggle = typeof ui.getToolsExpanded === "function" && typeof ui.setToolsExpanded === "function";
 	const initialExpanded = canToggle ? ui.getToolsExpanded() : undefined;
-	const shown: ApproveDialogSpec = canToggle ? { ...spec, toggleExpanded: () => ui.setToolsExpanded(!ui.getToolsExpanded()) } : spec;
+	const shown: ApproveDialogSpec = canToggle ? { ...spec, expansion: { get: () => ui.getToolsExpanded(), toggle: () => ui.setToolsExpanded(!ui.getToolsExpanded()) } } : spec;
 	try {
 		const r = await ui.custom<AskChoice | undefined>((tui, theme, _kb, done) => {
 			finish = done;
@@ -3393,7 +3381,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Verdict → UI(本扩展唯一的裁决呈现点):按 source × degraded 查模板,文案与
 	 *  重构前逐字节一致。受保护路径分支的通知永不携带路径明文与 action 行
 	 *  (ADR-0002 story 11:通知与 block reason 回流 agent context)。 */
-	async function presentVerdict(v: Verdict, call: { toolName: string; input: Record<string, unknown> }, action: string, ui: UiContext, opts: { label: string | null; signal?: AbortSignal; ctx: ExtensionContext; blockRef?: { title: string; preview: string | null } }): Promise<{ block: true; reason: string } | undefined | "aborted"> {
+	async function presentVerdict(v: Verdict, call: { toolName: string; input: Record<string, unknown> }, action: string, ui: UiContext, opts: { label: string | null; signal?: AbortSignal; ctx: ExtensionContext }): Promise<{ block: true; reason: string } | undefined | "aborted"> {
 		const note = (msg: string, level: "info" | "warning" | "error"): void => ui.notify(opts.label ? msg.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : msg, level);
 		const titled = (t: string): string => (opts.label ? t.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : t);
 		if (v.verdict === "allow") {
@@ -3451,7 +3439,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				minConfidence: null,
 				nerdFont: state.userRules.footer === "full",
 				fallbackMessage: `${action}\n\n${v.reason}\n\nProtected path: ${v.detail ?? "(see pi-verdict.json)"}\n\nAllow this access?`,
-				...(opts.blockRef ? { blockRef: opts.blockRef } : {}),
 			}, { signal: opts.signal });
 			if (d === "aborted") return "aborted";
 			if (d.allow) {
@@ -3474,7 +3461,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			minConfidence: state.userRules.confidenceThreshold,
 			nerdFont: state.userRules.footer === "full",
 			fallbackMessage: `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`,
-			...(opts.blockRef ? { blockRef: opts.blockRef } : {}),
 		}, { signal: opts.signal, explain: (question) => explainAsk(opts.ctx, call, action, reasonLine, question) });
 		if (d === "aborted") return "aborted";
 		return d.allow ? undefined : { block: true, reason: blockedReason("user-declined", declineDetail("user declined", d.reason)) };
@@ -4055,20 +4041,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		return toolCallLine(toolName, input);
 	}
 
-	// Batch position of every tool call, so an ask dialog can say "call 2 of 3" instead of repeating the code.
-	// Runs even while disabled: cheap, and keeps positions right after a toggle.
-	const noteBatch = (raw: unknown): void => {
-		const message = raw as { role?: unknown; content?: unknown } | undefined;
-		if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
-		const ids = (message.content as { type?: unknown; id?: unknown }[]).filter((c) => c?.type === "toolCall" && typeof c.id === "string").map((c) => c.id as string);
-		ids.forEach((id, index) => state.notePosition(id, { index, total: ids.length }));
-	};
-	// omp dispatches `tool_call` (via `beforeToolCall`) BEFORE the assistant message's `message_end`, so the streamed
-	// `toolcall_end` update is the first point where the batch is known; `message_end` covers hosts that order it the other way.
-	pi.on("message_update", (event) => {
-		if ((event.assistantMessageEvent as { type?: unknown } | undefined)?.type === "toolcall_end") noteBatch(event.message);
-	});
-	pi.on("message_end", (event) => noteBatch(event.message));
 	// Verdict label sink: a separate transcript row after the tool block.
 	// pi: TUI-only custom entry (persisted, not in LLM context). omp: `aside` custom message (model-visible, drained at the next step boundary; steer would abort the in-flight tool batch).
 	type LabelComponent = { render(width: number): string[]; invalidate(): void };
@@ -4115,9 +4087,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const call = { toolName: event.toolName, input };
 		const action = describeAction(event.toolName, input);
 		const callId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-		// Root asks point at the call's block in the transcript (subagent blocks are not there: they keep the full code)
-		const pos = callId === undefined || sub ? undefined : state.takePosition(callId);
-		const blockRef = pos ? blockReference(event.toolName, input, pos) : undefined;
 		const noteAllowed = (label: VerdictLabel): void => {
 			if (callId !== undefined) state.noteLabel(callId, label);
 		};
@@ -4172,7 +4141,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		type Presented = { block: true; reason: string } | undefined | "aborted";
 		const present = async (signal?: AbortSignal): Promise<Presented> => {
 			try {
-				return await presentVerdict(verdict, call, action, ui ?? ctx.ui, { label, signal, ctx, ...(blockRef ? { blockRef } : {}) });
+				return await presentVerdict(verdict, call, action, ui ?? ctx.ui, { label, signal, ctx });
 			} catch (err) {
 				if (verdict.pendingAudit) state.audit?.append(verdict.pendingAudit);
 				throw err;

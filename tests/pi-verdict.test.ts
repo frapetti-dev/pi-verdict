@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, blockReference, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
 
 // ── 桩设施 ──────────────────────────────────────────────
 
@@ -171,8 +171,9 @@ const ANSI = /\x1b\[[0-9;]*m/g;
 type DialogComponent = { render(width: number): string[]; handleInput(data: string): void };
 type DialogFactory = (tui: { requestRender(): void }, theme: { fg(c: string, t: string): string; bold(t: string): string }, kb: undefined, done: (r: unknown) => void) => DialogComponent;
 
-/** Each ui.custom call replays the next key script against the real dialog component and records its render; an exhausted script list presses Escape. */
-function driveDialogs(h: Harness, scripts: string[][], rendered: string[]): void {
+/** Each ui.custom call replays the next key script against the real dialog component and records its render; an exhausted script list presses Escape.
+ *  `after` additionally records the render after each key. */
+function driveDialogs(h: Harness, scripts: string[][], rendered: string[], after?: string[]): void {
 	h.ctx.ui.custom = async (factory: DialogFactory) => {
 		const { initTheme } = await import("@earendil-works/pi-coding-agent");
 		initTheme("dark", false);
@@ -181,7 +182,10 @@ function driveDialogs(h: Harness, scripts: string[][], rendered: string[]): void
 		return new Promise((resolve) => {
 			const component = factory({ requestRender() {} }, fakeTheme, undefined, resolve);
 			rendered.push(component.render(80).join("\n").replace(ANSI, ""));
-			for (const k of keys) component.handleInput(k);
+			for (const k of keys) {
+				component.handleInput(k);
+				after?.push(component.render(80).join("\n").replace(ANSI, ""));
+			}
 		});
 	};
 }
@@ -2822,6 +2826,13 @@ describe("approve dialog helpers", () => {
 		expect(long.markdown).toContain("l99\n");
 		const wide = approveCodeMarkdown("bash", { command: "x".repeat(10_000) }, lang)!;
 		expect(wide.markdown).toContain("[6000 chars truncated]");
+		const fullLong = approveCodeMarkdown("bash", { command: Array.from({ length: 100 }, (_, i) => `l${i}`).join("\n") }, lang, true)!;
+		expect(fullLong.markdown).toContain("l50\n");
+		expect(fullLong.markdown).not.toContain("omitted");
+		expect(approveCodeMarkdown("bash", { command: "x".repeat(10_000) }, lang, true)!.markdown).not.toContain("truncated");
+		const fullEdits = approveCodeMarkdown("edit", { path: "a.ts", edits }, lang, true)!;
+		expect(count(fullEdits.markdown, "```typescript")).toBe(5);
+		expect(fullEdits.markdown).not.toContain("more edits not shown");
 	});
 
 	test("displaySafe: control / bidi characters become visible escapes; tab and newline survive", () => {
@@ -3465,35 +3476,10 @@ describe("live classifier status widget", () => {
 	});
 });
 
-describe("approve dialog block reference and verdict label", () => {
+describe("approve dialog code expansion and verdict label", () => {
 	const ASK = { text: "<verdict>ask</verdict> needs a human" };
 	const CODE = "echo a\necho MARKER2";
-	const batch = (h: Harness, ids: string[]) =>
-		h.handlers.message_end({ message: { role: "assistant", content: [{ type: "text", text: "go" }, ...ids.map((id) => ({ type: "toolCall", id, name: "bash", arguments: {} }))] } }, h.ctx);
 	const result = (h: Harness, id: string) => h.handlers.tool_result({ toolCallId: id, toolName: "bash", content: [{ type: "text", text: "out" }], isError: false }, h.ctx);
-
-	test("the dialog names the block by its position in the batch and does not repeat the code", async () => {
-		const h = session({});
-		h.responses = [ASK];
-		batch(h, ["t1", "t2", "t3"]);
-		const rendered: string[] = [];
-		driveDialogs(h, [["\r"]], rendered);
-		const r = await toolCall(h, "bash", { command: CODE }, "t2");
-		expect(r).toBeUndefined();
-		expect(rendered[0]).toContain("↑ bash · call 2 of 3 above · 2 lines");
-		expect(rendered[0]).toContain("echo a");
-		expect(rendered[0]).not.toContain("MARKER2");
-	});
-
-	test("unknown call id falls back to the full code", async () => {
-		const h = session({});
-		h.responses = [ASK];
-		const rendered: string[] = [];
-		driveDialogs(h, [["\r"]], rendered);
-		await toolCall(h, "bash", { command: CODE }, "zz");
-		expect(rendered[0]).toContain("MARKER2");
-		expect(rendered[0]).not.toContain("above");
-	});
 
 	const LABEL_THEME = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 	const JEV_ALLOW_92 = "<verdict>allow</verdict> jev: allow 92% (confidence 85%; ask 5%, deny 3%)";
@@ -3580,64 +3566,77 @@ describe("approve dialog block reference and verdict label", () => {
 		expect(render({ data: { tool: "bash", how: "rule", jev: { choice: "allow", probabilities: { allow: "x" }, confidence: 1 } } }, { expanded: false }, LABEL_THEME)).toBeUndefined();
 	});
 
-	test("ctrl+o toggles the host's tool expansion inside the dialog and restores it on close", async () => {
+	const LONG = Array.from({ length: 60 }, (_, i) => "echo L" + i).join("\n");
+	const hostExpansion = (h: Harness) => {
+		const host = { expanded: false, sets: [] as boolean[] };
+		h.ctx.ui.getToolsExpanded = () => host.expanded;
+		h.ctx.ui.setToolsExpanded = (v: boolean) => {
+			host.expanded = v;
+			host.sets.push(v);
+		};
+		return host;
+	};
+
+	test("dialog always shows the code, even for a call with a known id", async () => {
 		const h = session({});
 		h.responses = [ASK];
-		batch(h, ["t1", "t2"]);
-		let expanded = false;
-		const sets: boolean[] = [];
-		h.ctx.ui.getToolsExpanded = () => expanded;
-		h.ctx.ui.setToolsExpanded = (v: boolean) => {
-			expanded = v;
-			sets.push(v);
-		};
 		const rendered: string[] = [];
-		driveDialogs(h, [["\x0f", "\r"]], rendered);
-		expect(await toolCall(h, "bash", { command: CODE }, "t1")).toBeUndefined();
-		expect(rendered[0]).toContain("expand above");
-		expect(sets).toEqual([true, false]);
+		driveDialogs(h, [["\r"]], rendered);
+		expect(await toolCall(h, "bash", { command: CODE }, "t2")).toBeUndefined();
+		expect(rendered[0]).toContain("MARKER2");
+		expect(rendered[0]).not.toContain("above");
+		expect(rendered[0]).not.toContain("ctrl+o"); // short code: nothing to expand
 	});
 
-	test("expansion the host toggles natively while the dialog is open (omp) is restored on close", async () => {
+	test("ctrl+o expands and collapses truncated code without a host expansion API", async () => {
 		const h = session({});
 		h.responses = [ASK];
-		batch(h, ["t1"]);
-		let expanded = false;
-		const sets: boolean[] = [];
-		h.ctx.ui.getToolsExpanded = () => expanded;
-		h.ctx.ui.setToolsExpanded = (v: boolean) => {
-			expanded = v;
-			sets.push(v);
-		};
-		driveDialogs(h, [["\r"]], []);
+		const rendered: string[] = [];
+		const after: string[] = [];
+		driveDialogs(h, [["\x0f", "\x0f", "\r"]], rendered, after);
+		expect(await toolCall(h, "bash", { command: LONG }, "t1")).toBeUndefined();
+		expect(rendered[0]).toContain("lines omitted");
+		expect(rendered[0]).toContain("expand");
+		expect(rendered[0]).not.toContain("echo L35");
+		expect(after[0]).toContain("echo L35");
+		expect(after[0]).not.toContain("lines omitted");
+		expect(after[0]).toContain("collapse");
+		expect(after[1]).toContain("lines omitted");
+		expect(after[1]).not.toContain("echo L35");
+	});
+
+	test("with a host expansion API, ctrl+o toggles it and the dialog follows; state restored on close", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		const host = hostExpansion(h);
+		const rendered: string[] = [];
+		const after: string[] = [];
+		driveDialogs(h, [["\x0f", "\r"]], rendered, after);
+		expect(await toolCall(h, "bash", { command: LONG }, "t1")).toBeUndefined();
+		expect(rendered[0]).not.toContain("echo L35");
+		expect(after[0]).toContain("echo L35");
+		expect(host.sets).toEqual([true, false]);
+	});
+
+	test("host-native toggle (omp) expands the dialog code and is restored on close", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		const host = hostExpansion(h);
+		const rendered: string[] = [];
+		driveDialogs(h, [["\r"]], rendered);
 		const drive = h.ctx.ui.custom;
 		h.ctx.ui.custom = (factory: DialogFactory) => {
 			const wrapped: DialogFactory = (tui, theme, kb, done) => {
-				expanded = true; // the host's own ctrl+o listener fired; the dialog never saw the key
+				host.expanded = true; // the host's own ctrl+o listener fired; the dialog never saw the key
 				return factory(tui, theme, kb, done);
 			};
 			return drive(wrapped);
 		};
-		expect(await toolCall(h, "bash", { command: CODE }, "t1")).toBeUndefined();
-		expect(expanded).toBe(false);
-		expect(sets).toEqual([false]);
-	});
-
-	test("no expand hint when the host cannot toggle expansion", async () => {
-		const h = session({});
-		h.responses = [ASK];
-		batch(h, ["t1"]);
-		const rendered: string[] = [];
-		driveDialogs(h, [["\r"]], rendered);
-		await toolCall(h, "bash", { command: CODE }, "t1");
-		expect(rendered[0]).toContain("↑ bash above · 2 lines"); // single call: no ordinal
-		expect(rendered[0]).not.toContain("expand above");
-	});
-
-	test("blockReference: path preview, long first line cut, no body", () => {
-		expect(blockReference("write", { path: "/proj/a.ts", content: "x\ny\nz" }, { index: 0, total: 2 })).toEqual({ title: "↑ write · call 1 of 2 above · 3 lines", preview: "/proj/a.ts" });
-		expect(blockReference("bash", { command: "\n  " + "x".repeat(130) }, { index: 0, total: 1 }).preview).toBe("x".repeat(100) + "…");
-		expect(blockReference("read", {}, { index: 0, total: 1 })).toEqual({ title: "↑ read above", preview: null });
+		expect(await toolCall(h, "bash", { command: LONG }, "t1")).toBeUndefined();
+		expect(rendered[0]).toContain("echo L35");
+		expect(rendered[0]).toContain("collapse");
+		expect(host.expanded).toBe(false);
+		expect(host.sets).toEqual([false]);
 	});
 
 	test("eval code is shown as a fenced block", () => {
