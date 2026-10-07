@@ -2877,21 +2877,29 @@ interface ApproveDialogSpec {
 	expansion?: { get(): boolean; toggle(): void };
 }
 
-/** What the dialog resolves with: the two plain answers, or a request for follow-up input. */
-export type AskChoice = "yes" | "no" | "no-reason" | "explain";
+/** The options the dialog lists. */
+type AskOption = "yes" | "no" | "explain";
 
 /** Interactive ask outcome. `reason` is the user's own explanation of a decline (forwarded to the agent). */
 export type AskDecision = { allow: true } | { allow: false; reason?: string };
 
-const ASK_LABELS: Record<AskChoice, string> = {
+/** What the dialog resolves with: a final decision (No carries the inline text as `reason`) or a request for the EXPLAIN-GATE follow-up. */
+export type AskPick = AskDecision | "explain";
+
+const ASK_LABELS: Record<AskOption, string> = {
 	yes: "Yes",
 	no: "No",
-	"no-reason": "No, with explanation…",
 	explain: "Explain… (optional question)",
 };
 
-function isAskChoice(x: unknown): x is AskChoice {
-	return typeof x === "string" && Object.hasOwn(ASK_LABELS, x);
+/** Dim hint shown in the empty inline No field. */
+const NO_PLACEHOLDER = "tell the agent what to do instead";
+
+function isAskPick(x: unknown): x is AskPick {
+	if (x === "explain") return true;
+	if (typeof x !== "object" || x === null || !("allow" in x)) return false;
+	if (x.allow === true) return true;
+	return x.allow === false && (!("reason" in x) || x.reason === undefined || typeof x.reason === "string");
 }
 
 /** 0-based dialog line under 0-based terminal row `screenRow`, or null when the host
@@ -2937,12 +2945,13 @@ export function buildApproveDialog(
 	tui: { requestRender(): void },
 	theme: Theme,
 	spec: ApproveDialogSpec,
-	done: (result: AskChoice | undefined) => void,
+	done: (result: AskPick | undefined) => void,
 ): PiTui.Container {
-	const { Container, Markdown, Spacer, Text, getKeybindings } = mods.tui;
+	const { Container, CURSOR_MARKER, Input, Markdown, Spacer, Text, getKeybindings, visibleWidth } = mods.tui;
 	const { DynamicBorder, getLanguageFromPath, getMarkdownTheme, keyHint, rawKeyHint } = mods.agent;
 	try {
-		const root = new Container() as PiTui.Container & { handleInput(data: string): void };
+		const root = new Container() as PiTui.Container & { handleInput(data: string): void; focused: boolean };
+		root.focused = false; // pi's ui.custom sets this via tui.setFocus, so the hardware cursor follows CURSOR_MARKER
 		root.addChild(new DynamicBorder());
 		root.addChild(new Spacer(1));
 		root.addChild(new Text(theme.fg("accent", theme.bold(displaySafe(spec.title))), 1, 0));
@@ -2989,12 +2998,42 @@ export function buildApproveDialog(
 		}
 		root.addChild(new Spacer(1));
 		root.addChild(new Text(theme.fg("text", spec.question), 1, 0));
-		const choices: AskChoice[] = spec.explain ? ["yes", "no", "no-reason", "explain"] : ["yes", "no", "no-reason"];
+		const choices: AskOption[] = spec.explain ? ["yes", "no", "explain"] : ["yes", "no"];
 		let index = 0;
+		// Single-line editor for the inline No reason (editing keys, bracketed paste, scrolling, fake cursor).
+		const noInput = new Input();
+		const noReason = (): string | undefined => noInput.getValue().trim() || undefined;
+		const resolve = (c: AskOption): void => done(c === "yes" ? { allow: true } : c === "no" ? { allow: false, reason: noReason() } : "explain");
 		const list = new Container();
 		const updateList = (): void => {
 			list.clear();
-			choices.forEach((c, i) => list.addChild(new Text(i === index ? theme.fg("accent", "→ ") + theme.fg("accent", ASK_LABELS[c]) : `  ${theme.fg("text", ASK_LABELS[c])}`, 1, 0)));
+			choices.forEach((c, i) => {
+				const selected = i === index;
+				if (c !== "no") {
+					list.addChild(new Text(selected ? theme.fg("accent", "→ ") + theme.fg("accent", ASK_LABELS[c]) : `  ${theme.fg("text", ASK_LABELS[c])}`, 1, 0));
+					return;
+				}
+				list.addChild({
+					render: (w: number): string[] => {
+						const value = noInput.getValue();
+						if (!selected) {
+							const line = value === "" ? `  ${theme.fg("text", "No")}` : `  ${theme.fg("text", "No, ")}${theme.fg("muted", value)}`;
+							return new Text(line, 1, 0).render(w);
+						}
+						let line = theme.fg("accent", "→ ") + theme.fg("accent", "No, ");
+						if (value === "") {
+							line += (root.focused ? CURSOR_MARKER : "") + "\x1b[7m \x1b[27m" + " " + theme.fg("dim", NO_PLACEHOLDER);
+						} else {
+							noInput.focused = root.focused;
+							const inner = w - 2 - visibleWidth("→ No, ");
+							// Input.render prepends its own "> " prompt; strip it.
+							if (inner > 0) line += noInput.render(inner + 2)[0]!.slice(2);
+						}
+						return [` ${line}`];
+					},
+					invalidate() {},
+				});
+			});
 		};
 		updateList();
 		root.addChild(list);
@@ -3042,7 +3081,7 @@ export function buildApproveDialog(
 			const choice = line === null ? undefined : optionAtLine[line];
 			if (choice === undefined) return;
 			if (armed === choice && index === choice) {
-				done(choices[choice]);
+				resolve(choices[choice]);
 				return;
 			}
 			index = choice;
@@ -3065,18 +3104,30 @@ export function buildApproveDialog(
 				return;
 			}
 			const kb = getKeybindings();
-			if (kb.matches(data, "tui.select.up") || data === "k") {
+			if (kb.matches(data, "tui.select.up")) {
 				index = Math.max(0, index - 1);
 				updateList();
 				tui.requestRender();
-			} else if (kb.matches(data, "tui.select.down") || data === "j") {
+			} else if (kb.matches(data, "tui.select.down")) {
 				index = Math.min(choices.length - 1, index + 1);
 				updateList();
 				tui.requestRender();
 			} else if (kb.matches(data, "tui.select.confirm") || data === "\n") {
-				done(choices[index]);
+				resolve(choices[index]);
 			} else if (kb.matches(data, "tui.select.cancel")) {
-				done("no");
+				done({ allow: false });
+			} else if (choices[index] === "no") {
+				// On the No row every other key is text for the inline field (including j/k).
+				noInput.handleInput(data);
+				tui.requestRender();
+			} else if (data === "k") {
+				index = Math.max(0, index - 1);
+				updateList();
+				tui.requestRender();
+			} else if (data === "j") {
+				index = Math.min(choices.length - 1, index + 1);
+				updateList();
+				tui.requestRender();
 			}
 		};
 		return root;
@@ -3090,11 +3141,11 @@ export function buildApproveDialog(
  *  (no `custom`, modules unavailable, or RPC mode, whose `custom()` returns undefined unrun).
  *  `signal` closes a shown dialog (custom has no signal option, so cancellation goes through
  *  the factory's `done`). */
-async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSignal): Promise<AskChoice | undefined> {
+async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSignal): Promise<AskPick | undefined> {
 	if (typeof ui.custom !== "function") return undefined;
 	const mods = await loadDialogModules();
 	if (!mods || signal?.aborted) return undefined;
-	let finish: ((r: AskChoice | undefined) => void) | undefined;
+	let finish: ((r: AskPick | undefined) => void) | undefined;
 	const onAbort = (): void => finish?.(undefined);
 	signal?.addEventListener("abort", onAbort, { once: true });
 	// ctrl+o expands/collapses the dialog's own code view. pi delivers the key to the focused dialog (expansion.toggle);
@@ -3104,23 +3155,24 @@ async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSig
 	const initialExpanded = canToggle ? ui.getToolsExpanded() : undefined;
 	const shown: ApproveDialogSpec = canToggle ? { ...spec, expansion: { get: () => ui.getToolsExpanded(), toggle: () => ui.setToolsExpanded(!ui.getToolsExpanded()) } } : spec;
 	try {
-		const r = await ui.custom<AskChoice | undefined>((tui, theme, _kb, done) => {
+		const r = await ui.custom<AskPick | undefined>((tui, theme, _kb, done) => {
 			finish = done;
 			const dialog = buildApproveDialog(mods, tui, theme, shown, done);
 			if (signal?.aborted) queueMicrotask(() => done(undefined));
 			return dialog;
 		});
-		return isAskChoice(r) ? r : undefined;
+		return isAskPick(r) ? r : undefined;
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
 		if (initialExpanded !== undefined && ui.getToolsExpanded() !== initialExpanded) ui.setToolsExpanded(initialExpanded);
 	}
 }
 
-/** Asks the user. The rich dialog offers Yes / No / "No, with explanation…" (free text forwarded
- *  to the agent) and, when `explain` is given, "Explain…" (optional free-text question to the
- *  EXPLAIN-GATE role; the answer is shown in the re-opened dialog). Escape in a follow-up input
- *  returns to the dialog. Hosts without the rich dialog get the plain yes/no `confirm`.
+/** Asks the user. The rich dialog offers Yes / No (while highlighted, an inline field `No, <text>`;
+ *  non-empty text is forwarded to the agent as the decline reason, Escape declines without text) and,
+ *  when `explain` is given, "Explain…" (optional free-text question to the EXPLAIN-GATE role; the
+ *  answer is shown in the re-opened dialog). Escape in the Explain question input returns to the
+ *  dialog. Hosts without the rich dialog get the plain yes/no `confirm`.
  *  Dialogs are serialized process-wide (omp queues `confirm`/`select` but not `custom`), and
  *  `signal` cancels a pending or shown dialog → "aborted". */
 async function confirmAsk(ui: UiContext, spec: ApproveDialogSpec, opts: { signal?: AbortSignal; explain?: (question: string | null) => Promise<ExplainGateResult> } = {}): Promise<AskDecision | "aborted"> {
@@ -3130,21 +3182,14 @@ async function confirmAsk(ui: UiContext, spec: ApproveDialogSpec, opts: { signal
 		let explanation: string | undefined;
 		for (;;) {
 			if (signal?.aborted) return "aborted";
-			const choice = await pickAsk(ui, { ...spec, explain: explain !== undefined, explanation }, signal);
+			const pick = await pickAsk(ui, { ...spec, explain: explain !== undefined, explanation }, signal);
 			if (signal?.aborted) return "aborted";
-			if (choice === undefined) {
+			if (pick === undefined) {
 				const ok = await ui.confirm(spec.title, spec.fallbackMessage, dialogOpts);
 				if (signal?.aborted) return "aborted";
 				return ok ? { allow: true } : { allow: false };
 			}
-			if (choice === "yes") return { allow: true };
-			if (choice === "no") return { allow: false };
-			if (choice === "no-reason") {
-				const text = await ui.input("Why decline? The agent will be told.", "explanation (optional)", dialogOpts);
-				if (signal?.aborted) return "aborted";
-				if (text === undefined) continue;
-				return { allow: false, reason: text.trim() || undefined };
-			}
+			if (pick !== "explain") return pick;
 			const question = await ui.input(`${EXPLAIN_GATE_ROLE}: ask a question`, "specific question (empty = default explanation)", dialogOpts);
 			if (signal?.aborted) return "aborted";
 			if (question === undefined || explain === undefined) continue;

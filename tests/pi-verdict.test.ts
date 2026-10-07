@@ -2914,22 +2914,25 @@ describe("approve dialog routing", () => {
 
 describe("EXPLAIN-GATE role and decline explanation", () => {
 	const DOWN = "\x1b[B";
+	const UP = "\x1b[A";
 	const ASK = { text: "<verdict>ask</verdict> needs a human" };
 
-	test("the dialog offers the explanation-decline option; Explain only for asks whose content may reach a model", async () => {
+	test("the dialog merges No and the explanation; Explain only for asks whose content may reach a model", async () => {
 		const h = session({});
 		h.responses = [ASK];
 		const rendered: string[] = [];
 		driveDialogs(h, [], rendered);
 		await toolCall(h, "bash", { command: "cargo build" });
-		expect(rendered[0]).toContain("No, with explanation…");
+		expect(rendered[0]).not.toContain("with explanation");
+		expect(rendered[0]).toContain("Yes");
+		expect(rendered[0]).toContain("No");
 		expect(rendered[0]).toContain("Explain…");
 
 		const p = session({});
 		const protectedRender: string[] = [];
 		driveDialogs(p, [], protectedRender);
 		await toolCall(p, "read", { path: "/proj/.omp/notes.md" });
-		expect(protectedRender[0]).toContain("No, with explanation…");
+		expect(protectedRender[0]).not.toContain("with explanation");
 		expect(protectedRender[0]).not.toContain("Explain");
 	});
 
@@ -2938,7 +2941,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		h.responses = [ASK, { text: "Compiles the project; builds run arbitrary scripts." }];
 		h.inputs = ["does it touch the network?"];
 		const rendered: string[] = [];
-		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], rendered);
+		driveDialogs(h, [[DOWN, DOWN, "\r"], ["\r"]], rendered);
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(r).toBeUndefined(); // second dialog: Yes
 		expect(h.calls).toHaveLength(2);
@@ -2959,7 +2962,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		const h = session({});
 		h.responses = [ASK, { text: "Compiles the project." }];
 		h.inputs = [""];
-		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], [DOWN, "\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, "\r"], [DOWN, "\r"]], []);
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(String(h.calls[1].messages[0].content)).toContain(`Task: ${EXPLAIN_GATE_DEFAULT_PROMPT}`);
 		expect(h.calls[1].model).toBe("mock/glm");
@@ -2973,7 +2976,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		h.findMap = { "mock/explain": { id: "explain-model" } };
 		h.responses = [ASK, { text: "ok" }];
 		h.inputs = [""];
-		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, "\r"], ["\r"]], []);
 		await toolCall(h, "bash", { command: "cargo build" });
 		expect(h.calls[1].model).toBe("explain-model");
 		expect(h.calls[1].effort).toBe("low");
@@ -2985,7 +2988,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		h.responses = [ASK, new Error("boom")];
 		h.inputs = [""];
 		const rendered: string[] = [];
-		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"]], rendered); // second dialog: Escape
+		driveDialogs(h, [[DOWN, DOWN, "\r"]], rendered); // second dialog: Escape
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("EXPLAIN-GATE failed") && m.includes("boom"))).toBe(true);
 		expect(rendered).toHaveLength(2);
@@ -2998,42 +3001,75 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		const h = session({});
 		h.responses = [ASK];
 		h.inputs = [undefined];
-		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, "\r"], ["\r"]], []);
 		expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
 		expect(h.calls).toHaveLength(1);
 	});
 
-	test("No, with explanation: the user's text reaches the agent in the block reason", async () => {
+	test("No with inline text: the user's text reaches the agent in the block reason", async () => {
 		const h = session({});
 		h.responses = [ASK];
-		h.inputs = ["use npm ci instead\nthanks"];
-		driveDialogs(h, [[DOWN, DOWN, "\r"]], []);
+		driveDialogs(h, [[DOWN, ..."use npm ci instead".split(""), "\r"]], []);
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(r.block).toBe(true);
 		expect(r.reason).toContain("user-declined");
-		expect(r.reason).toContain('saying: "use npm ci instead thanks"');
+		expect(r.reason).toContain('saying: "use npm ci instead"');
 	});
 
-	test("No, with explanation: Escape on the text prompt returns to the dialog; empty text declines like plain No", async () => {
-		const back = session({});
-		back.responses = [ASK];
-		back.inputs = [undefined];
-		driveDialogs(back, [[DOWN, DOWN, "\r"], ["\r"]], []);
-		expect(await toolCall(back, "bash", { command: "cargo build" })).toBeUndefined();
-
-		const empty = session({});
-		empty.responses = [ASK];
-		empty.inputs = ["  "];
-		driveDialogs(empty, [[DOWN, DOWN, "\r"]], []);
-		const r = await toolCall(empty, "bash", { command: "cargo build" });
-		expect(r.block).toBe(true);
-		expect(r.reason).not.toContain("saying");
-	});
-
-	test("protected-path ask: declining with an explanation works, and no model call is made", async () => {
+	test("No with pasted text: newlines are stripped by the inline field", async () => {
 		const h = session({});
-		h.inputs = ["not that file"];
-		driveDialogs(h, [[DOWN, DOWN, "\r"]], []);
+		h.responses = [ASK];
+		driveDialogs(h, [[DOWN, "\x1b[200~fix\nit\x1b[201~", "\r"]], []);
+		const r = await toolCall(h, "bash", { command: "cargo build" });
+		expect(r.block).toBe(true);
+		expect(r.reason).toContain('saying: "fixit"');
+	});
+
+	test("No row: empty text declines plainly, Escape discards typed text, text survives navigation, j/k are text", async () => {
+		const plain = session({});
+		plain.responses = [ASK];
+		driveDialogs(plain, [[DOWN, "\r"]], []);
+		const p = await toolCall(plain, "bash", { command: "cargo build" });
+		expect(p.block).toBe(true);
+		expect(p.reason).not.toContain("saying");
+
+		const esc = session({});
+		esc.responses = [ASK];
+		driveDialogs(esc, [[DOWN, "a", "b", "\x1b"]], []);
+		const e = await toolCall(esc, "bash", { command: "cargo build" });
+		expect(e.block).toBe(true);
+		expect(e.reason).not.toContain("saying");
+
+		const nav = session({});
+		nav.responses = [ASK];
+		driveDialogs(nav, [[DOWN, "x", UP, DOWN, "\r"]], []);
+		const n = await toolCall(nav, "bash", { command: "cargo build" });
+		expect(n.reason).toContain('saying: "x"');
+
+		const vim = session({});
+		vim.responses = [ASK];
+		driveDialogs(vim, [[DOWN, "j", "k", "\r"]], []);
+		const v = await toolCall(vim, "bash", { command: "cargo build" });
+		expect(v.reason).toContain('saying: "jk"');
+	});
+
+	test("No row renders as an inline field: placeholder when empty, typed text after `No, `", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		const rendered: string[] = [];
+		const after: string[] = [];
+		driveDialogs(h, [[DOWN, "f", "o", "\x1b"]], rendered, after);
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(rendered[0]!.split("\n").some((l) => l.trim() === "No")).toBe(true);
+		expect(after[0]).toContain("→ No, ");
+		expect(after[0]).toContain("tell the agent what to do instead");
+		expect(after[2]).toContain("→ No, fo");
+		expect(after[2]).not.toContain("tell the agent what to do instead");
+	});
+
+	test("protected-path ask: declining with inline text works, and no model call is made", async () => {
+		const h = session({});
+		driveDialogs(h, [[DOWN, ..."not that file".split(""), "\r"]], []);
 		const r = await toolCall(h, "read", { path: "/proj/.omp/notes.md" });
 		expect(r.block).toBe(true);
 		expect(r.reason).toContain('saying: "not that file"');
@@ -3081,7 +3117,10 @@ describe("ask dialog mouse clicks", () => {
 
 	/** SGR click (button `b`, press `M` or release `m`) on the option labelled `label`, below the 3-line filler. */
 	const click = (label: string, b = 0, kind: "M" | "m" = "M") => (lines: string[]): string => {
-		const i = lines.findIndex((l) => l.trim() === `→ ${label}` || l.trim() === label);
+		const i = lines.findIndex((l) => {
+			const t = l.trim().replace(/^→ /, "");
+			return t === label || t.startsWith(`${label},`);
+		});
 		if (i < 0) throw new Error(`option ${label} not rendered`);
 		return `\x1b[<${b};5;${3 + i + 1}${kind}`;
 	};
@@ -3121,6 +3160,12 @@ describe("ask dialog mouse clicks", () => {
 	test("releases and wheel events are ignored", async () => {
 		const r = await run([click("Yes", 0, "m"), click("Yes", 0, "m"), click("Yes", 64), click("Yes", 64), "\x1b"]);
 		expect(r.block).toBe(true);
+	});
+
+	test("typing into the highlighted No row, then clicking it twice, declines with the text", async () => {
+		const r = await run([click("No"), "o", "k", click("No"), click("No")]);
+		expect(r.block).toBe(true);
+		expect(r.reason).toContain('saying: "ok"');
 	});
 
 	test("host without layout metrics: clicks are ignored without throwing", async () => {
