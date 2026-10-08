@@ -3414,6 +3414,9 @@ export function modeStatusText(mode: ApprovalMode, theme: Pick<Theme, "fg">): st
 /** Status-bar key of the mode chip (separate from the footer's "auto-mode" key). */
 const MODE_STATUS_KEY = "verdict-mode";
 
+/** omp model roles pi-verdict reads: `judge` is omp's built-in role (gray-zone classifier); the other two are custom chat roles (listed in `/model` → Roles when assigned or tagged via omp's `modelTags`). */
+export const VERDICT_MODEL_ROLES = { classifier: "judge", fallback: "verdict-fallback", explain: "explain-gate" } as const;
+
 export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	pi.registerFlag("verdict-mode", { description: "Session approval mode: default|yolo|noAutoDeny|off", type: "string" });
 	pi.registerFlag("auto-mode-model", { description: "Classifier model as provider/id[:thinking] (pi --model syntax; default: inherit session model)", type: "string" });
@@ -3514,24 +3517,21 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Classifier model as the footer shows it: same precedence as resolveClassifier, but side-effect free (no warnings, no calls). */
 	function footerInfo(ctx: ExtensionContext): FooterInfo {
 		const rules = state.userRules;
-		const raw = (pi.getFlag("auto-mode-model") as string | undefined) ?? process.env.PI_AUTO_MODE_MODEL ?? rules.classifierModel;
 		const session = ctx.model ?? null;
 		let classifier: FooterInfo["classifier"];
-		if (raw) {
-			const { specPart, level } = parseModelSpec(raw, () => {});
-			const thinking = level ?? "off";
-			const model = findAuthedModel(ctx, specPart);
-			if (model) classifier = { id: model.id, thinking, state: "configured" };
-			else if (session) classifier = { id: session.id, thinking, state: "unavailable" };
+		const pick = classifierPick(ctx, false);
+		if (pick) {
+			const r = resolvePick(ctx, pick, () => {});
+			if (r.model) classifier = { id: r.model.id, thinking: r.thinking, state: "configured" };
+			else if (session) classifier = { id: session.id, thinking: r.thinking, state: "unavailable" };
 			else classifier = { id: null, thinking: "off", state: "none" };
 		} else {
 			classifier = session ? { id: session.id, thinking: "off", state: "inherited" } : { id: null, thinking: "off", state: "none" };
 		}
 		let fallback: FooterInfo["fallback"] = null;
-		if (rules.classifierFallbackModel) {
-			const { specPart } = parseModelSpec(rules.classifierFallbackModel, () => {});
-			fallback = { id: findAuthedModel(ctx, specPart)?.id ?? null, mode: rules.classifierFallbackMode };
-		}
+		const fbRole = roleSelector(VERDICT_MODEL_ROLES.fallback);
+		const fbPick: ModelPick | null = fbRole ? { raw: fbRole, via: "role", role: VERDICT_MODEL_ROLES.fallback } : rules.classifierFallbackModel ? { raw: rules.classifierFallbackModel, via: "spec" } : null;
+		if (fbPick) fallback = { id: resolvePick(ctx, fbPick, () => {}).model?.id ?? null, mode: rules.classifierFallbackMode };
 		return {
 			mode: state.userRules.mode,
 			classifier,
@@ -3988,26 +3988,87 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		return model && ctx.modelRegistry.hasConfiguredAuth(model) ? model : null;
 	}
 
+	// ---- omp model roles (no-ops on real pi: it has no `pi.pi.settings`) ----
+
+	/** Explicitly assigned selector of an omp model role, or null (unassigned, real pi, settings not yet initialized).
+	 *  Reads the raw assignment, so omp's built-in priority defaults for unassigned built-in roles never count. */
+	function roleSelector(role: string): string | null {
+		// `pi.pi.settings` exists only on omp's ExtensionAPI; pi's type has no such member, so the shape is asserted once here
+		const ompApi = pi as unknown as { pi?: { settings?: { getModelRole?: (r: string) => string | undefined } } };
+		try {
+			const raw = ompApi.pi?.settings?.getModelRole?.(role);
+			const t = typeof raw === "string" ? raw.trim() : "";
+			return t === "" ? null : t;
+		} catch {
+			return null; // omp's settings proxy throws "Settings not initialized" before init
+		}
+	}
+
+	/** Resolve a role selector (provider/id, @role alias, comma list) against authenticated models via omp's `ctx.models`. */
+	function roleModel(ctx: ExtensionContext, raw: string): NonNullable<ExtensionContext["model"]> | null {
+		// `models` exists only on omp's ExtensionContext; pi's type has no such member, so the shape is asserted once here
+		const ompCtx = ctx as unknown as { models?: { resolve?: (s: string) => ExtensionContext["model"] } };
+		return ompCtx.models?.resolve?.(raw) ?? null;
+	}
+
+	/** Thinking level from the first comma-separated selector's suffix. omp-only suffixes (auto/inherit) get the invalid-suffix warning → off. */
+	function roleThinking(raw: string, warnOnce: (m: string) => void): ThinkingLevel {
+		return (parseModelSpec(raw.split(",")[0].trim(), warnOnce).level ?? "off") as ThinkingLevel;
+	}
+
+	/** A configured model selection: `role` = omp model role assignment, `spec` = pi-verdict "provider/id[:thinking]" string. */
+	type ModelPick = { raw: string; via: "role" | "spec"; role?: string };
+
+	function resolvePick(ctx: ExtensionContext, pick: ModelPick, warnOnce: (m: string) => void): { model: NonNullable<ExtensionContext["model"]> | null; thinking: ThinkingLevel } {
+		if (pick.via === "role") return { model: roleModel(ctx, pick.raw), thinking: roleThinking(pick.raw, warnOnce) };
+		const { specPart, level } = parseModelSpec(pick.raw, warnOnce);
+		return { model: findAuthedModel(ctx, specPart), thinking: (level ?? "off") as ThinkingLevel };
+	}
+
+	let warnedJudgeKind = false;
+	/** Classifier selection, first set source wins: flag > env > omp `judge` role > `classifierModel` > none (session model).
+	 *  A `judge` assignment resolving to a non-chat model (native judgment runner, tiny model) is not callable and is skipped
+	 *  (warning only when `warn`; the footer passes false to stay side-effect free). */
+	function classifierPick(ctx: ExtensionContext, warn: boolean): ModelPick | null {
+		const top = (pi.getFlag("auto-mode-model") as string | undefined) ?? process.env.PI_AUTO_MODE_MODEL;
+		if (top !== undefined) return top ? { raw: top, via: "spec" } : null;
+		const judge = roleSelector(VERDICT_MODEL_ROLES.classifier);
+		if (judge) {
+			const judgeModel = roleModel(ctx, judge);
+			const kind = judgeModel && "kind" in judgeModel && typeof judgeModel.kind === "string" ? judgeModel.kind : undefined;
+			if (kind === undefined || kind === "chat") return { raw: judge, via: "role", role: VERDICT_MODEL_ROLES.classifier };
+			if (warn && !warnedJudgeKind) {
+				warnedJudgeKind = true;
+				ctx.ui.notify(`pi-verdict: model role "${VERDICT_MODEL_ROLES.classifier}" = "${judge}" is a ${kind} model pi-verdict cannot call — using classifierModel / session model for the gate`, "warning");
+			}
+		}
+		const cfg = state.userRules.classifierModel;
+		return cfg ? { raw: cfg, via: "spec" } : null;
+	}
+
 	/** 解析分类器模型与思考级别:CLI flag > 环境变量 > 配置文件(classifierModel) >
 	 *  自省(会话模型)。不可用回退会话模型并警告一次;null = 连会话模型都没有 →
 	 *  fail-closed。经 AdjudicateEnv.getModel 惰性调用(仅灰区),回退警告不会出现在
 	 *  规则已裁决的调用上。 */
 	function resolveClassifier(ctx: ExtensionContext): { model: NonNullable<ExtensionContext["model"]>; thinking: ThinkingLevel } | null {
-		const raw =
-			(pi.getFlag("auto-mode-model") as string | undefined) ?? process.env.PI_AUTO_MODE_MODEL ?? state.userRules.classifierModel;
+		const pick = classifierPick(ctx, true);
 		let thinking: ThinkingLevel = "off";
-		if (raw) {
-			const { specPart, level } = parseModelSpec(raw, (msg) => {
+		if (pick) {
+			const r = resolvePick(ctx, pick, (msg) => {
 				if (warnedClassifierModel) return;
 				warnedClassifierModel = true;
 				ctx.ui.notify(msg, "warning");
 			});
-			thinking = (level ?? "off") as ThinkingLevel;
-			const model = findAuthedModel(ctx, specPart);
-			if (model) return { model, thinking };
+			if (r.model) return { model: r.model, thinking: r.thinking };
+			thinking = r.thinking;
 			if (!warnedClassifierModel) {
 				warnedClassifierModel = true; // 每会话仅警告一次,避免逐调用刷屏
-				ctx.ui.notify(`pi-verdict: classifier model "${raw}" unavailable (not found or no configured auth), falling back to session model (self-reflection)`, "warning");
+				ctx.ui.notify(
+					pick.via === "role"
+						? `pi-verdict: model role "${pick.role}" = "${pick.raw}" unavailable (not found or no configured auth), falling back to session model (self-reflection)`
+						: `pi-verdict: classifier model "${pick.raw}" unavailable (not found or no configured auth), falling back to session model (self-reflection)`,
+					"warning",
+				);
 			}
 		}
 		// 自省:继承当前会话模型;显式指定的思考级别在回退时仍生效(原语义)
@@ -4022,19 +4083,24 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	 *  + null (shadow: inert; enforce: triggered calls fail-closed, see runFallbackCascade).
 	 *  Resolved lazily via AdjudicateEnv.getFallbackModel, only after the gate fires. */
 	function resolveFallbackClassifier(ctx: ExtensionContext): { model: NonNullable<ExtensionContext["model"]>; thinking: ThinkingLevel } | null {
-		const raw = state.userRules.classifierFallbackModel;
-		if (!raw) return null;
-		const { specPart, level } = parseModelSpec(raw, (msg) => {
+		const roleRaw = roleSelector(VERDICT_MODEL_ROLES.fallback);
+		const cfgRaw = state.userRules.classifierFallbackModel;
+		const pick: ModelPick | null = roleRaw ? { raw: roleRaw, via: "role", role: VERDICT_MODEL_ROLES.fallback } : cfgRaw ? { raw: cfgRaw, via: "spec" } : null;
+		if (!pick) return null;
+		const r = resolvePick(ctx, pick, (msg) => {
 			if (warnedFallbackSuffix) return;
 			warnedFallbackSuffix = true;
 			ctx.ui.notify(msg, "warning");
 		});
-		const thinking = (level ?? "off") as ThinkingLevel;
-		const model = findAuthedModel(ctx, specPart);
-		if (model) return { model, thinking };
+		if (r.model) return { model: r.model, thinking: r.thinking };
 		if (!warnedFallbackModel) {
 			warnedFallbackModel = true; // one warning per session
-			ctx.ui.notify(`pi-verdict: fallback model "${raw}" unavailable (not found or no configured auth) — classifierFallbackModel inactive this session`, "warning");
+			ctx.ui.notify(
+				pick.via === "role"
+					? `pi-verdict: model role "${pick.role}" = "${pick.raw}" unavailable (not found or no configured auth) — classifierFallbackModel inactive this session`
+					: `pi-verdict: fallback model "${pick.raw}" unavailable (not found or no configured auth) — classifierFallbackModel inactive this session`,
+				"warning",
+			);
 		}
 		return null;
 	}
@@ -4045,20 +4111,26 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	 *  user-initiated, so unlike the second-layer classifier there is no double-billing concern). An
 	 *  unavailable configured model falls back to the session model with a one-time warning. */
 	function resolveExplainGate(ctx: ExtensionContext): { model: NonNullable<ExtensionContext["model"]>; thinking: ThinkingLevel } | null {
-		const raw = state.userRules.explainGateModel;
+		const roleRaw = roleSelector(VERDICT_MODEL_ROLES.explain);
+		const cfgRaw = state.userRules.explainGateModel;
+		const pick: ModelPick | null = roleRaw ? { raw: roleRaw, via: "role", role: VERDICT_MODEL_ROLES.explain } : cfgRaw ? { raw: cfgRaw, via: "spec" } : null;
 		let thinking: ThinkingLevel = "off";
-		if (raw) {
-			const { specPart, level } = parseModelSpec(raw, (msg) => {
+		if (pick) {
+			const r = resolvePick(ctx, pick, (msg) => {
 				if (warnedExplainSuffix) return;
 				warnedExplainSuffix = true;
 				ctx.ui.notify(msg, "warning");
 			});
-			thinking = (level ?? "off") as ThinkingLevel;
-			const model = findAuthedModel(ctx, specPart);
-			if (model) return { model, thinking };
+			if (r.model) return { model: r.model, thinking: r.thinking };
+			thinking = r.thinking;
 			if (!warnedExplainModel) {
 				warnedExplainModel = true;
-				ctx.ui.notify(`pi-verdict: ${EXPLAIN_GATE_ROLE} model "${raw}" unavailable (not found or no configured auth), falling back to session model`, "warning");
+				ctx.ui.notify(
+					pick.via === "role"
+						? `pi-verdict: ${EXPLAIN_GATE_ROLE} model role "${pick.role}" = "${pick.raw}" unavailable (not found or no configured auth), falling back to session model`
+						: `pi-verdict: ${EXPLAIN_GATE_ROLE} model "${pick.raw}" unavailable (not found or no configured auth), falling back to session model`,
+					"warning",
+				);
 			}
 		}
 		return ctx.model ? { model: ctx.model, thinking } : null;

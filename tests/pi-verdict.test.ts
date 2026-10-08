@@ -40,6 +40,8 @@ interface Harness {
 	inputs: Array<string | undefined>;
 	editors: Array<string | undefined>;
 	findMap: Record<string, any> | undefined;
+	/** omp model role assignments served by the fake `pi.pi.settings.getModelRole` (needs `session(…, { roles: true })`) */
+	roles: Record<string, string> | undefined;
 	/** `pi.sendMessage` calls (omp label path) */
 	sent: Array<{ message: any; options: any }>;
 	/** `pi.appendEntry` calls (pi label path) */
@@ -49,7 +51,7 @@ interface Harness {
 	install: (opts?: { verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }>; ompHost?: boolean }) => void;
 }
 
-function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): Harness {
+function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; roles?: boolean }): Harness {
 	const handlers: Record<string, any> = {};
 	const commands: Record<string, any> = {};
 	const shortcuts: Record<string, any> = {};
@@ -63,12 +65,14 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 	const entries: Array<[string, any]> = [];
 	const messageRenderers: Record<string, any> = {};
 	const entryRenderers: Record<string, any> = {};
-	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined };
+	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined, roles: undefined };
 	h.widgetSets = widgetSets;
+	const rolesEnabled = opts?.roles === true; // install()'s own `opts` shadows this function's
 
 	const ctx: any = {
 		cwd, hasUI: true, signal: undefined, model: { id: "mock/glm" },
 		sessionManager: { getBranch: () => branch, getSessionId: () => "s1" },
+		models: { resolve: (s: string) => h.findMap?.[s.split(",")[0].trim().replace(/:[a-z]+$/, "")] },
 		modelRegistry: {
 			// omp 18 shape (#35): no `complete` on the registry — the extension must
 			// resolve completion through the compat fallback instead
@@ -119,6 +123,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean }): H
 			sendMessage: (message: any, options: any) => { sent.push({ message, options }); },
 			appendEntry: (t: string, data: any) => { entries.push([t, data]); },
 			...(opts?.ompHost ? { logger: {}, typebox: {} } : { registerEntryRenderer: (t: string, r: any) => { entryRenderers[t] = r; } }),
+			...(rolesEnabled ? { pi: { settings: { getModelRole: (r: string) => h.roles?.[r] } } } : {}),
 		} as any, opts?.compatLoader ? { compatLoader: opts.compatLoader } : {});
 		if (prev !== undefined) process.env.PI_AUTO_MODE_DEBUG = prev; else delete process.env.PI_AUTO_MODE_DEBUG;
 	};
@@ -193,9 +198,9 @@ function driveDialogs(h: Harness, scripts: string[][], rendered: string[], after
 /** 开一个会话:按 cfg 写真实配置 → 建 harness → 装载扩展。顺序约束(配置先于装载)
  *  内化于此;opts 统一收纳全部变体:cwd/ompRegistry 给 makeHarness,
  *  invalid/flag/debug/modelFlag/compatLoader 分别传给 setConfig 与 install。 */
-function session(cfg: Parameters<typeof setConfig>[0], opts: { cwd?: string; ompRegistry?: boolean; ompHost?: boolean; invalid?: string[]; verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> } = {}): Harness {
+function session(cfg: Parameters<typeof setConfig>[0], opts: { cwd?: string; ompRegistry?: boolean; roles?: boolean; ompHost?: boolean; invalid?: string[]; verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> } = {}): Harness {
 	setConfig(cfg, opts.invalid);
-	const h = makeHarness(opts.cwd, { ompRegistry: opts.ompRegistry });
+	const h = makeHarness(opts.cwd, { ompRegistry: opts.ompRegistry, roles: opts.roles });
 	h.install({ verdictMode: opts.verdictMode, debug: opts.debug, modelFlag: opts.modelFlag, compatLoader: opts.compatLoader, ompHost: opts.ompHost });
 	return h;
 }
@@ -3983,5 +3988,107 @@ describe("approval modes", () => {
 			expect(bad.notifies.some(([m, l]) => l === "warning" && m.includes("not a valid value"))).toBe(true);
 			expect(fs.existsSync(SESSION_FILE())).toBe(false);
 		});
+	});
+});
+
+describe("omp model roles", () => {
+	const ALLOW = { text: "<verdict>allow</verdict> ok" };
+	const ASK = { text: "<verdict>ask</verdict> needs a human" };
+	const JEV_ALLOW_49 = "<verdict>allow</verdict> jev: allow 66% (confidence 49%; ask 33%, deny 1%)";
+	const DOWN = "\x1b[B";
+	const rolesSession = (cfg: Parameters<typeof session>[0], roles: Record<string, string>, opts: Parameters<typeof session>[1] = {}): Harness => {
+		const h = session(cfg, { ...opts, roles: true });
+		h.roles = roles;
+		return h;
+	};
+
+	test("the judge role beats classifierModel and carries its thinking suffix", async () => {
+		const h = rolesSession({ classifierModel: "zai/flash" }, { judge: "r/cls:low" });
+		h.findMap = { "r/cls": { id: "cls" }, "zai/flash": { id: "glm-4-flash" } };
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(h.calls[0].model).toBe("cls");
+		expect(h.calls[0].effort).toBe("low");
+	});
+
+	test("without any role assignment the config classifierModel is used (real pi behavior)", async () => {
+		const h = rolesSession({ classifierModel: "zai/flash" }, {});
+		h.findMap = { "r/cls": { id: "cls" }, "zai/flash": { id: "glm-4-flash" } };
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(h.calls[0].model).toBe("glm-4-flash");
+	});
+
+	test("the CLI flag beats the judge role", async () => {
+		const h = rolesSession({}, { judge: "r/cls" }, { modelFlag: "prov/flagged" });
+		h.findMap = { "r/cls": { id: "cls" }, "prov/flagged": { id: "flagged-model" } };
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(h.calls[0].model).toBe("flagged-model");
+	});
+
+	test("a judge role resolving to a native judgment runner is skipped with one warning; a kind-less jev model is used", async () => {
+		const h = rolesSession({ classifierModel: "zai/flash" }, { judge: "r/native" });
+		h.findMap = { "r/native": { id: "native", kind: "judge" }, "r/jev": { id: "jev-latest", api: "jev-decisions" }, "zai/flash": { id: "glm-4-flash" } };
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "cargo build" });
+		await toolCall(h, "bash", { command: "cargo test" });
+		expect(h.calls.map((c) => c.model)).toEqual(["glm-4-flash", "glm-4-flash"]);
+		expect(h.notifies.filter(([m]) => m.includes("is a judge model pi-verdict cannot call"))).toHaveLength(1);
+		h.roles = { judge: "r/jev" };
+		await toolCall(h, "bash", { command: "cargo fmt" });
+		expect(h.calls[2].model).toBe("jev-latest");
+	});
+
+	test("an unresolvable judge role warns once and falls back to the session model, not to classifierModel", async () => {
+		const h = rolesSession({ classifierModel: "zai/flash" }, { judge: "r/gone" });
+		h.findMap = { "zai/flash": { id: "glm-4-flash" } };
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "cargo build" });
+		await toolCall(h, "bash", { command: "cargo test" });
+		expect(h.calls.map((c) => c.model)).toEqual(["mock/glm", "mock/glm"]);
+		expect(h.notifies.filter(([m]) => m.includes('model role "judge"') && m.includes("unavailable"))).toHaveLength(1);
+	});
+
+	test("the verdict-fallback role beats classifierFallbackModel for the cascade call", async () => {
+		const h = rolesSession({ confidenceThreshold: 50, classifierFallbackModel: "mock/fb" }, { "verdict-fallback": "r/fbrole" });
+		h.findMap = { "mock/fb": { id: "fb-model" }, "r/fbrole": { id: "fbrole-model" } };
+		h.responses = [{ text: JEV_ALLOW_49 }, { text: "<verdict>deny</verdict> unsafe" }];
+		h.confirmAnswer = true;
+		await toolCall(h, "bash", { command: "ls -la /tmp" });
+		expect(h.calls.map((c) => c.model)).toEqual(["mock/glm", "fbrole-model"]);
+	});
+
+	test("an unavailable verdict-fallback role warns once and runs no fallback call (config key is not consulted)", async () => {
+		const h = rolesSession({ confidenceThreshold: 50, classifierFallbackModel: "mock/fb" }, { "verdict-fallback": "r/gone" });
+		h.findMap = { "mock/fb": { id: "fb-model" } };
+		h.responses = [{ text: JEV_ALLOW_49 }];
+		h.confirmAnswer = true;
+		await toolCall(h, "bash", { command: "ls -la /tmp" });
+		await toolCall(h, "bash", { command: "ls -la /var" });
+		expect(h.calls).toHaveLength(2); // one classifier call per command, zero fallback calls
+		expect(h.calls.every((c) => c.model === "mock/glm")).toBe(true);
+		expect(h.notifies.filter(([m]) => m.includes('model role "verdict-fallback"'))).toHaveLength(1);
+	});
+
+	test("the explain-gate role beats explainGateModel", async () => {
+		const h = rolesSession({ explainGateModel: "mock/explain" }, { "explain-gate": "r/xp:low" });
+		h.findMap = { "mock/explain": { id: "explain-model" }, "r/xp": { id: "xp-model" } };
+		h.responses = [ASK, { text: "ok" }];
+		h.inputs = [""];
+		driveDialogs(h, [[DOWN, DOWN, "\r"], ["\r"]], []);
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(h.calls[1].model).toBe("xp-model");
+		expect(h.calls[1].effort).toBe("low");
+	});
+
+	test("the footer shows the role-picked classifier and fallback ids", async () => {
+		const h = rolesSession({}, { judge: "r/cls", "verdict-fallback": "r/fbrole" });
+		h.findMap = { "r/cls": { id: "cls" }, "r/fbrole": { id: "fbrole-model" } };
+		await h.handlers.session_start({}, h.ctx);
+		const s = h.statusSets.at(-1)![1];
+		expect(s).toContain("cls");
+		expect(s).toContain("↳ fbrole-model");
+		expect(s).not.toContain("↺");
 	});
 });
