@@ -4086,13 +4086,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		return toolCallLine(toolName, input);
 	}
 
-	// Verdict label sink: a separate transcript row after the tool block.
+	// Verdict label sink: a separate transcript row after the tool block. Rule-allow labels (`how: "rule"`) are recorded but never rendered (noise); other labels render.
 	// pi: TUI-only custom entry (persisted, not in LLM context). omp: `aside` custom message (model-visible, drained at the next step boundary; steer would abort the in-flight tool batch).
 	type LabelComponent = { render(width: number): string[]; invalidate(): void };
 	type LabelRenderer = (data: unknown, theme: Theme) => LabelComponent | undefined;
 	const labelComponent: LabelRenderer = (data, theme) => {
 		const l = asVerdictLabel(data);
-		return l ? { render: (w: number) => renderVerdictLabel(l, theme, state.userRules.footer === "full", w), invalidate() {} } : undefined;
+		return l && l.how !== "rule" ? { render: (w: number) => renderVerdictLabel(l, theme, state.userRules.footer === "full", w), invalidate() {} } : undefined;
 	};
 	type OmpSendMessage = (message: { customType: string; content: string; display: boolean; details: VerdictLabel }, options: { deliverAs: "aside" }) => void;
 	const labelHost = pi as unknown as {
@@ -4107,10 +4107,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		labelSink = (l) => labelHost.appendEntry?.call(pi, VERDICT_LABEL_TYPE, l);
 	} else if (isOmpHost && typeof labelHost.sendMessage === "function" && typeof labelHost.registerMessageRenderer === "function") {
 		labelHost.registerMessageRenderer(VERDICT_LABEL_TYPE, (message, _o, theme) => labelComponent(message.details, theme));
-		labelSink = (l) => labelHost.sendMessage?.call(pi, { customType: VERDICT_LABEL_TYPE, content: verdictLabelText(l), display: true, details: l }, { deliverAs: "aside" });
+		labelSink = (l) => labelHost.sendMessage?.call(pi, { customType: VERDICT_LABEL_TYPE, content: verdictLabelText(l), display: l.how !== "rule", details: l }, { deliverAs: "aside" });
 	}
 
-	// Verdict label after the block: a separate transcript row (pi: TUI-only custom entry; omp: aside custom message, model-visible).
+	// Verdict label after the block: a separate transcript row (pi: TUI-only custom entry; omp: aside custom message, model-visible). Rule-allow labels are recorded but not rendered (pi: renderer yields nothing; omp: display:false).
 	// No reason text, no path (ADR-0002). The result content stays untouched.
 	pi.on("tool_result", (event) => {
 		const l = typeof event.toolCallId === "string" ? state.takeLabel(event.toolCallId) : undefined;

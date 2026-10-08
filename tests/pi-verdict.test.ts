@@ -3529,11 +3529,12 @@ describe("approve dialog code expansion and verdict label", () => {
 	const LABEL_THEME = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 	const JEV_ALLOW_92 = "<verdict>allow</verdict> jev: allow 92% (confidence 85%; ask 5%, deny 3%)";
 
-	test("pi: rule allow records one TUI-only label entry and leaves the result untouched", async () => {
+	test("pi: rule allow records a label entry that renders nothing; the result is untouched", async () => {
 		const h = session({ allow: ["^ls\\b"] });
 		expect(await toolCall(h, "bash", { command: "ls" }, "c1")).toBeUndefined();
 		expect(await result(h, "c1")).toBeUndefined();
 		expect(h.entries).toEqual([["pi-verdict-label", { tool: "bash", how: "rule", jev: null }]]);
+		expect(h.entryRenderers["pi-verdict-label"]({ data: h.entries[0][1] }, { expanded: false }, LABEL_THEME)).toBeUndefined();
 		expect(await result(h, "c1")).toBeUndefined();
 		expect(h.entries).toHaveLength(1);
 		expect(h.sent).toEqual([]);
@@ -3562,17 +3563,18 @@ describe("approve dialog code expansion and verdict label", () => {
 		expect(h.entries).toHaveLength(2);
 	});
 
-	test("omp: rule allow sends an aside custom message, never a pi entry", async () => {
+	test("omp: rule allow sends a hidden aside custom message, never a pi entry", async () => {
 		const h = session({ allow: ["^ls\\b"] }, { ompHost: true });
 		expect(await toolCall(h, "bash", { command: "ls" }, "c1")).toBeUndefined();
 		expect(await result(h, "c1")).toBeUndefined();
 		expect(h.sent).toEqual([
 			{
-				message: { customType: "pi-verdict-label", content: "[auto-mode] bash allowed: rule", display: true, details: { tool: "bash", how: "rule", jev: null } },
+				message: { customType: "pi-verdict-label", content: "[auto-mode] bash allowed: rule", display: false, details: { tool: "bash", how: "rule", jev: null } },
 				options: { deliverAs: "aside" },
 			},
 		]);
 		expect(h.entries).toEqual([]);
+		expect(h.messageRenderers["pi-verdict-label"](h.sent[0].message, { expanded: false }, LABEL_THEME)).toBeUndefined();
 	});
 
 	test("omp: jev verdict carries numbers and renders a bar that drops on narrow widths", async () => {
@@ -3582,6 +3584,7 @@ describe("approve dialog code expansion and verdict label", () => {
 		await result(h, "c1");
 		const msg = h.sent[0].message;
 		expect(msg.content).toBe("[auto-mode] bash allowed: classifier · jev allow 92%");
+		expect(msg.display).toBe(true);
 		expect(msg.details.jev).toEqual({ choice: "allow", probabilities: { allow: 92, ask: 5, deny: 3 }, confidence: 85 });
 		const component = h.messageRenderers["pi-verdict-label"](msg, { expanded: false }, LABEL_THEME);
 		const wide = component.render(80)[0];
