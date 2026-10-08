@@ -79,6 +79,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `/automode default|yolo|noautodeny|off` — set the **approval mode** for this session (persisted per session id)
 - `ctrl+shift+y` — cycle the session mode `default → yolo → noAutoDeny → off → default` silently (the footer is the only feedback; rebind or disable via `toggleShortcut`)
 - `/verdict [user|local]` — edit the list rules (`allow`, `deny`, `denyPaths`, `tools`, `rules`) of the global (`user`) or project (`local`) config interactively: add / edit / remove entries, saved to disk and applied to the running session at once; also hosts the `gateOmpDir` on/off switch and the `footer` style. Other scalar keys stay hand-edited
+- `/rule [description]` — describe a rule in plain words ("always allow cargo build and test"); the session model writes one `allow` / `deny` / `denyPaths` / `tools` / `rules` entry, which is checked before you see it (up to 3 attempts: an `allow` rule an earlier layer such as the `.omp` gate would still stop is rejected, then a model critic reviews it); the preview shows which of this session's recent tool calls it would match, and you save it to the session only, the project or the global config (or edit it / amend it with feedback first). Escape cancels the waiting panel
 - footer status (`footer` key): `full` = Nerd Font powerline blocks (gate state, risky settings, classifier model, verdict counters, badges), `compact` = one plain line, `off` = none; a switched-off gate always shows as `AUTO OFF · ungated`
 
 | Option | Default | Description |

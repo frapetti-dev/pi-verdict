@@ -36,6 +36,8 @@ interface Harness {
 	confirmError: unknown;
 	/** When non-null, select answers from this queue of option prefixes (undefined = escape); null keeps selectIndex behaviour */
 	selectPicks: string[] | null;
+	/** Titles of every ui.select call, in order */
+	selectTitles: string[];
 	/** Queued answers for ui.input / ui.editor (undefined = escape) */
 	inputs: Array<string | undefined>;
 	editors: Array<string | undefined>;
@@ -65,7 +67,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 	const entries: Array<[string, any]> = [];
 	const messageRenderers: Record<string, any> = {};
 	const entryRenderers: Record<string, any> = {};
-	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined, roles: undefined };
+	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectTitles: [] as string[], selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined, roles: undefined };
 	h.widgetSets = widgetSets;
 	const rolesEnabled = opts?.roles === true; // install()'s own `opts` shadows this function's
 
@@ -95,8 +97,9 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 				h.confirmMsgs.push(m);
 				return h.confirmAnswer;
 			},
-			select: async (_t: string, options: string[]) => {
+			select: async (t: string, options: string[]) => {
 				h.selects++;
+				h.selectTitles.push(t);
 				if (h.selectPicks === null) return h.selectIndex === null ? undefined : options[h.selectIndex];
 				const prefix = h.selectPicks.shift();
 				return prefix === undefined ? undefined : options.find((o) => o.startsWith(prefix));
@@ -2549,6 +2552,165 @@ describe("/verdict config editor", () => {
 		await run(h, "user", { picks: ["gateOmpDir", "Done"] });
 		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("gateOmpDir") && m.includes("not a boolean"))).toBe(true);
+	});
+});
+
+describe("/rule command", () => {
+	const USER_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
+	const readUser = () => JSON.parse(fs.readFileSync(USER_FILE(), "utf8"));
+	const SESSION_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict-sessions", "s1.json");
+	const gen = (kind: string, value: string) => ({ text: `<kind>${kind}</kind><value>${value}</value> matches it` });
+	const ok = (why = "fine") => ({ text: `<verdict>ok</verdict> ${why}` });
+	async function run(h: Harness, arg: string, script: { picks: string[]; editors?: Array<string | undefined> }): Promise<void> {
+		await h.handlers.session_start({}, h.ctx);
+		h.selectPicks = script.picks;
+		h.editors = script.editors ?? [];
+		await h.commands.rule.handler(arg, h.ctx);
+	}
+
+	test("global allow: saved to the user file and takes effect without a classifier call", async () => {
+		const h = session({});
+		h.responses = [gen("allow", "^cargo build\\b"), ok()];
+		await run(h, "allow cargo build", { picks: ["Save — global"] });
+		expect(readUser().allow.at(-1)).toBe("^cargo build\\b");
+		expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
+		expect(h.calls).toHaveLength(2); // generator + critic; the gated call itself needs no classifier
+	});
+
+	test("session deny is appended to the effective list, persisted, and survives a reload", async () => {
+		const h = session({ deny: ["^keepme"] });
+		h.responses = [gen("deny", "^git push\\b")];
+		const before = fs.readFileSync(USER_FILE(), "utf8");
+		await run(h, "never git push", { picks: ["Save — session"] });
+		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
+		expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8")).ruleAdditions.deny).toEqual(["^git push\\b"]);
+		const callsAfterGen = h.calls.length;
+		expect((await toolCall(h, "bash", { command: "git push origin main" }))?.block).toBe(true);
+		expect((await toolCall(h, "bash", { command: "keepme now" }))?.block).toBe(true);
+		expect(h.calls).toHaveLength(callsAfterGen);
+		await h.handlers.session_start({}, h.ctx);
+		expect((await toolCall(h, "bash", { command: "git push origin main" }))?.block).toBe(true);
+	});
+
+	test("project: first add offers the global copy and warns the project is untrusted", async () => {
+		await withTempDir("pv-rule-cmd-", async (dir) => {
+			const h = session({ allow: ["^g"] }, { cwd: dir });
+			h.responses = [gen("allow", "^p")];
+			await run(h, "allow p", { picks: ["Save — project", "Copy of global"] });
+			const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
+			expect(JSON.parse(fs.readFileSync(path.join(dir, dot, "pi-verdict.json"), "utf8")).allow).toEqual(["^g", "^p"]);
+			expect(h.notifies.some(([m, l]) => l === "info" && m.includes("is not trusted"))).toBe(true);
+		});
+	});
+
+	test("invalid regex hides every Save option and nothing is written", async () => {
+		const h = session({});
+		h.responses = [gen("allow", "(")];
+		const before = fs.readFileSync(USER_FILE(), "utf8");
+		await run(h, "bad", { picks: ["Save"] });
+		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
+		expect(h.selectTitles[0]).toContain("invalid regex");
+	});
+
+	test("history match: the preview lists the recent tool calls the rule would match", async () => {
+		const h = session({});
+		h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: "cargo build" } }] } });
+		h.responses = [gen("allow", "^cargo build\\b")];
+		await run(h, "allow cargo build", { picks: ["Cancel"] });
+		expect(h.selectTitles[0]).toContain("Matches 1 of the last 1 tool calls");
+		expect(h.selectTitles[0]).toContain("bash: cargo build");
+	});
+
+	test("malformed generator output → 3 attempts, then error notify, no dialog", async () => {
+		const h = session({});
+		h.responses = [{ text: "sure! here's a rule" }];
+		await run(h, "anything", { picks: [] });
+		expect(h.notifies.some(([m, l]) => l === "error" && m.includes("rule generation failed"))).toBe(true);
+		expect(h.selects).toBe(0);
+		expect(h.calls).toHaveLength(3);
+	});
+
+	test("tools rule for a path/command tool is refused", async () => {
+		const h = session({});
+		h.responses = [gen("tools", "bash")];
+		await run(h, "allow bash", { picks: ["Save"] });
+		expect(h.selectTitles[0]).toContain("takes a path or command");
+	});
+
+	test("Edit value replaces the generated value before saving", async () => {
+		const h = session({});
+		h.responses = [gen("allow", "^a")];
+		await run(h, "x", { picks: ["Edit value", "Save — global"], editors: ["^b\n"] });
+		expect(readUser().allow.at(-1)).toBe("^b");
+	});
+
+	test("shadowed allow is retried with feedback; the corrected rule is shown as reviewed", async () => {
+		const h = session({}); // gateOmpDir on by default
+		h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: "cat .omp/notes" } }] } });
+		h.responses = [gen("allow", "^cat \\.omp/"), gen("rules", "Reading notes under .omp is fine"), ok()];
+		await run(h, "allow reading .omp notes", { picks: ["Cancel"] });
+		expect(h.calls).toHaveLength(3);
+		expect(String(h.calls[1].messages[0].content)).toContain("forced gate");
+		expect(String(h.calls[1].messages[0].content)).toContain("<latest_candidate>");
+		expect(h.selectTitles[0]).toContain("rules");
+		expect(h.selectTitles[0]).toContain("✓ reviewed (attempt 2/3)");
+	});
+
+	test("critic revise feeds the next attempt", async () => {
+		const h = session({});
+		h.responses = [gen("allow", "cargo"), { text: "<verdict>revise</verdict> anchor it: ^cargo test\\b" }, gen("allow", "^cargo test\\b"), ok()];
+		await run(h, "allow cargo test", { picks: ["Cancel"] });
+		expect(h.calls).toHaveLength(4);
+		expect(String(h.calls[2].messages[0].content)).toContain("anchor it");
+		expect(h.selectTitles[0]).toContain("^cargo test\\b");
+	});
+
+	test("attempts exhausted: the last candidate is shown unconfirmed", async () => {
+		const h = session({});
+		const revise = { text: "<verdict>revise</verdict> too broad" };
+		h.responses = [gen("allow", "x"), revise, gen("allow", "y"), revise, gen("allow", "z"), revise];
+		await run(h, "x", { picks: ["Cancel"] });
+		expect(h.calls).toHaveLength(6);
+		expect(h.selectTitles[0]).toContain("⚠ not confirmed after 3 attempts");
+	});
+
+	test("Amend with feedback regenerates from the previous candidate and the amendment", async () => {
+		const h = session({});
+		h.responses = [gen("allow", "^a"), ok(), gen("allow", "^b"), ok()];
+		h.inputs = ["make it b"];
+		await run(h, "x", { picks: ["Amend", "Save — global"] });
+		expect(readUser().allow.at(-1)).toBe("^b");
+		expect(String(h.calls[2].messages[0].content)).toContain("make it b");
+		expect(String(h.calls[2].messages[0].content)).toContain("<value>^a</value>");
+	});
+
+	test("waiting panel renders the attempt counter and Escape cancels before any model call", async () => {
+		// Lazy like the extension's own dialog modules (and the driveDialog helper): the pi package is an optional peer dependency, so the suite must not load it statically.
+		const { initTheme } = await import("@earendil-works/pi-coding-agent");
+		initTheme("dark", false);
+		const h = session({});
+		const rendered: string[] = [];
+		h.ctx.ui.custom = async (factory: any) => {
+			const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+			const c = factory({ requestRender() {} }, fakeTheme, undefined, () => {});
+			rendered.push(c.render(80).join("\n"));
+			c.handleInput("\x1b");
+			return undefined;
+		};
+		await run(h, "allow cargo", { picks: [] });
+		expect(rendered[0]).toContain("Attempt 1/3");
+		expect(h.calls).toHaveLength(0);
+		expect(h.notifies.some(([m]) => m.includes("rule generation cancelled"))).toBe(true);
+		expect(h.selects).toBe(0);
+	});
+
+	test("without ui.custom the progress shows in the status widget and is cleared", async () => {
+		const h = session({});
+		h.responses = [gen("allow", "^cargo build\\b"), ok()];
+		await run(h, "allow cargo build", { picks: ["Cancel"] });
+		const rows = h.widgetSets.filter(([k]) => k === "verdict");
+		expect(rows[0][1]![0]).toContain("Attempt 1/3");
+		expect(rows.at(-1)![1]).toBeUndefined();
 	});
 });
 
