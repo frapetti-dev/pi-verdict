@@ -3817,6 +3817,94 @@ const MODE_STATUS_KEY = "verdict-mode";
 /** omp model roles pi-verdict reads: `judge` is omp's built-in role (gray-zone classifier); the other two are custom chat roles (listed in `/model` → Roles when assigned or tagged via omp's `modelTags`). */
 export const VERDICT_MODEL_ROLES = { classifier: "judge", fallback: "verdict-fallback", explain: "explain-gate" } as const;
 
+/** omp `modelTags` entries that list pi-verdict's custom model roles in `/model` → Roles while unassigned */
+export const VERDICT_ROLE_TAGS: Readonly<Record<string, { name: string }>> = {
+	[VERDICT_MODEL_ROLES.fallback]: { name: "VERDICT FALLBACK" },
+	[VERDICT_MODEL_ROLES.explain]: { name: "EXPLAIN GATE" },
+};
+
+type BunYaml = { parse(text: string): unknown; stringify(value: unknown, replacer: null, space: number): string };
+
+/** Bun's YAML codec (omp runs on Bun); null on other runtimes */
+function bunYaml(): BunYaml | null {
+	const bun: unknown = Reflect.get(globalThis, "Bun"); // not in the TS lib types (tsc runs without bun-types)
+	if (typeof bun !== "object" || bun === null || !("YAML" in bun)) return null;
+	const yaml = bun.YAML;
+	if (typeof yaml !== "object" || yaml === null || !("parse" in yaml) || !("stringify" in yaml)) return null;
+	return yaml as BunYaml; // members checked above; signatures are Bun's documented YAML API
+}
+
+/** omp's main config file: first existing of config.yml / config.yaml in agentDir, else config.yml */
+export function ompMainConfigPath(agentDir: string): string {
+	for (const name of ["config.yml", "config.yaml"]) {
+		const candidate = path.join(agentDir, name);
+		if (fs.existsSync(candidate)) return candidate;
+	}
+	return path.join(agentDir, "config.yml");
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+	return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** Parse omp's config.yml into its top-level mapping. Missing file or empty document → {} */
+export function readOmpConfig(file: string, yaml: BunYaml): { raw: Record<string, unknown> } | { error: string } {
+	if (!fs.existsSync(file)) return { raw: {} };
+	let parsed: unknown;
+	try {
+		parsed = yaml.parse(fs.readFileSync(file, "utf8"));
+	} catch (e) {
+		return { error: `${file} is not valid YAML (${e instanceof Error ? e.message : String(e)}) — fix it by hand` };
+	}
+	if (parsed === null || parsed === undefined) return { raw: {} };
+	if (!isPlainObject(parsed)) return { error: `${file}: top level must be a mapping — fix it by hand` };
+	if (parsed.modelTags !== undefined && !isPlainObject(parsed.modelTags)) {
+		return { error: `${file}: modelTags is not a mapping — fix it by hand` };
+	}
+	return { raw: parsed };
+}
+
+/** True when every VERDICT_ROLE_TAGS key is an own object entry of raw.modelTags */
+export function verdictRoleTagsPresent(raw: Record<string, unknown>): boolean {
+	const tags = raw.modelTags;
+	if (!isPlainObject(tags)) return false;
+	return Object.keys(VERDICT_ROLE_TAGS).every((k) => Object.hasOwn(tags, k) && isPlainObject(tags[k]));
+}
+
+/** Copy of raw with the tags added (existing entries for our keys kept as-is, other tags untouched)
+ *  or removed (only our keys; an emptied modelTags key is dropped) */
+export function withVerdictRoleTags(raw: Record<string, unknown>, add: boolean): Record<string, unknown> {
+	const next: Record<string, unknown> = { ...raw };
+	const tags: Record<string, unknown> = isPlainObject(raw.modelTags) ? { ...raw.modelTags } : {};
+	for (const [k, def] of Object.entries(VERDICT_ROLE_TAGS)) {
+		if (add) {
+			if (!Object.hasOwn(tags, k)) tags[k] = { ...def };
+		} else delete tags[k];
+	}
+	if (Object.keys(tags).length === 0) delete next.modelTags;
+	else next.modelTags = tags;
+	return next;
+}
+
+/** Serialize like omp (stringify(…, null, 2) + strip trailing spaces after mapping headers) and write
+ *  atomically (`${file}.pi-verdict.tmp` then fs.renameSync); mkdir -p the dir. null on success, else error message */
+export function writeOmpConfig(file: string, raw: Record<string, unknown>, yaml: BunYaml): string | null {
+	const tmp = `${file}.pi-verdict.tmp`;
+	try {
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(tmp, yaml.stringify(raw, null, 2).replace(/: +$/gm, ":"));
+		fs.renameSync(tmp, file);
+		return null;
+	} catch (e) {
+		try {
+			fs.rmSync(tmp, { force: true });
+		} catch {
+			// best effort
+		}
+		return e instanceof Error ? e.message : String(e);
+	}
+}
+
 export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	pi.registerFlag("verdict-mode", { description: "Session approval mode: default|yolo|noAutoDeny|off", type: "string" });
 	pi.registerFlag("auto-mode-model", { description: "Classifier model as provider/id[:thinking] (pi --model syntax; default: inherit session model)", type: "string" });
@@ -4155,7 +4243,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	});
 
 	pi.registerCommand("verdict", {
-		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch, footer style): /verdict [user|local]",
+		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch, footer style, omp custom roles): /verdict [user|local]",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("pi-verdict: /verdict needs an interactive UI", "warning");
@@ -4249,6 +4337,45 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				else if (choice === UNSET) save(undefined, "footer");
 			}
 
+			/** omp's main config file + YAML codec; null when not on omp (no `getAgentDir`) or not on Bun */
+			function ompRolesTarget(): { file: string; yaml: BunYaml } | null {
+				const yaml = bunYaml();
+				const getAgentDir = ompSettings()?.getAgentDir;
+				if (!yaml || typeof getAgentDir !== "function") return null;
+				try {
+					return { file: ompMainConfigPath(getAgentDir()), yaml };
+				} catch {
+					return null; // omp's settings proxy throws before init
+				}
+			}
+
+			/** Add/remove pi-verdict's two `modelTags` entries in omp's config.yml (confirmed, then omp reloads the file) */
+			async function toggleRoleTags(target: { file: string; yaml: BunYaml }): Promise<void> {
+				const { file: cfgFile, yaml } = target;
+				const loaded = readOmpConfig(cfgFile, yaml);
+				if ("error" in loaded) {
+					ctx.ui.notify(`pi-verdict: ${loaded.error}`, "error");
+					return;
+				}
+				const present = verdictRoleTagsPresent(loaded.raw);
+				const ok = present
+					? await ctx.ui.confirm(`Remove pi-verdict custom roles from ${cfgFile}?`, "Removes the modelTags entries verdict-fallback and explain-gate. Assignments under modelRoles are kept; an assigned role stays listed and active.")
+					: await ctx.ui.confirm(`Add pi-verdict custom roles to ${cfgFile}?`, 'Adds modelTags entries verdict-fallback ("VERDICT FALLBACK") and explain-gate ("EXPLAIN GATE") so both roles are listed in /model → Roles. The file is re-serialized (YAML comments are not kept).');
+				if (!ok) return;
+				const err = writeOmpConfig(cfgFile, withVerdictRoleTags(loaded.raw, !present), yaml);
+				if (err) {
+					ctx.ui.notify(`pi-verdict: could not save ${cfgFile}: ${err}`, "error");
+					return;
+				}
+				try {
+					await ompSettings()?.reloadFromDisk?.();
+				} catch (e) {
+					ctx.ui.notify(`pi-verdict: ${cfgFile} saved, but omp could not reload it (${e instanceof Error ? e.message : String(e)}) — restart omp to apply`, "warning");
+					return;
+				}
+				ctx.ui.notify(present ? `pi-verdict: custom roles removed from ${cfgFile}` : `pi-verdict: custom roles added to ${cfgFile} — assign them in /model → Roles`, "info");
+			}
+
 			/** Normalize + duplicate-check a typed entry; undefined = nothing to save (already notified or cancelled) */
 			function acceptEntry(key: EditableListKey, input: string | undefined, list: unknown[], selfIndex: number): string | undefined {
 				if (input === undefined) return undefined;
@@ -4329,6 +4456,15 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				const fv = raw.footer;
 				const footerState = fv === undefined ? (kind === "local" ? "not set: global applies" : "full, default") : fv === "full" || fv === "compact" || fv === "off" ? fv : "invalid";
 				options.push(`footer (${footerState}) — ${FOOTER_DESC}`);
+				let rolesIdx = -1;
+				const rolesTarget = ompRolesTarget();
+				if (rolesTarget) {
+					rolesIdx = options.length;
+					const rc = readOmpConfig(rolesTarget.file, rolesTarget.yaml);
+					if ("error" in rc) options.push("omp custom roles (config.yml unreadable) — select for details");
+					else if (verdictRoleTagsPresent(rc.raw)) options.push("✓ omp custom roles — verdict-fallback, explain-gate listed in /model → Roles (select to remove)");
+					else options.push("omp custom roles — add verdict-fallback, explain-gate to /model → Roles");
+				}
 				options.push(DONE);
 				const choice = await ctx.ui.select(`pi-verdict: edit ${file}`, options);
 				if (choice === undefined || choice === DONE) return;
@@ -4347,6 +4483,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						continue;
 					}
 					await editFooter();
+					continue;
+				}
+				if (rolesTarget && choiceIdx === rolesIdx) {
+					await toggleRoleTags(rolesTarget);
 					continue;
 				}
 				const key = EDITABLE_LIST_KEYS[choiceIdx];
@@ -4556,13 +4696,19 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	// ---- omp model roles (no-ops on real pi: it has no `pi.pi.settings`) ----
 
+	type OmpSettings = { getModelRole?: (r: string) => string | undefined; getAgentDir?: () => string; reloadFromDisk?: () => Promise<void> };
+
+	/** `pi.pi.settings` exists only on omp's ExtensionAPI; pi's type has no such member, so the shape is asserted once here */
+	function ompSettings(): OmpSettings | null {
+		const ompApi = pi as unknown as { pi?: { settings?: OmpSettings } };
+		return ompApi.pi?.settings ?? null;
+	}
+
 	/** Explicitly assigned selector of an omp model role, or null (unassigned, real pi, settings not yet initialized).
 	 *  Reads the raw assignment, so omp's built-in priority defaults for unassigned built-in roles never count. */
 	function roleSelector(role: string): string | null {
-		// `pi.pi.settings` exists only on omp's ExtensionAPI; pi's type has no such member, so the shape is asserted once here
-		const ompApi = pi as unknown as { pi?: { settings?: { getModelRole?: (r: string) => string | undefined } } };
 		try {
-			const raw = ompApi.pi?.settings?.getModelRole?.(role);
+			const raw = ompSettings()?.getModelRole?.(role);
 			const t = typeof raw === "string" ? raw.trim() : "";
 			return t === "" ? null : t;
 		} catch {

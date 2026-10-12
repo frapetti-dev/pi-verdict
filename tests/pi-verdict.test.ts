@@ -44,6 +44,10 @@ interface Harness {
 	findMap: Record<string, any> | undefined;
 	/** omp model role assignments served by the fake `pi.pi.settings.getModelRole` (needs `session(…, { roles: true })`) */
 	roles: Record<string, string> | undefined;
+	/** Agent dir served by the fake `pi.pi.settings.getAgentDir` (omp's config.yml lives there); defaults to `<TMP_AGENT>/omp` */
+	ompAgentDir: string | undefined;
+	/** Number of `pi.pi.settings.reloadFromDisk` calls */
+	ompReloads: number;
 	/** `pi.sendMessage` calls (omp label path) */
 	sent: Array<{ message: any; options: any }>;
 	/** `pi.appendEntry` calls (pi label path) */
@@ -67,7 +71,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 	const entries: Array<[string, any]> = [];
 	const messageRenderers: Record<string, any> = {};
 	const entryRenderers: Record<string, any> = {};
-	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectTitles: [] as string[], selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined, roles: undefined };
+	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectTitles: [] as string[], selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined, roles: undefined, ompAgentDir: undefined, ompReloads: 0 };
 	h.widgetSets = widgetSets;
 	const rolesEnabled = opts?.roles === true; // install()'s own `opts` shadows this function's
 
@@ -126,7 +130,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 			sendMessage: (message: any, options: any) => { sent.push({ message, options }); },
 			appendEntry: (t: string, data: any) => { entries.push([t, data]); },
 			...(opts?.ompHost ? { logger: {}, typebox: {} } : { registerEntryRenderer: (t: string, r: any) => { entryRenderers[t] = r; } }),
-			...(rolesEnabled ? { pi: { settings: { getModelRole: (r: string) => h.roles?.[r] } } } : {}),
+			...(rolesEnabled ? { pi: { settings: { getModelRole: (r: string) => h.roles?.[r], getAgentDir: () => h.ompAgentDir ?? path.join(TMP_AGENT, "omp"), reloadFromDisk: async () => { h.ompReloads++; } } } } : {}),
 		} as any, opts?.compatLoader ? { compatLoader: opts.compatLoader } : {});
 		if (prev !== undefined) process.env.PI_AUTO_MODE_DEBUG = prev; else delete process.env.PI_AUTO_MODE_DEBUG;
 	};
@@ -2552,6 +2556,123 @@ describe("/verdict config editor", () => {
 		await run(h, "user", { picks: ["gateOmpDir", "Done"] });
 		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("gateOmpDir") && m.includes("not a boolean"))).toBe(true);
+	});
+});
+
+describe("/verdict omp custom roles", () => {
+	const TAGS = { "verdict-fallback": { name: "VERDICT FALLBACK" }, "explain-gate": { name: "EXPLAIN GATE" } };
+	const parse = (file: string): any => Bun.YAML.parse(fs.readFileSync(file, "utf8"));
+	async function open(h: Harness, dir: string, picks: string[], confirm = true): Promise<void> {
+		h.ompAgentDir = dir;
+		await h.handlers.session_start({}, h.ctx);
+		h.confirmAnswer = confirm;
+		h.selectPicks = picks;
+		await h.commands.verdict.handler("user", h.ctx);
+	}
+
+	test("missing config.yml: add writes both tags, reloads omp once, row then shows ✓", async () => {
+		await withTempDir("pv-roles-", async (dir) => {
+			const h = session({}, { roles: true });
+			await open(h, dir, ["omp custom roles", "Done"]);
+			expect(parse(path.join(dir, "config.yml")).modelTags).toEqual(TAGS);
+			expect(h.ompReloads).toBe(1);
+			expect(h.confirmMsgs.length).toBe(1);
+			// the ✓ row exists now: selecting it reaches the remove confirm (declined → no change)
+			h.confirmAnswer = false;
+			h.selectPicks = ["✓ omp custom roles", "Done"];
+			await h.commands.verdict.handler("user", h.ctx);
+			expect(h.confirmMsgs.length).toBe(2);
+			expect(parse(path.join(dir, "config.yml")).modelTags).toEqual(TAGS);
+		});
+	});
+
+	test("add keeps unrelated config, other tags and an existing entry for our key", async () => {
+		await withTempDir("pv-roles-", async (dir) => {
+			const file = path.join(dir, "config.yml");
+			fs.writeFileSync(file, "modelRoles:\n  default: a/b\nmodelTags:\n  mine:\n    name: MINE\n  verdict-fallback:\n    name: X\n");
+			const h = session({}, { roles: true });
+			await open(h, dir, ["omp custom roles", "Done"]);
+			const out = parse(file);
+			expect(out.modelRoles).toEqual({ default: "a/b" });
+			expect(out.modelTags).toEqual({ mine: { name: "MINE" }, "verdict-fallback": { name: "X" }, "explain-gate": { name: "EXPLAIN GATE" } });
+			expect(fs.readFileSync(file, "utf8")).not.toMatch(/: +$/m); // omp-style serialization: no trailing spaces after headers
+		});
+	});
+
+	test("remove drops the modelTags key when only our tags existed, keeping other keys", async () => {
+		await withTempDir("pv-roles-", async (dir) => {
+			const file = path.join(dir, "config.yml");
+			fs.writeFileSync(file, "modelRoles:\n  default: a/b\nmodelTags:\n  verdict-fallback:\n    name: VERDICT FALLBACK\n  explain-gate:\n    name: EXPLAIN GATE\n");
+			const h = session({}, { roles: true });
+			await open(h, dir, ["✓ omp custom roles", "Done"]);
+			const out = parse(file);
+			expect(out).toEqual({ modelRoles: { default: "a/b" } });
+			expect(h.ompReloads).toBe(1);
+		});
+	});
+
+	test("remove keeps foreign tags", async () => {
+		await withTempDir("pv-roles-", async (dir) => {
+			const file = path.join(dir, "config.yml");
+			fs.writeFileSync(file, "modelTags:\n  mine:\n    name: MINE\n  verdict-fallback:\n    name: VERDICT FALLBACK\n  explain-gate:\n    name: EXPLAIN GATE\n");
+			const h = session({}, { roles: true });
+			await open(h, dir, ["✓ omp custom roles", "Done"]);
+			expect(parse(file).modelTags).toEqual({ mine: { name: "MINE" } });
+		});
+	});
+
+	test("declined confirm (add and remove) leaves the file byte-identical and does not reload", async () => {
+		await withTempDir("pv-roles-", async (dir) => {
+			const file = path.join(dir, "config.yml");
+			const addBefore = "modelRoles:\n  default: a/b\n";
+			fs.writeFileSync(file, addBefore);
+			const h = session({}, { roles: true });
+			await open(h, dir, ["omp custom roles", "Done"], false);
+			expect(fs.readFileSync(file, "utf8")).toBe(addBefore);
+			expect(h.confirmMsgs.length).toBe(1);
+			expect(h.ompReloads).toBe(0);
+
+			const removeBefore = "modelTags:\n  verdict-fallback:\n    name: VERDICT FALLBACK\n  explain-gate:\n    name: EXPLAIN GATE\n";
+			fs.writeFileSync(file, removeBefore);
+			const h2 = session({}, { roles: true });
+			await open(h2, dir, ["✓ omp custom roles", "Done"], false);
+			expect(fs.readFileSync(file, "utf8")).toBe(removeBefore);
+			expect(h2.confirmMsgs.length).toBe(1);
+			expect(h2.ompReloads).toBe(0);
+		});
+	});
+
+	test("invalid YAML: row is marked unreadable, selecting it notifies an error and leaves the file alone", async () => {
+		await withTempDir("pv-roles-", async (dir) => {
+			const file = path.join(dir, "config.yml");
+			fs.writeFileSync(file, "a: [\n");
+			const h = session({}, { roles: true });
+			await open(h, dir, ["omp custom roles (config.yml unreadable)", "Done"]);
+			expect(h.notifies.some(([m, l]) => l === "error" && m.includes("is not valid YAML"))).toBe(true);
+			expect(h.confirms).toBe(0);
+			expect(fs.readFileSync(file, "utf8")).toBe("a: [\n");
+		});
+	});
+
+	test("modelTags that is not a mapping is reported, not overwritten", async () => {
+		await withTempDir("pv-roles-", async (dir) => {
+			const file = path.join(dir, "config.yml");
+			fs.writeFileSync(file, "modelTags: [a]\n");
+			const h = session({}, { roles: true });
+			await open(h, dir, ["omp custom roles (config.yml unreadable)", "Done"]);
+			expect(h.notifies.some(([m, l]) => l === "error" && m.includes("modelTags is not a mapping"))).toBe(true);
+			expect(fs.readFileSync(file, "utf8")).toBe("modelTags: [a]\n");
+		});
+	});
+
+	test("real pi (no omp settings): no roles row; nothing is created", async () => {
+		await withTempDir("pv-roles-", async (dir) => {
+			const h = session({});
+			await open(h, dir, ["omp custom roles"]);
+			expect(h.confirms).toBe(0);
+			expect(fs.existsSync(path.join(TMP_AGENT, "omp", "config.yml"))).toBe(false);
+			expect(fs.existsSync(path.join(dir, "config.yml"))).toBe(false);
+		});
 	});
 });
 
