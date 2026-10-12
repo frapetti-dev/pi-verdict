@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+
+- `/verdict` row `omp custom roles` (omp only, hidden on real pi): adds or removes the `modelTags` entries `verdict-fallback` ("VERDICT FALLBACK") and `explain-gate` ("EXPLAIN GATE") in omp's `<agentDir>/config.yml` (`config.yaml` if that is the existing file), so both custom roles are listed in `/model` → Roles before they are assigned (omp lists a custom role only when assigned or tagged; extensions cannot register tags through omp's settings registry). The row shows `✓` when both tags are present and then removes them; each operation asks for confirmation first, keeps every other key and tag (an existing entry for our key is left as-is; an emptied `modelTags` is dropped; `modelRoles` assignments are never touched), writes atomically with omp's own YAML serialization (comments in `config.yml` are not preserved) and calls `reloadFromDisk()` so `/model` updates without a restart. An unreadable `config.yml` (invalid YAML, non-mapping top level or `modelTags`) is reported and left untouched. New exports: `VERDICT_ROLE_TAGS`, `ompMainConfigPath`, `readOmpConfig`, `verdictRoleTagsPresent`, `withVerdictRoleTags`, `writeOmpConfig`.
+
 ## [0.18.0] - 2026-10-08
 
 ### Added
