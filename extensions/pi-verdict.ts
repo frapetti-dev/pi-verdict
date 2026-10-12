@@ -265,8 +265,11 @@ export const PERCENT_KEYS = ["confidenceThreshold", "defaultDenyThreshold", "def
 export type PercentKey = (typeof PERCENT_KEYS)[number];
 export const APPROVAL_KEYS = ["mode", ...PERCENT_KEYS, "yoloDenyPaths", "yoloOmpDir", "classifierFallbackMode"] as const;
 export type ApprovalKey = (typeof APPROVAL_KEYS)[number];
-export type ApprovalSource = "session" | "project" | "user" | "default";
-const isApprovalKey = (k: string): k is ApprovalKey => (APPROVAL_KEYS as readonly string[]).includes(k);
+export type SettingSource = "session" | "local" | "global" | "default";
+/** Keys a session override may carry: the approval keys plus the two switches the `/verdict` menu edits per session. */
+export const SESSION_KEYS = [...APPROVAL_KEYS, "gateOmpDir", "footer"] as const;
+export type SessionKey = (typeof SESSION_KEYS)[number];
+const isSessionKey = (k: string): k is SessionKey => (SESSION_KEYS as readonly string[]).includes(k);
 const EDITABLE_LIST_KEYS = ["allow", "deny", "denyPaths", "tools", "rules"] as const;
 type EditableListKey = (typeof EDITABLE_LIST_KEYS)[number];
 const LIST_KEY_DESC: Record<EditableListKey, string> = {
@@ -617,8 +620,8 @@ interface LoadedRules {
 	skipped: string[];
 	shortcutWarning: string | null;
 	project: { path: string; trusted: boolean; applied: boolean } | null;
-	/** where each approval key's effective value comes from */
-	approvalSources: Record<ApprovalKey, ApprovalSource>;
+	/** where each session-scopable key's effective value comes from */
+	settingSources: Record<SessionKey, SettingSource>;
 }
 
 /** Percent / mode / yolo-action keys of a merged raw config. Invalid values skip into the warning channel and fall back to their defaults. */
@@ -654,11 +657,11 @@ function parseApprovalKeys(raw: Record<string, unknown>, skipped: string[]): Pic
 	};
 }
 
-/** Session overrides restricted to the approval keys plus `ruleAdditions`; anything else is reported and dropped. */
+/** Session overrides restricted to the session keys plus `ruleAdditions`; anything else is reported and dropped. */
 function sanitizeSessionRaw(sessionRaw: Record<string, unknown>, skipped: string[]): Record<string, unknown> {
 	const out: Record<string, unknown> = {};
 	for (const [k, v] of Object.entries(sessionRaw)) {
-		if (isApprovalKey(k)) out[k] = v;
+		if (isSessionKey(k)) out[k] = v;
 		else if (k === "ruleAdditions") {
 			if (typeof v === "object" && v !== null && !Array.isArray(v)) out[k] = v;
 			else skipped.push("session override ruleAdditions: must be an object — ignored");
@@ -683,25 +686,31 @@ function applyRuleAdditions(raw: Record<string, unknown>, skipped: string[]): vo
 	}
 }
 
-/** Where each approval key's value comes from: session > project > user > default. */
-function approvalSourcesOf(sessionKeys: string[], projectKeys: string[], userKeys: string[]): Record<ApprovalKey, ApprovalSource> {
+/** Where each session-scopable key's value comes from: session > local > global > default. */
+function settingSourcesOf(sessionKeys: string[], localKeys: string[], globalKeys: string[]): Record<SessionKey, SettingSource> {
 	return Object.fromEntries(
-		APPROVAL_KEYS.map((k) => [k, sessionKeys.includes(k) ? "session" : projectKeys.includes(k) ? "project" : userKeys.includes(k) ? "user" : "default"]),
-	) as Record<ApprovalKey, ApprovalSource>;
+		SESSION_KEYS.map((k) => [k, sessionKeys.includes(k) ? "session" : localKeys.includes(k) ? "local" : globalKeys.includes(k) ? "global" : "default"]),
+	) as Record<SessionKey, SettingSource>;
 }
 
-/** Rules when the user config is missing or unreadable: empty rules with the floor ON, session approval keys still applied. */
+/** Rules when the user config is missing or unreadable: empty rules with the floor ON, session keys still applied. */
 function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[]): LoadedRules {
 	const session = sanitizeSessionRaw(sessionRaw, skipped);
 	if (session.ruleAdditions !== undefined) skipped.push("session ruleAdditions: not applied — user config not loaded");
 	const fbMode = session.classifierFallbackMode;
 	if (fbMode !== undefined && fbMode !== "shadow" && fbMode !== "enforce") skipped.push(`classifierFallbackMode: ${JSON.stringify(fbMode)}`);
+	let gateOmpDir = true;
+	if (typeof session.gateOmpDir === "boolean") gateOmpDir = session.gateOmpDir;
+	else if (session.gateOmpDir !== undefined) skipped.push(`gateOmpDir: ${JSON.stringify(session.gateOmpDir)}`);
+	const footer = session.footer;
+	const footerOk = footer === "full" || footer === "compact" || footer === "off";
+	if (footer !== undefined && !footerOk) skipped.push(`footer: ${JSON.stringify(footer)}`);
 	return {
-		rules: { ...EMPTY_RULES, ...parseApprovalKeys(session, skipped), classifierFallbackMode: fbMode === "enforce" ? "enforce" : "shadow" },
+		rules: { ...EMPTY_RULES, ...parseApprovalKeys(session, skipped), classifierFallbackMode: fbMode === "enforce" ? "enforce" : "shadow", gateOmpDir, footer: footerOk ? footer : EMPTY_RULES.footer },
 		skipped,
 		shortcutWarning: null,
 		project: null,
-		approvalSources: approvalSourcesOf(Object.keys(session), [], []),
+		settingSources: settingSourcesOf(Object.keys(session), [], []),
 	};
 }
 
@@ -824,6 +833,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 		const footerRaw = raw.footer;
 		const footerOk = footerRaw === "full" || footerRaw === "compact" || footerRaw === "off";
 		if (footerRaw !== undefined && !footerOk) skipped.push(`footer: ${JSON.stringify(footerRaw)}`);
+		if (raw.gateOmpDir !== undefined && typeof raw.gateOmpDir !== "boolean") skipped.push(`gateOmpDir: ${JSON.stringify(raw.gateOmpDir)}`);
 		const sgRaw = raw.subagentGate;
 		const sgOk = sgRaw === "off" || sgRaw === "normal" || sgRaw === "auto";
 		if (sgRaw !== undefined && !sgOk) skipped.push(`subagentGate: ${JSON.stringify(sgRaw)}`);
@@ -855,7 +865,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 			skipped,
 			shortcutWarning: shortcut.warning,
 			project,
-			approvalSources: approvalSourcesOf(Object.keys(session), projectKeys, userKeys),
+			settingSources: settingSourcesOf(Object.keys(session), projectKeys, userKeys),
 		};
 	} catch {
 		return sessionOnlyLoad(sessionRaw, []);
@@ -1812,7 +1822,7 @@ export interface RulesLoadReport {
 	skipped: string[];
 	shortcutWarning: string | null;
 	project: { path: string; trusted: boolean; applied: boolean } | null;
-	approvalSources: Record<ApprovalKey, ApprovalSource>;
+	settingSources: Record<SessionKey, SettingSource>;
 }
 
 /**
@@ -1828,8 +1838,8 @@ export class SessionState {
 	private denyPathBases: string[] | null = null;
 	/** Session-scope approval overrides (persisted per session id); applied over project/user config on every reload. */
 	sessionOverrides: Record<string, unknown> = {};
-	/** Where each approval key's effective value comes from (updated on every reload). */
-	approvalSources: Record<ApprovalKey, ApprovalSource> = approvalSourcesOf([], [], []);
+	/** Where each session-scopable key's effective value comes from (updated on every reload). */
+	settingSources: Record<SessionKey, SettingSource> = settingSourcesOf([], [], []);
 	private readonly agentDir: string | null;
 	/** Final pipeline verdicts this session (root calls only; an ask counts once whatever the user answers). Reset on session start, kept across /verdict reloads. */
 	verdictCounts = { allow: 0, ask: 0, deny: 0 };
@@ -1873,10 +1883,10 @@ export class SessionState {
 	reloadRules(cwd: string, sessionTrustedRoot: string | null = null): RulesLoadReport {
 		const loaded = loadUserRules(cwd, sessionTrustedRoot, this.sessionOverrides);
 		this.userRules = loaded.rules;
-		this.approvalSources = loaded.approvalSources;
+		this.settingSources = loaded.settingSources;
 		this.denyPathBases = anchorDenyPaths(loaded.rules.denyPaths, cwd); // anchored to the session cwd, once (ADR-0002)
 		this.audit = this.makeAudit(loaded.rules);
-		return { skipped: loaded.skipped, shortcutWarning: loaded.shortcutWarning, project: loaded.project, approvalSources: loaded.approvalSources };
+		return { skipped: loaded.skipped, shortcutWarning: loaded.shortcutWarning, project: loaded.project, settingSources: loaded.settingSources };
 	}
 
 	/** 会话重置:重载用户规则(配置改动新会话生效)+ 按会话 cwd 重锚 denyPaths
@@ -2264,9 +2274,6 @@ export async function adjudicate(
 // Config editor helpers (/verdict)
 // ============================================================================
 
-const GATE_OMP_DIR_DESC = "forced ask on any .omp directory access";
-const FOOTER_DESC = "footer status style";
-
 /** Where a project config would be written for `cwd`: the existing one if discovered, else `<cwd>/<dotdir>/pi-verdict.json`.
  *  null when `findProjectConfig`'s stop rule (home dir / agent tree root) would never discover a file there. */
 function projectConfigTarget(cwd: string, agentDir: string): string | null {
@@ -2345,218 +2352,398 @@ async function projectListStart(ui: ExtensionContext["ui"], key: EditableListKey
 }
 
 // ============================================================================
-// Quick settings panel (/automode): every approval key at session / project / user scope
+// Settings menu (/automode, /verdict): sections, ‹value› rows, Tab scope
 // ============================================================================
 
-export type PanelScope = "session" | "project" | "user";
-
-interface PanelItemSpec {
-	key: ApprovalKey;
-	label: string;
-	/** one-line meaning shown under the selected row */
-	meaning: string;
-	/** enum values (without scope extras); absent = percent slider */
-	values?: readonly string[];
+/** Where a menu edit is stored: this session only (wins), the trusted project config, or the global config. */
+export type MenuScope = "session" | "local" | "global";
+export type MenuTone = "text" | "muted" | "warning";
+/** Description lines under the selected row. */
+export type MenuInfo = Array<{ tone: MenuTone; text: string }>;
+export type MenuRow =
+	| { kind: "section"; label: string } // "" = plain rule
+	| { kind: "choice"; id: string; label: string; values: readonly string[]; value: string; shortcut?: string; confirm?: boolean; locked?: string; info(value: string): MenuInfo }
+	| { kind: "percent"; id: string; label: string; allowInherit: boolean; value: string; info(value: string): MenuInfo }
+	| { kind: "page"; id: string; label: string; locked?: string; info(): MenuInfo }
+	| { kind: "action"; id: string; label: string; key?: string; confirm?: boolean; info(): MenuInfo }
+	| { kind: "add"; id: string; placeholder: string; info(): MenuInfo }
+	| { kind: "entry"; id: string; text: string; tag?: string; editable: boolean; info(): MenuInfo };
+export interface MenuController {
+	/** breadcrumb root, e.g. "approval" | "rules" */
+	title: string;
+	/** Tab order */
+	scopes: readonly MenuScope[];
+	/** initial scope */
+	scope: MenuScope;
+	badge(scope: MenuScope): { label: string; warn: boolean };
+	/** recomputed on every render and keypress, so rows always reflect the live state */
+	rows(scope: MenuScope, page: string | null): MenuRow[];
+	/** breadcrumb text of a list page, e.g. "allow" */
+	pageTitle(page: string): string;
+	/** choice / percent commit */
+	change(scope: MenuScope, id: string, value: string): void;
+	action(scope: MenuScope, id: string): void;
+	/** add / edit commit; false keeps the inline input open */
+	submit(scope: MenuScope, page: string, id: string, text: string): boolean;
+	remove(scope: MenuScope, page: string, id: string): void;
+	/** key → action row id (e.g. "a" → "show-all"); inactive while an inline input is open */
+	hotkeys?: Record<string, string>;
+	/** hint-line text for the hotkeys, e.g. "a all modes" */
+	hotkeyHint?: string;
 }
 
-const PANEL_ITEMS: readonly PanelItemSpec[] = [
-	{ key: "mode", label: "mode", values: ["default", "yolo", "noAutoDeny"], meaning: "default = deny/ask/allow; yolo = deny/allow, never prompts; noAutoDeny = ask/allow; off = ungated (session only)" },
-	{ key: "confidenceThreshold", label: "confidence threshold", meaning: "jev confidence below this cascades to the fallback model, else asks" },
-	{ key: "defaultDenyThreshold", label: "default: deny threshold", meaning: "default mode: jev deny probability needed to deny" },
-	{ key: "defaultAllowThreshold", label: "default: allow threshold", meaning: "default mode: jev allow probability needed to allow" },
-	{ key: "yoloDenyThreshold", label: "yolo: deny threshold", meaning: "yolo mode: jev deny probability needed to deny (otherwise allow)" },
-	{ key: "noAutoDenyAllowThreshold", label: "noAutoDeny: allow threshold", meaning: "noAutoDeny mode: jev allow probability needed to allow (otherwise ask)" },
-	{ key: "yoloDenyPaths", label: "yolo: denyPaths hit", values: ["deny", "allow"], meaning: "yolo mode: what a denyPaths hit does" },
-	{ key: "yoloOmpDir", label: "yolo: .omp gate hit", values: ["deny", "allow"], meaning: "yolo mode: what a .omp directory access does" },
-	{ key: "classifierFallbackMode", label: "fallback mode", values: ["shadow", "enforce"], meaning: "shadow = the second model only records its opinion; enforce = it decides" },
-];
+/** Enum values per key (the menu's choice rows); `mode` also lists `off`, which only the session scope offers. */
+const ENUM_VALUES: Partial<Record<SessionKey, readonly string[]>> = {
+	mode: APPROVAL_MODES,
+	yoloDenyPaths: ["deny", "allow"],
+	yoloOmpDir: ["deny", "allow"],
+	classifierFallbackMode: ["shadow", "enforce"],
+	footer: ["full", "compact", "off"],
+};
 
-const PANEL_DEFAULT_DISPLAY: Partial<Record<ApprovalKey, string>> = { mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierFallbackMode: "shadow" };
+/** What a key means when no scope sets it (global scope shows these instead of `inherit`). */
+const MENU_DEFAULTS: Partial<Record<SessionKey, string>> = { mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierFallbackMode: "shadow", gateOmpDir: "on", footer: "full" };
 
-/** Percent keys store a number, `null` = off; enum keys store their string. Parse a panel value back; `undefined` = inherit (drop the key), `"invalid"` = not a value. */
-export function parsePanelValue(spec: Pick<PanelItemSpec, "key" | "values">, text: string): unknown | "invalid" {
+/** One-line meaning of each enum value, shown under the selected row (`inherit` and percent values are composed by the controller). */
+const VALUE_MEANING: Record<string, Record<string, string>> = {
+	mode: {
+		default: "default — deny, ask or allow; the full gate",
+		yolo: "yolo — deny or allow, never prompts; uncertain calls are blocked",
+		noAutoDeny: "noAutoDeny — ask or allow; every auto-review deny becomes an ask",
+		off: "off — ungated: tool calls execute directly (session only)",
+	},
+	yoloDenyPaths: { deny: "deny — yolo blocks a denyPaths hit", allow: "allow — yolo lets a denyPaths hit through silently" },
+	yoloOmpDir: { deny: "deny — yolo blocks a .omp directory access", allow: "allow — yolo lets a .omp directory access through silently" },
+	classifierFallbackMode: { shadow: "shadow — the second model only records its opinion", enforce: "enforce — the second model decides" },
+	gateOmpDir: { on: "on — ask before any .omp directory access (default)", off: "off — no forced gate on .omp directories" },
+	footer: { full: "full — Nerd Font powerline blocks (default)", compact: "compact — plain one-line text", off: "off — no footer status" },
+};
+
+/** What each percent key does when set (the value `off` disables it). */
+const PERCENT_MEANING: Record<PercentKey, string> = {
+	confidenceThreshold: "jev confidence below this cascades to the fallback model, else asks",
+	defaultDenyThreshold: "default mode: jev deny probability needed to deny",
+	defaultAllowThreshold: "default mode: jev allow probability needed to allow",
+	yoloDenyThreshold: "yolo mode: jev deny probability needed to deny (otherwise allow)",
+	noAutoDenyAllowThreshold: "noAutoDeny mode: jev allow probability needed to allow (otherwise ask)",
+};
+
+/** Percent keys store a number, `null` = off; enum keys store their string; gateOmpDir stores a boolean. Parse a menu value back; `undefined` = inherit (drop the key), `"invalid"` = not a value. */
+export function parseMenuValue(key: SessionKey, text: string): unknown | "invalid" {
 	const t = text.trim();
 	if (t === "inherit") return undefined;
-	if (spec.values) return spec.values.includes(t) || (spec.key === "mode" && t === "off") ? t : "invalid";
+	if (key === "gateOmpDir") return t === "on" ? true : t === "off" ? false : "invalid";
+	const values = ENUM_VALUES[key];
+	if (values) return values.includes(t) ? t : "invalid";
 	if (t === "off") return null;
 	const n = Number(t.replace(/%$/, ""));
 	return t !== "" && Number.isFinite(n) && n >= 0 && n <= 100 ? n : "invalid";
 }
 
-/** Value text stored at a scope: `inherit` when the key is absent at session/project, the default when absent at user. */
-function panelStoredText(raw: Record<string, unknown>, key: ApprovalKey, scope: PanelScope): string {
+/** Value text stored at a scope: `inherit` when the key is absent at session/local, the default when absent at global. */
+function storedValueText(raw: Record<string, unknown>, key: SessionKey, scope: MenuScope): string {
 	const v = raw[key];
-	if (v === undefined) return scope === "user" ? (PANEL_DEFAULT_DISPLAY[key] ?? "off") : "inherit";
+	if (v === undefined) return scope === "global" ? (MENU_DEFAULTS[key] ?? "off") : "inherit";
 	if (v === null) return "off";
+	if (typeof v === "boolean") return v ? "on" : "off";
 	return typeof v === "number" ? `${v}%` : String(v);
 }
 
-/** Slider submenu for a percent key (rendered inside the settings list). `done(text)` saves, `done(undefined)` cancels. */
-export function buildPercentSlider(
+/** Next percent value text one step left (`delta < 0`) or right of `cur` (`N%` | `off` | `inherit`); null = at the end. */
+function stepPercent(cur: string, delta: number, allowInherit: boolean): string | null {
+	if (cur === "inherit") return delta > 0 ? "off" : null;
+	if (cur === "off") return delta > 0 ? "0%" : allowInherit ? "inherit" : null;
+	const n = Number.parseFloat(cur);
+	if (!Number.isFinite(n)) return null;
+	if (delta < 0 && n <= 0) return "off";
+	const next = Math.max(0, Math.min(100, n + delta));
+	return next === n ? null : `${next}%`;
+}
+
+/**
+ * Reusable settings menu: section separators, `‹ value ›` choice rows (←/→), percent rows with a 10-cell bar,
+ * list pages with inline add/edit, per-row descriptions, and a scope badge in the title border cycled with Tab.
+ * All state lives in the controller; rows are re-read on every render and keypress.
+ */
+export function buildSettingsMenu(
 	mods: DialogModules,
+	tui: { requestRender(): void },
 	theme: Pick<Theme, "fg" | "bold">,
-	label: string,
-	current: string,
-	allowInherit: boolean,
-	done: (selected?: string) => void,
-): PiTui.Component {
-	const m = /^(\d+(?:\.\d+)?)%$/.exec(current);
-	let value = m ? Number(m[1]) : 50;
-	let state: "value" | "off" | "inherit" = "value";
-	const cells = 20;
-	const hint = `←/→ ±5 · -/+ ±1 · x off${allowInherit ? " · i inherit" : ""} · enter save · esc cancel`;
-	const step = (delta: number): void => {
-		state = "value";
-		value = Math.max(0, Math.min(100, value + delta));
-	};
-	return {
-		render: () => {
-			const filled = Math.round((value / 100) * cells);
-			const bar = state === "value" ? theme.fg("accent", "█".repeat(filled)) + theme.fg("dim", "░".repeat(cells - filled)) : theme.fg("dim", "░".repeat(cells));
-			const text = state === "value" ? `${value}%` : state;
-			return [` ${theme.fg("accent", theme.bold(label))}`, ` ${bar} ${text}`, ` ${theme.fg("muted", hint)}`];
-		},
-		invalidate() {},
-		handleInput(data: string): void {
-			const { matchesKey, getKeybindings } = mods.tui;
-			const kb = getKeybindings();
-			if (matchesKey(data, "left")) step(-5);
-			else if (matchesKey(data, "right")) step(5);
-			else if (data === "-") step(-1);
-			else if (data === "+" || data === "=") step(1);
-			else if (data === "x") state = "off";
-			else if (data === "i" && allowInherit) state = "inherit";
-			else if (kb.matches(data, "tui.select.confirm") || data === "\n") done(state === "value" ? `${value}%` : state);
-			else if (kb.matches(data, "tui.select.cancel")) done(undefined);
-		},
-	};
-}
+	ctl: MenuController,
+	done: () => void,
+): PiTui.Component & { handleInput(data: string): void; focused: boolean } {
+	const { CURSOR_MARKER, Input, getKeybindings, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } = mods.tui;
+	const { DynamicBorder } = mods.agent;
+	type ColorName = Parameters<Theme["fg"]>[0];
+	const fg = (c: string, t: string): string => theme.fg(c as ColorName, t);
+	const bottom = new DynamicBorder();
 
-/** What the panel needs from its host: the stored object per scope, a writer, and the live state for "Effective" lines. */
-export interface PanelEnv {
-	state: SessionState;
-	scopes: readonly PanelScope[];
-	/** shortcut registered per approval key at load; absent = none (only `mode` has one) */
-	shortcuts: Partial<Record<ApprovalKey, string>>;
-	/** the object stored at a scope (session overrides / project file / user file) */
-	stored(scope: PanelScope): Record<string, unknown>;
-	/** persist + reload; `undefined` drops the key; null = ok, else an error message */
-	write(scope: PanelScope, key: ApprovalKey, value: unknown): string | null;
-}
+	let scope = ctl.scope;
+	let page: string | null = null;
+	let index = 0;
+	const parents: number[] = []; // selected index of each ancestor page, restored on back
+	let pending: { id: string; value: string } | undefined; // confirm-row value awaiting Enter
+	let armed: string | undefined; // row id awaiting a second Enter / d
+	let editing: { id: string; placeholder: string; input: PiTui.Input } | undefined;
 
-/** Extra enum values a scope allows: `off` (session only) and `inherit` (session/project). */
-function panelValues(spec: PanelItemSpec, scope: PanelScope): string[] {
-	if (!spec.values) return [];
-	return [...spec.values, ...(spec.key === "mode" && scope === "session" ? ["off"] : []), ...(scope === "user" ? [] : ["inherit"])];
-}
-
-/** Effective value + source line for one panel item. */
-function panelEffective(state: SessionState, spec: PanelItemSpec): string {
-	const v = state.userRules[spec.key];
-	const shown = v === null ? "off" : typeof v === "number" ? `${v}%` : String(v);
-	return `Effective: ${shown} (${state.approvalSources[spec.key]}) — ${spec.meaning}`;
-}
-
-/** Column (0-based, inside the label cell) where a row's cycle shortcut starts; fits under the 36-col label cap and the widest label (27). */
-const PANEL_SHORTCUT_COL = 8;
-
-/** Row label with the registered cycle shortcut (#15) aligned at `PANEL_SHORTCUT_COL`; plain text, since `SettingsList` pads by visible width. */
-function panelLabel(spec: PanelItemSpec, env: PanelEnv): string {
-	const k = env.shortcuts[spec.key];
-	return k ? `${spec.label.padEnd(PANEL_SHORTCUT_COL)}[${k}]` : spec.label;
-}
-
-/** Interactive settings panel: rich `SettingsList` when the host supports `ui.custom`, else a select/input loop. */
-export async function runApprovalPanel(ctx: ExtensionContext, env: PanelEnv): Promise<void> {
-	let scope: PanelScope = "session";
-	const apply = (spec: PanelItemSpec, text: string): void => {
-		const value = parsePanelValue(spec, text);
-		if (value === "invalid") {
-			ctx.ui.notify(`pi-verdict: "${text}" is not a valid value for ${spec.label}`, "warning");
-			return;
+	const selectable = (r: MenuRow): boolean => r.kind !== "section" && !(r.kind === "entry" && !r.editable);
+	const labelOf = (r: MenuRow): string => (r.kind === "choice" || r.kind === "percent" || r.kind === "page" ? r.label : "");
+	/** Rows for the current scope/page with `index` clamped onto a selectable one. */
+	const current = (): { rs: MenuRow[]; row: MenuRow | undefined } => {
+		const rs = ctl.rows(scope, page);
+		if (rs.length === 0) return { rs, row: undefined };
+		index = Math.max(0, Math.min(index, rs.length - 1));
+		if (!selectable(rs[index]!)) {
+			let found = -1;
+			for (let j = index + 1; j < rs.length && found < 0; j++) if (selectable(rs[j]!)) found = j;
+			for (let j = index - 1; j >= 0 && found < 0; j--) if (selectable(rs[j]!)) found = j;
+			if (found >= 0) index = found;
 		}
-		const err = env.write(scope, spec.key, value);
-		if (err) ctx.ui.notify(`pi-verdict: could not save ${spec.key} (${scope}): ${err}`, "error");
+		const row = rs[index];
+		return { rs, row: row !== undefined && selectable(row) ? row : undefined };
 	};
 
-	const mods = typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
-	if (mods) {
-		const result = await ctx.ui.custom<"closed" | undefined>((tui, theme, _kb, done) => {
-			const { Container, SettingsList, Spacer, Text } = mods.tui;
-			const { DynamicBorder, getSettingsListTheme } = mods.agent;
-			const items: Array<PiTui.SettingItem & { spec?: PanelItemSpec }> = [
-				{ id: "scope", label: "scope", currentValue: scope, values: [...env.scopes], description: "Where changes are stored: session (this session only, wins), project (trusted project config), user (global config)" },
-				...PANEL_ITEMS.map((spec): PiTui.SettingItem & { spec?: PanelItemSpec } => {
-					const base = { id: spec.key, label: panelLabel(spec, env), spec, currentValue: panelStoredText(env.stored(scope), spec.key, scope), description: panelEffective(env.state, spec) };
-					return spec.values
-						? { ...base, values: panelValues(spec, scope) }
-						: { ...base, submenu: (current, close) => buildPercentSlider(mods, theme, spec.label, current, scope !== "user", close) };
-				}),
-			];
-			const refresh = (): void => {
-				for (const it of items) {
-					if (!it.spec) continue;
-					it.currentValue = panelStoredText(env.stored(scope), it.spec.key, scope);
-					it.description = panelEffective(env.state, it.spec);
-					if (it.spec.values) it.values = panelValues(it.spec, scope);
-				}
-			};
-			const list = new SettingsList(
-				items,
-				Math.min(items.length, 12),
-				getSettingsListTheme(),
-				(id, value) => {
-					if (id === "scope") {
-						scope = value as PanelScope;
-					} else {
-						const spec = PANEL_ITEMS.find((s) => s.key === id);
-						if (spec) apply(spec, value);
-					}
-					refresh();
-					tui.requestRender();
-				},
-				() => done("closed"),
-			);
-			const root = new Container() as PiTui.Container & { handleInput(data: string): void };
-			root.addChild(new DynamicBorder());
-			root.addChild(new Text(theme.fg("accent", theme.bold("pi-verdict · approval settings")), 1, 0));
-			root.addChild(new Spacer(1));
-			root.addChild(list);
-			root.addChild(new Spacer(1));
-			root.addChild(new DynamicBorder());
-			root.handleInput = (data: string): void => {
-				list.handleInput(data);
-				tui.requestRender();
-			};
-			return root;
+	const pad = (s: string, n: number): string => s + " ".repeat(Math.max(0, n - visibleWidth(s)));
+	/** `left` flush left, `right` flush right with a two-column margin; the left side is truncated first. */
+	const rightAlign = (left: string, right: string, w: number): string => {
+		const rw = visibleWidth(right);
+		if (rw === 0) return left;
+		const l = truncateToWidth(left, Math.max(0, w - rw - 3));
+		return l + " ".repeat(Math.max(1, w - 2 - visibleWidth(l) - rw)) + right;
+	};
+	const bar = (n: number | null): string => {
+		const filled = n === null ? 0 : Math.max(0, Math.min(10, Math.round(n / 10)));
+		return fg("accent", "█".repeat(filled)) + fg("dim", "░".repeat(10 - filled));
+	};
+
+	const inputLine = (pfx: string, w: number): string => {
+		const e = editing!;
+		e.input.focused = component.focused;
+		if (e.input.getValue() === "") return pfx + (component.focused ? CURSOR_MARKER : "") + "\x1b[7m \x1b[27m" + " " + fg("dim", e.placeholder);
+		const inner = w - 2 - visibleWidth(pfx);
+		// Input.render prepends its own "> " prompt; strip it.
+		return inner > 0 ? pfx + e.input.render(inner + 2)[0]!.slice(2) : pfx;
+	};
+
+	const renderRow = (row: MenuRow, selected: boolean, labelW: number, w: number): string => {
+		const pfx = selected ? fg("accent", "› ") : "  ";
+		const lab = (r: { label: string }): string => pad(truncateToWidth(r.label, labelW - 2), labelW);
+		switch (row.kind) {
+			case "section": {
+				if (row.label === "") return "  " + fg("border", "─".repeat(Math.max(0, w - 4)));
+				const head = "  " + fg("border", "─ ") + fg("muted", row.label) + fg("border", " ");
+				return head + fg("border", "─".repeat(Math.max(0, w - 2 - visibleWidth(head))));
+			}
+			case "choice": {
+				const isPending = pending?.id === row.id;
+				const shown = isPending ? pending!.value : row.value;
+				if (row.locked !== undefined) return rightAlign(pfx + fg("dim", lab(row) + "  " + shown), fg("dim", row.locked), w);
+				let seg: string;
+				if (selected) {
+					const i = row.values.indexOf(shown);
+					const l = i > 0 ? "‹" : " ";
+					const r = i >= 0 && i < row.values.length - 1 ? "›" : " ";
+					seg = fg("dim", l) + " " + fg(isPending ? "warning" : "text", shown) + " " + fg("dim", r);
+				} else seg = "  " + fg(isPending ? "warning" : "muted", shown);
+				return rightAlign(pfx + fg("text", lab(row)) + seg, row.shortcut ? fg("dim", row.shortcut) : "", w);
+			}
+			case "percent": {
+				const n = /^\d+(?:\.\d+)?%$/.test(row.value) ? Number.parseFloat(row.value) : null;
+				let seg: string;
+				if (selected) {
+					const l = row.value === "inherit" || (row.value === "off" && !row.allowInherit) ? " " : "‹";
+					const r = row.value === "100%" ? " " : "›";
+					seg = `${fg("dim", l)} ${bar(n)} ${fg("text", row.value)} ${fg("dim", r)}`;
+				} else seg = "  " + fg("muted", row.value);
+				return pfx + fg("text", lab(row)) + seg;
+			}
+			case "page":
+				if (row.locked !== undefined) return rightAlign(pfx + fg("dim", row.label), fg("dim", row.locked), w);
+				return pfx + fg("text", lab(row)) + fg("dim", "›");
+			case "action":
+				return rightAlign(pfx + fg(selected ? "text" : "muted", row.label), row.key ? fg("dim", row.key) : "", w);
+			case "add":
+				if (selected && editing?.id === row.id) return inputLine(pfx + "+ ", w);
+				return pfx + fg(selected ? "text" : "muted", "+ add");
+			case "entry": {
+				if (selected && editing?.id === row.id) return inputLine(pfx, w);
+				const text = displaySafe(row.text.replace(/\r?\n/g, "⏎"));
+				if (!row.editable) return rightAlign("  " + fg("dim", text), row.tag ? fg("dim", row.tag) : "", w);
+				return rightAlign(pfx + fg("text", text), row.tag ? fg("muted", row.tag) : "", w);
+			}
+		}
+	};
+
+	const infoOf = (row: MenuRow | undefined): MenuInfo => {
+		if (row === undefined) return [];
+		let info: MenuInfo = [];
+		const isPending = (row.kind === "choice") && pending?.id === row.id;
+		if (row.kind === "choice") info = row.info(isPending ? pending!.value : row.value);
+		else if (row.kind === "percent") info = row.info(row.value);
+		else if (row.kind !== "section") info = row.info();
+		if (isPending) info = [...info, { tone: "warning", text: "press enter to apply" }];
+		if (row.kind === "action" && row.confirm && armed === row.id) info = [...info, { tone: "warning", text: "press enter again to confirm" }];
+		if (row.kind === "entry" && armed === row.id) info = [...info, { tone: "warning", text: "press d again to remove" }];
+		return info;
+	};
+
+	const hintFor = (row: MenuRow | undefined, rs: MenuRow[]): string => {
+		if (editing) return "enter save · esc cancel";
+		if (page !== null) {
+			const first = row?.kind === "entry" ? "enter edit · d remove" : row?.kind === "add" ? "enter add" : "enter select";
+			return `${first} · ← / esc back · tab scope`;
+		}
+		const parts = ["↑↓ move"];
+		if (rs.some((r) => r.kind === "choice" || r.kind === "percent")) parts.push("←→ change");
+		if (row?.kind === "page") parts.push("enter open");
+		else if (row?.kind === "choice") parts.push("enter next value");
+		else if (row?.kind === "action") parts.push("enter select");
+		if (ctl.hotkeyHint) parts.push(ctl.hotkeyHint);
+		parts.push("tab scope", "esc close");
+		return parts.join(" · ");
+	};
+
+	const titleLine = (w: number): string => {
+		const b = ctl.badge(scope);
+		const right = " " + fg(b.warn ? "warning" : "accent", `⟨ ${b.label} ⟩`) + " " + fg("dim", "tab ⇥") + " " + fg("border", "──");
+		const title = `pi-verdict · ${ctl.title}${page !== null ? ` › ${ctl.pageTitle(page)}` : ""}`;
+		const left = fg("border", "── ") + fg("accent", truncateToWidth(title, Math.max(1, w - visibleWidth(right) - 4))) + " ";
+		return left + fg("border", "─".repeat(Math.max(0, w - visibleWidth(left) - visibleWidth(right)))) + right;
+	};
+
+	const render = (w: number): string[] => {
+		const { rs, row } = current();
+		const labelW = Math.min(28, Math.max(0, ...rs.map((r) => visibleWidth(labelOf(r))))) + 2;
+		const lines: string[] = [titleLine(w)];
+		rs.forEach((r, i) => {
+			const line = renderRow(r, i === index && selectable(r), labelW, w);
+			lines.push(editing && i === index ? line : truncateToWidth(line, w));
 		});
-		if (result !== undefined) return;
-	}
+		lines.push("");
+		const info = infoOf(row);
+		for (const item of info) for (const l of wrapTextWithAnsi(item.text, Math.max(1, w - 4))) lines.push("  " + fg(item.tone, l));
+		if (info.length > 0) lines.push("");
+		lines.push(truncateToWidth("  " + fg("dim", hintFor(row, rs)), w));
+		lines.push(...bottom.render(w));
+		return lines;
+	};
 
-	// Fallback: select/input loop (hosts without `ui.custom`, unavailable TUI modules, or a `custom` that did not run)
-	for (;;) {
-		const rows = [
-			`scope: ${scope}`,
-			...PANEL_ITEMS.map((spec) => `${panelLabel(spec, env)}: ${panelStoredText(env.stored(scope), spec.key, scope)}`),
-		];
-		const picked = await ctx.ui.select("pi-verdict: approval settings", [...rows, "Done"]);
-		if (picked === undefined || picked === "Done") return;
-		const row = rows.indexOf(picked);
-		if (row === 0) {
-			const next = await ctx.ui.select("pi-verdict: settings scope", [...env.scopes]);
-			if (next !== undefined) scope = next as PanelScope;
-			continue;
-		}
-		const spec = PANEL_ITEMS[row - 1];
-		if (!spec) continue;
-		if (spec.values) {
-			const choice = await ctx.ui.select(`${spec.label} (${scope})`, panelValues(spec, scope));
-			if (choice !== undefined) apply(spec, choice);
-		} else {
-			const text = await ctx.ui.input(`${spec.label} (${scope})`, scope === "user" ? "0-100 or off" : "0-100, off, or inherit");
-			if (text !== undefined && text.trim() !== "") apply(spec, text);
-		}
-	}
+	const commit = (row: Extract<MenuRow, { kind: "choice" | "percent" }>, value: string): void => {
+		if (row.kind === "choice" && row.confirm) pending = value === row.value ? undefined : { id: row.id, value };
+		else ctl.change(scope, row.id, value);
+	};
+	const stepChoice = (row: Extract<MenuRow, { kind: "choice" }>, dir: 1 | -1, wrap: boolean, base: string): void => {
+		const i = row.values.indexOf(base);
+		let n = i + dir;
+		n = wrap ? (n + row.values.length) % row.values.length : Math.max(0, Math.min(row.values.length - 1, n));
+		const next = row.values[n];
+		if (next !== undefined && next !== base) commit(row, next);
+	};
+	const move = (dir: 1 | -1): void => {
+		const rs = ctl.rows(scope, page);
+		if (!rs.some(selectable)) return;
+		let i = index;
+		do i = (i + dir + rs.length) % rs.length;
+		while (!selectable(rs[i]!));
+		index = i;
+	};
+	const back = (): void => {
+		page = null;
+		index = parents.pop() ?? 0;
+	};
+
+	const component: PiTui.Component & { handleInput(data: string): void; focused: boolean } = {
+		focused: false,
+		invalidate() {},
+		render,
+		handleInput(data: string): void {
+			if (data.startsWith("\x1b[<") || data.startsWith("\x1b[M")) return; // mouse reports are never keys
+			const kb = getKeybindings();
+			const isEnter = kb.matches(data, "tui.select.confirm") || data === "\n";
+			const isEsc = kb.matches(data, "tui.select.cancel");
+			const isTab = matchesKey(data, "tab");
+			const isShiftTab = matchesKey(data, "shift+tab");
+
+			if (editing) {
+				if (isTab || isShiftTab) return;
+				if (isEsc) editing = undefined;
+				else if (isEnter) {
+					const text = editing.input.getValue();
+					if (text.trim() === "" || ctl.submit(scope, page!, editing.id, text)) editing = undefined;
+				} else editing.input.handleInput(data);
+				tui.requestRender();
+				return;
+			}
+
+			const prevPending = pending;
+			const prevArmed = armed;
+			pending = undefined;
+			armed = undefined;
+			const { row } = current();
+			const left = matchesKey(data, "left");
+			const right = matchesKey(data, "right");
+			const hot = ctl.hotkeys?.[data];
+
+			if (isTab || isShiftTab) {
+				const n = ctl.scopes.length;
+				scope = ctl.scopes[(ctl.scopes.indexOf(scope) + (isTab ? 1 : n - 1)) % n]!;
+			} else if (hot !== undefined) ctl.action(scope, hot);
+			else if (isEsc) {
+				if (page !== null) back();
+				else {
+					done();
+					return;
+				}
+			} else if (kb.matches(data, "tui.select.up") || data === "k") move(-1);
+			else if (kb.matches(data, "tui.select.down") || data === "j") move(1);
+			else if (left && page !== null) back();
+			else if ((left || right) && row?.kind === "choice" && row.locked === undefined) stepChoice(row, right ? 1 : -1, false, prevPending?.id === row.id ? prevPending.value : row.value);
+			else if ((left || right || data === "-" || data === "+" || data === "=") && row?.kind === "percent") {
+				const delta = left ? -5 : right ? 5 : data === "-" ? -1 : 1;
+				const next = stepPercent(row.value, delta, row.allowInherit);
+				if (next !== null) commit(row, next);
+			} else if (data === "x" && row?.kind === "percent") commit(row, "off");
+			else if (data === "i" && row?.kind === "percent" && row.allowInherit) commit(row, "inherit");
+			else if (isEnter && row) {
+				switch (row.kind) {
+					case "choice":
+						if (row.locked !== undefined) break;
+						if (prevPending?.id === row.id) ctl.change(scope, row.id, prevPending.value);
+						else stepChoice(row, 1, true, row.value);
+						break;
+					case "page":
+						if (row.locked !== undefined) break;
+						parents.push(index);
+						page = row.id;
+						index = 0;
+						break;
+					case "action":
+						if (row.confirm && prevArmed !== row.id) armed = row.id;
+						else ctl.action(scope, row.id);
+						break;
+					case "add":
+						editing = { id: row.id, placeholder: row.placeholder, input: new Input() };
+						break;
+					case "entry": {
+						if (row.text.includes("\n")) break; // multi-line entries are removable only (the inline field is single-line)
+						const input = new Input();
+						input.setValue(row.text);
+						input.handleInput("\x05"); // setValue keeps the cursor at 0; ctrl+e (cursorLineEnd) moves it behind the prefilled text
+						editing = { id: row.id, placeholder: "", input };
+						break;
+					}
+					default:
+						break;
+				}
+			} else if ((data === "d" || matchesKey(data, "delete")) && row?.kind === "entry" && page !== null) {
+				if (prevArmed === row.id) ctl.remove(scope, page, row.id);
+				else armed = row.id;
+			}
+			current();
+			tui.requestRender();
+		},
+	};
+	return component;
 }
 
 // ============================================================================
@@ -4075,12 +4262,34 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if (report.shortcutWarning) ctx.ui.notify(`pi-verdict: ${report.shortcutWarning}`, "warning");
 	}
 
-	/** Set (or with `undefined` drop) one approval key at session scope: persisted per session id, rules reloaded, status refreshed. */
-	function setSessionApproval(key: ApprovalKey, value: unknown, ctx: ExtensionContext): void {
+	/** Set (or with `undefined` drop) one session-scopable key at session scope: persisted per session id, rules reloaded, status refreshed. */
+	function setSessionSetting(key: SessionKey, value: unknown, ctx: ExtensionContext): void {
 		if (value === undefined) delete state.sessionOverrides[key];
 		else state.sessionOverrides[key] = value;
 		const err = writeSessionOverrides(ctx.sessionManager.getSessionId(), state.sessionOverrides);
 		if (err) ctx.ui.notify(`pi-verdict: session setting not persisted (${err}) — applies until restart`, "warning");
+		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
+		refreshStatus(ctx);
+	}
+
+	/** This session's additions to one editable list (`ruleAdditions`, appended to the effective list). */
+	function sessionAdditions(key: EditableListKey): string[] {
+		const existing = state.sessionOverrides.ruleAdditions;
+		if (typeof existing !== "object" || existing === null || Array.isArray(existing)) return [];
+		const list = (existing as RuleAdditions)[key];
+		return Array.isArray(list) ? list : [];
+	}
+
+	/** Replace this session's additions to one list (`undefined` or empty drops the key, and `ruleAdditions` itself once empty): persisted, rules reloaded, status refreshed. */
+	function setSessionRuleAdditions(key: EditableListKey, list: string[] | undefined, ctx: ExtensionContext): void {
+		const existing = state.sessionOverrides.ruleAdditions;
+		const cur: RuleAdditions = typeof existing === "object" && existing !== null && !Array.isArray(existing) ? { ...(existing as RuleAdditions) } : {};
+		if (list === undefined || list.length === 0) delete cur[key];
+		else cur[key] = list;
+		if (Object.keys(cur).length === 0) delete state.sessionOverrides.ruleAdditions;
+		else state.sessionOverrides.ruleAdditions = cur;
+		const err = writeSessionOverrides(ctx.sessionManager.getSessionId(), state.sessionOverrides);
+		if (err) ctx.ui.notify(`pi-verdict: session rule not persisted (${err}) — applies until restart`, "warning");
 		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
 		refreshStatus(ctx);
 	}
@@ -4153,7 +4362,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			description: "Cycle approval mode (pi-verdict)",
 			handler: (ctx) => {
 				const order: readonly ApprovalMode[] = ["default", "yolo", "noAutoDeny", "off"];
-				setSessionApproval("mode", order[(order.indexOf(state.userRules.mode) + 1) % order.length], ctx);
+				setSessionSetting("mode", order[(order.indexOf(state.userRules.mode) + 1) % order.length], ctx);
 			},
 		});
 	}
@@ -4166,47 +4375,414 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Status line cascade hint (#63/#67): shown while the floor or the fallback is configured */
 	const fallbackHint = () => (state.userRules.confidenceThreshold !== null || state.userRules.classifierFallbackModel ? `\n${state.fallback.summary(state.userRules.classifierFallbackMode)}` : "");
 
-	/** /automode panel: wires the scope stores and writers to the live state, then runs the shared panel UI. */
-	async function openQuickPanel(ctx: ExtensionContext): Promise<void> {
-		const projectFile = projectConfigTarget(ctx.cwd, agentDirPath());
-		const scopes: PanelScope[] = projectFile === null ? ["session", "user"] : ["session", "project", "user"];
-		if (projectFile !== null) {
-			const root = projectRootOf(projectFile);
-			const trusted = (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, readTrustStore().trusted);
-			if (!trusted) ctx.ui.notify(`pi-verdict: project ${root} is not trusted — project-scope edits are saved but not applied until you trust it (prompted at session start)`, "info");
+	// ---- Settings menus (/automode, /verdict): shared scope plumbing ----
+
+	/** Is the project config at `file` trusted for this session (i.e. applied by the loader)? */
+	const projectTrusted = (file: string): boolean => {
+		const root = projectRootOf(file);
+		return (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, readTrustStore().trusted);
+	};
+	/** Precedence of a setting's source: session > local > global > default. */
+	const SOURCE_RANK: Record<SettingSource, number> = { default: 0, global: 1, local: 2, session: 3 };
+
+	/** The object stored at a scope: the session overrides, or the parsed global / local config file ({} when unreadable). */
+	const storedAt = (scope: MenuScope, localFile: string | null): Record<string, unknown> => {
+		if (scope === "session") return state.sessionOverrides;
+		const loaded = scope === "global" ? readConfigObject(userConfigPath(), "user") : localFile === null ? null : readConfigObject(localFile, "local");
+		return loaded === null || "error" in loaded ? {} : loaded.raw;
+	};
+
+	/** Persist `value` (`undefined` drops the key) for a session-scopable setting or a list key at a file scope; session scope takes settings only. null = ok, else an error message. */
+	const writeScoped = (scope: MenuScope, key: string, value: unknown, localFile: string | null, ctx: ExtensionContext): string | null => {
+		if (scope === "session") {
+			setSessionSetting(key as SessionKey, value, ctx);
+			return null;
 		}
-		const fileOf = (scope: "project" | "user"): { file: string; kind: "user" | "local" } | null =>
-			scope === "user" ? { file: userConfigPath(), kind: "user" } : projectFile === null ? null : { file: projectFile, kind: "local" };
-		await runApprovalPanel(ctx, {
-			shortcuts: registeredToggleKey ? { mode: registeredToggleKey } : {},
-			state,
-			scopes,
-			stored: (scope) => {
-				if (scope === "session") return state.sessionOverrides;
-				const target = fileOf(scope);
-				const loaded = target === null ? null : readConfigObject(target.file, target.kind);
-				return loaded === null || "error" in loaded ? {} : loaded.raw;
-			},
-			write: (scope, key, value) => {
-				if (scope === "session") {
-					setSessionApproval(key, value, ctx);
-					return null;
+		const target = scope === "global" ? { file: userConfigPath(), kind: "user" as const } : localFile === null ? null : { file: localFile, kind: "local" as const };
+		if (target === null) return "no project config location here";
+		const err = writeConfigKey(target.file, target.kind, key, value);
+		if (err) return err;
+		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
+		refreshStatus(ctx);
+		return null;
+	};
+
+	/** Parse a menu value and store it at `scope`; invalid values and write errors surface as notifications. */
+	const applySetting = (ctx: ExtensionContext, scope: MenuScope, key: SessionKey, text: string, localFile: string | null): void => {
+		const value = parseMenuValue(key, text);
+		if (value === "invalid" || (key === "mode" && value === "off" && scope !== "session")) {
+			ctx.ui.notify(`pi-verdict: "${text}" is not a valid value for ${key}${scope === "session" ? "" : " at this scope"}`, "warning");
+			return;
+		}
+		const err = writeScoped(scope, key, value, localFile, ctx);
+		if (err) ctx.ui.notify(`pi-verdict: could not save ${key} (${scope}): ${err}`, "error");
+	};
+
+	/** The next lower scope that sets `key` (what `inherit` resolves to at `scope`); an untrusted local file is skipped. */
+	const inheritedFrom = (scope: MenuScope, key: SessionKey, localFile: string | null): { source: MenuScope | "default"; text: string } => {
+		const lower: MenuScope[] = scope === "session" ? ["local", "global"] : ["global"];
+		for (const s of lower) {
+			if (s === "local" && (localFile === null || !projectTrusted(localFile))) continue;
+			const raw = storedAt(s, localFile);
+			if (raw[key] !== undefined) return { source: s, text: storedValueText(raw, key, s) };
+		}
+		return { source: "default", text: MENU_DEFAULTS[key] ?? "off" };
+	};
+
+	/** Description lines of a setting row: value meaning, effective value + source, a precedence warning, an untrusted-project warning. */
+	const settingInfo = (scope: MenuScope, key: SessionKey, value: string, localFile: string | null): MenuInfo => {
+		let meaning: string;
+		if (value === "inherit") {
+			const from = inheritedFrom(scope, key, localFile);
+			meaning = `inherit — use the ${from.source} value (${from.text})`;
+		} else if (value === "invalid") meaning = "invalid value in the config file — fix it by hand";
+		else if ((PERCENT_KEYS as readonly string[]).includes(key)) meaning = value === "off" ? "off — disabled" : `${value} — ${PERCENT_MEANING[key as PercentKey]}`;
+		else meaning = VALUE_MEANING[key]?.[value] ?? value;
+		const src = state.settingSources[key];
+		const eff = state.userRules[key];
+		const effText = eff === null ? "off" : typeof eff === "boolean" ? (eff ? "on" : "off") : typeof eff === "number" ? `${eff}%` : String(eff);
+		const info: MenuInfo = [
+			{ tone: "text", text: meaning },
+			{ tone: "muted", text: `Effective: ${effText} (${src})` },
+		];
+		if (SOURCE_RANK[src] > SOURCE_RANK[scope]) info.push({ tone: "warning", text: `${src} sets this too and wins over ${scope}` });
+		if (scope === "local" && localFile !== null && !projectTrusted(localFile)) info.push({ tone: "warning", text: "not applied until this project is trusted" });
+		return info;
+	};
+
+	/** /automode panel: the approval settings at global / local / session scope (opens at session). */
+	async function openQuickPanel(ctx: ExtensionContext): Promise<void> {
+		const mods = typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
+		if (!mods) {
+			ctx.ui.notify("pi-verdict: the settings panel needs an interactive TUI — use /automode status|default|yolo|noautodeny|off", "warning");
+			return;
+		}
+		const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
+		const untrusted = localFile !== null && !projectTrusted(localFile);
+		let showAll = false;
+		const sections: Array<{ label: string; mode: ApprovalMode | null; items: Array<{ key: SessionKey; label: string }> }> = [
+			{ label: "all modes", mode: null, items: [{ key: "confidenceThreshold", label: "confidence threshold" }, { key: "classifierFallbackMode", label: "fallback mode" }] },
+			{ label: "default", mode: "default", items: [{ key: "defaultDenyThreshold", label: "deny threshold" }, { key: "defaultAllowThreshold", label: "allow threshold" }] },
+			{ label: "yolo", mode: "yolo", items: [{ key: "yoloDenyThreshold", label: "deny threshold" }, { key: "yoloDenyPaths", label: "denyPaths hit" }, { key: "yoloOmpDir", label: ".omp gate hit" }] },
+			{ label: "noAutoDeny", mode: "noAutoDeny", items: [{ key: "noAutoDenyAllowThreshold", label: "allow threshold" }] },
+		];
+		const ctl: MenuController = {
+			title: "approval",
+			scopes: localFile === null ? ["global", "session"] : ["global", "local", "session"],
+			scope: "session",
+			badge: (scope) => (scope === "local" && untrusted ? { label: "local · untrusted", warn: true } : { label: scope, warn: false }),
+			pageTitle: () => "",
+			rows: (scope) => {
+				const raw = storedAt(scope, localFile);
+				const effMode = state.userRules.mode;
+				const modeValues: readonly string[] = scope === "session" ? APPROVAL_MODES : APPROVAL_MODES.filter((m) => m !== "off");
+				const rows: MenuRow[] = [
+					{
+						kind: "choice",
+						id: "mode",
+						label: "mode",
+						values: scope === "global" ? modeValues : ["inherit", ...modeValues],
+						value: storedValueText(raw, "mode", scope),
+						shortcut: registeredToggleKey ?? undefined,
+						info: (v) => settingInfo(scope, "mode", v, localFile),
+					},
+				];
+				for (const sec of sections) {
+					if (!(showAll || (effMode !== "off" && (sec.mode === null || sec.mode === effMode)))) continue;
+					rows.push({ kind: "section", label: sec.label });
+					for (const item of sec.items) {
+						const value = storedValueText(raw, item.key, scope);
+						const info = (v: string): MenuInfo => settingInfo(scope, item.key, v, localFile);
+						const values = ENUM_VALUES[item.key];
+						rows.push(
+							values
+								? { kind: "choice", id: item.key, label: item.label, values: scope === "global" ? values : ["inherit", ...values], value, info }
+								: { kind: "percent", id: item.key, label: item.label, allowInherit: scope !== "global", value, info },
+						);
+					}
 				}
-				const target = fileOf(scope);
-				if (target === null) return "no project config location here";
-				const err = writeConfigKey(target.file, target.kind, key, value);
-				if (err) return err;
-				reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
-				refreshStatus(ctx);
-				return null;
+				rows.push(
+					{ kind: "section", label: "" },
+					{
+						kind: "action",
+						id: "show-all",
+						label: showAll ? "▾ current mode only" : "▸ show all modes",
+						key: "a",
+						info: () => [{ tone: "muted", text: showAll ? "Showing every mode's settings." : "Showing the effective mode's settings only." }],
+					},
+				);
+				return rows;
 			},
-		});
+			change: (scope, id, value) => applySetting(ctx, scope, id as SessionKey, value, localFile),
+			action: (_scope, id) => {
+				if (id === "show-all") showAll = !showAll;
+			},
+			submit: () => true,
+			remove: () => {},
+			hotkeys: { a: "show-all" },
+			hotkeyHint: "a all modes",
+		};
+		await ctx.ui.custom<"closed" | undefined>((tui, theme, _kb, done) => buildSettingsMenu(mods, tui, theme, ctl, () => done("closed")));
+	}
+
+	/** omp's main config file + YAML codec; null when not on omp (no `getAgentDir`) or not on Bun */
+	function ompRolesTarget(): { file: string; yaml: BunYaml } | null {
+		const yaml = bunYaml();
+		const getAgentDir = ompSettings()?.getAgentDir;
+		if (!yaml || typeof getAgentDir !== "function") return null;
+		try {
+			return { file: ompMainConfigPath(getAgentDir()), yaml };
+		} catch {
+			return null; // omp's settings proxy throws before init
+		}
+	}
+
+	/** Add (`add`) or remove pi-verdict's two `modelTags` entries in omp's config.yml, then have omp reload the file. The menu's pending value + Enter is the confirmation. */
+	async function applyRoleTags(ctx: ExtensionContext, target: { file: string; yaml: BunYaml }, add: boolean): Promise<void> {
+		const { file: cfgFile, yaml } = target;
+		const loaded = readOmpConfig(cfgFile, yaml);
+		if ("error" in loaded) {
+			ctx.ui.notify(`pi-verdict: ${loaded.error}`, "error");
+			return;
+		}
+		if (verdictRoleTagsPresent(loaded.raw) === add) return;
+		const err = writeOmpConfig(cfgFile, withVerdictRoleTags(loaded.raw, add), yaml);
+		if (err) {
+			ctx.ui.notify(`pi-verdict: could not save ${cfgFile}: ${err}`, "error");
+			return;
+		}
+		try {
+			await ompSettings()?.reloadFromDisk?.();
+		} catch (e) {
+			ctx.ui.notify(`pi-verdict: ${cfgFile} saved, but omp could not reload it (${e instanceof Error ? e.message : String(e)}) — restart omp to apply`, "warning");
+			return;
+		}
+		ctx.ui.notify(add ? `pi-verdict: custom roles added to ${cfgFile} — assign them in /model → Roles` : `pi-verdict: custom roles removed from ${cfgFile}`, "info");
+	}
+
+	/** Normalize + duplicate-check a typed entry; undefined = nothing to save (already notified) */
+	function acceptEntry(ctx: ExtensionContext, key: EditableListKey, input: string, list: unknown[], selfIndex: number): string | undefined {
+		const n = normalizeEntry(key, input);
+		if (n === null) return undefined;
+		if ("error" in n) {
+			ctx.ui.notify(`pi-verdict: ${key}: ${n.error} — not saved`, "warning");
+			return undefined;
+		}
+		if (list.some((x, j) => j !== selfIndex && x === n.value)) {
+			ctx.ui.notify(`pi-verdict: already in ${key}`, "info");
+			return undefined;
+		}
+		return n.value;
+	}
+
+	const LIST_LABEL = (key: EditableListKey): string => (key === "rules" ? "classifier rules" : key);
+	const LIST_SCOPE_LINE: Record<MenuScope, string> = {
+		global: "Saved to the global config — the base list.",
+		local: "Saved to this project's config — replaces the global list for this project.",
+		session: "Added for this session only; appended to the local/global list.",
+	};
+
+	/** /verdict menu: list pages (allow/deny/tools/denyPaths/classifier rules), the gateOmpDir + footer switches and omp custom roles, at global / local / session scope. */
+	async function openVerdictMenu(ctx: ExtensionContext, initial: MenuScope): Promise<void> {
+		const mods = typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
+		if (!mods) {
+			ctx.ui.notify("pi-verdict: /verdict needs an interactive TUI", "warning");
+			return;
+		}
+		const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
+		if (initial === "local" && localFile === null) {
+			ctx.ui.notify("pi-verdict: no project config location here (cwd is your home dir or the agent tree root)", "warning");
+			return;
+		}
+		if (initial !== "session") {
+			const first = initial === "global" ? readConfigObject(userConfigPath(), "user") : readConfigObject(localFile!, "local");
+			if ("error" in first) {
+				ctx.ui.notify(`pi-verdict: ${first.error}`, "error");
+				return;
+			}
+		}
+		const untrusted = localFile !== null && !projectTrusted(localFile);
+		const rolesTarget = ompRolesTarget();
+		if (rolesTarget) {
+			const rc = readOmpConfig(rolesTarget.file, rolesTarget.yaml);
+			if ("error" in rc) ctx.ui.notify(`pi-verdict: ${rc.error}`, "warning");
+		}
+		const pendingOps: Promise<void>[] = [];
+
+		type ListState = { list: unknown[]; set: boolean; invalid: boolean };
+		const ownList = (scope: MenuScope, key: EditableListKey): ListState => {
+			if (scope === "session") {
+				const list = sessionAdditions(key);
+				return { list, set: list.length > 0, invalid: false };
+			}
+			const v = storedAt(scope, localFile)[key];
+			if (v === undefined) return { list: [], set: false, invalid: false };
+			return Array.isArray(v) ? { list: v, set: true, invalid: false } : { list: [], set: true, invalid: true };
+		};
+		/** Entries a scope inherits (shown dimmed, never editable here). */
+		const inheritedList = (scope: MenuScope, key: EditableListKey): Array<{ x: unknown; tag: string }> => {
+			if (scope === "global") return [];
+			const tagged = (l: ListState, tag: string): Array<{ x: unknown; tag: string }> => (l.invalid ? [] : l.list.map((x) => ({ x, tag })));
+			if (scope === "local") return ownList("local", key).set ? [] : tagged(ownList("global", key), "global");
+			if (localFile !== null && !untrusted) {
+				const local = ownList("local", key);
+				if (local.set && !local.invalid) return tagged(local, "local");
+			}
+			return tagged(ownList("global", key), "global");
+		};
+		const untrustedWarn = (scope: MenuScope): MenuInfo => (scope === "local" && untrusted ? [{ tone: "warning", text: "not applied until this project is trusted" }] : []);
+		const listInfo = (scope: MenuScope): MenuInfo => [{ tone: "text", text: LIST_SCOPE_LINE[scope] }, ...untrustedWarn(scope)];
+
+		/** Store a list at a scope; session scope rewrites this session's additions. false = not saved. */
+		const saveList = (scope: MenuScope, key: EditableListKey, next: unknown[] | undefined): boolean => {
+			if (scope === "session") {
+				setSessionRuleAdditions(key, next as string[] | undefined, ctx);
+				ctx.ui.notify(`pi-verdict: ${key} updated for this session — rules reloaded`, "info");
+				return true;
+			}
+			const file = scope === "global" ? userConfigPath() : localFile;
+			const err = writeScoped(scope, key, next, localFile, ctx);
+			if (err) {
+				ctx.ui.notify(`pi-verdict: could not save ${file}: ${err}`, "error");
+				return false;
+			}
+			ctx.ui.notify(`pi-verdict: ${key} saved to ${file} — rules reloaded`, "info");
+			return true;
+		};
+
+		const switchRow = (scope: MenuScope, key: "gateOmpDir" | "footer", label: string): MenuRow => {
+			const raw = storedAt(scope, localFile);
+			const stored = raw[key];
+			const base = key === "gateOmpDir" ? ["on", "off"] : (ENUM_VALUES.footer as readonly string[]);
+			const valid = stored === undefined || (key === "gateOmpDir" ? typeof stored === "boolean" : typeof stored === "string" && base.includes(stored));
+			return {
+				kind: "choice",
+				id: key,
+				label,
+				values: !valid ? ["invalid"] : scope === "global" ? base : ["inherit", ...base],
+				value: valid ? storedValueText(raw, key, scope) : "invalid",
+				...(valid ? {} : { locked: "fix by hand" }),
+				info: (v) => settingInfo(scope, key, v, localFile),
+			};
+		};
+
+		const ctl: MenuController = {
+			title: "rules",
+			scopes: localFile === null ? ["global", "session"] : ["global", "local", "session"],
+			scope: initial,
+			badge: (scope) => (scope === "local" && untrusted ? { label: "local · untrusted", warn: true } : { label: scope, warn: false }),
+			pageTitle: (page) => LIST_LABEL(page as EditableListKey),
+			rows: (scope, page) => {
+				if (page === null) {
+					const rows: MenuRow[] = [{ kind: "section", label: "rules" }];
+					for (const key of EDITABLE_LIST_KEYS) {
+						const own = ownList(scope, key);
+						const count = own.invalid ? "invalid" : scope === "local" && !own.set ? "not set" : String(own.list.length);
+						rows.push({
+							kind: "page",
+							id: key,
+							label: `${LIST_LABEL(key)} (${count})`,
+							...(own.invalid ? { locked: "fix by hand" } : {}),
+							info: () => [{ tone: "text", text: `${LIST_KEY_DESC[key][0]!.toUpperCase()}${LIST_KEY_DESC[key].slice(1)}` }, { tone: "muted", text: LIST_SCOPE_LINE[scope] }, ...untrustedWarn(scope)],
+						});
+					}
+					rows.push({ kind: "section", label: "switches" }, switchRow(scope, "gateOmpDir", ".omp gate"), switchRow(scope, "footer", "footer"));
+					if (rolesTarget) {
+						const rc = readOmpConfig(rolesTarget.file, rolesTarget.yaml);
+						const readError = "error" in rc ? rc.error : null;
+						const present = "raw" in rc && verdictRoleTagsPresent(rc.raw);
+						rows.push(
+							{ kind: "section", label: "omp" },
+							{
+								kind: "choice",
+								id: "roles",
+								label: "custom roles",
+								values: readError ? ["unreadable"] : ["off", "on"],
+								value: readError ? "unreadable" : present ? "on" : "off",
+								confirm: true,
+								...(scope !== "global" ? { locked: "global only" } : readError ? { locked: "see notification" } : {}),
+								info: (v) => {
+									if (readError) return [{ tone: "warning", text: readError }];
+									const text =
+										v === (present ? "on" : "off")
+											? present
+												? "on — verdict-fallback and explain-gate are listed in /model → Roles"
+												: "off — pi-verdict's custom roles are not listed in /model → Roles"
+											: v === "on"
+												? 'Adds modelTags entries verdict-fallback ("VERDICT FALLBACK") and explain-gate ("EXPLAIN GATE") so both roles are listed in /model → Roles. The file is re-serialized (YAML comments are not kept).'
+												: "Removes the modelTags entries verdict-fallback and explain-gate. Assignments under modelRoles are kept; an assigned role stays listed and active.";
+									return [{ tone: "text", text }, { tone: "muted", text: `omp config: ${rolesTarget.file}` }];
+								},
+							},
+						);
+					}
+					return rows;
+				}
+				const key = page as EditableListKey;
+				const own = ownList(scope, key);
+				const rows: MenuRow[] = [{ kind: "add", id: "add", placeholder: LIST_KEY_PLACEHOLDER[key], info: () => listInfo(scope) }];
+				own.list.forEach((x, i) =>
+					rows.push({
+						kind: "entry",
+						id: String(i),
+						text: entryLabel(x),
+						tag: scope,
+						editable: true,
+						info: () => (entryLabel(x).includes("\n") ? [{ tone: "muted", text: "multi-line rule — remove it and add again to change it" }, ...listInfo(scope)] : listInfo(scope)),
+					}),
+				);
+				inheritedList(scope, key).forEach((e, i) => rows.push({ kind: "entry", id: `inherited-${i}`, text: entryLabel(e.x), tag: e.tag, editable: false, info: () => [] }));
+				if (scope === "local" && own.set) {
+					rows.push(
+						{ kind: "section", label: "" },
+						{ kind: "action", id: `unset:${key}`, label: "× unset — inherit the global list", confirm: true, info: () => [{ tone: "text", text: "Removes this project's list; the global list applies again." }, ...untrustedWarn(scope)] },
+					);
+				}
+				return rows;
+			},
+			change: (scope, id, value) => {
+				if (id === "roles") {
+					if (rolesTarget && (value === "on" || value === "off")) pendingOps.push(applyRoleTags(ctx, rolesTarget, value === "on"));
+					return;
+				}
+				if (id === "gateOmpDir" || id === "footer") applySetting(ctx, scope, id, value, localFile);
+			},
+			action: (scope, id) => {
+				if (id.startsWith("unset:")) saveList(scope, id.slice("unset:".length) as EditableListKey, undefined);
+			},
+			submit: (scope, page, id, text) => {
+				const key = page as EditableListKey;
+				const own = ownList(scope, key);
+				if (own.invalid) {
+					ctx.ui.notify(`pi-verdict: ${key} is not an array — fix it by hand`, "warning");
+					return true;
+				}
+				const selfIndex = id === "add" ? -1 : Number(id);
+				const fromGlobal = selfIndex < 0 && scope === "local" && !own.set ? ownList("global", key) : null;
+				const base = fromGlobal && !fromGlobal.invalid ? fromGlobal.list : own.list;
+				const value = acceptEntry(ctx, key, text, base, selfIndex);
+				if (value === undefined) return false;
+				if (selfIndex >= 0 && own.list[selfIndex] === value) return true;
+				const next = selfIndex >= 0 ? own.list.map((e, j) => (j === selfIndex ? value : e)) : [...base, value];
+				const saved = saveList(scope, key, next);
+				if (saved && fromGlobal) ctx.ui.notify(`pi-verdict: local ${key} created from the global list (${base.length} entries)`, "info");
+				return saved;
+			},
+			remove: (scope, page, id) => {
+				const key = page as EditableListKey;
+				const own = ownList(scope, key);
+				if (own.invalid) return;
+				saveList(scope, key, own.list.filter((_, j) => j !== Number(id)));
+			},
+		};
+		await ctx.ui.custom<"closed" | undefined>((tui, theme, _kb, done) => buildSettingsMenu(mods, tui, theme, ctl, () => done("closed")));
+		await Promise.all(pendingOps);
 	}
 
 	/** `/automode status` body: effective mode + source, thresholds, yolo protected actions, then the shadow/denyPaths/audit/fallback hints. */
 	const statusText = (): string => {
 		const r = state.userRules;
-		const src = state.approvalSources;
+		const src = state.settingSources;
 		const pct = (v: number | null): string => (v === null ? "off" : `${v}%`);
 		const lines = [r.mode === "off" ? `Auto Mode: off (${src.mode})` : `🛡️ Approval mode: ${r.mode} (${src.mode})`];
 		lines.push(`confidence threshold: ${pct(r.confidenceThreshold)} (${src.confidenceThreshold})`);
@@ -4232,7 +4808,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const m = parseModeArg(arg);
 			if (m) {
 				const changed = m !== state.userRules.mode;
-				setSessionApproval("mode", m, ctx);
+				setSessionSetting("mode", m, ctx);
 				const tail = m === "yolo" ? " — no prompts: uncertain calls are blocked with an explain/rewrite request" : m === "off" ? " — tool calls execute directly" : "";
 				ctx.ui.notify(`🛡️ Approval mode: ${m} (${changed ? "session" : "unchanged"})${tail}\n${state.shadow.summary()}${fallbackHint()}`, "info");
 				return;
@@ -4243,260 +4819,18 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	});
 
 	pi.registerCommand("verdict", {
-		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch, footer style, omp custom roles): /verdict [user|local]",
+		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch, footer style, omp custom roles) in a settings menu: /verdict [global|local|session]",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("pi-verdict: /verdict needs an interactive UI", "warning");
 				return;
 			}
 			const arg = args.trim().toLowerCase();
-			const agentDir = agentDirPath();
-			const localFile = projectConfigTarget(ctx.cwd, agentDir);
-			let kind: "user" | "local";
-			let file: string;
-			if (arg === "user") {
-				kind = "user";
-				file = userConfigPath();
-			} else if (arg === "local") {
-				if (localFile === null) {
-					ctx.ui.notify("pi-verdict: no project config location here (cwd is your home dir or the agent tree root)", "warning");
-					return;
-				}
-				kind = "local";
-				file = localFile;
-			} else if (arg === "") {
-				const targets: Array<{ kind: "user" | "local"; file: string; label: string }> = [
-					{ kind: "user", file: userConfigPath(), label: `User — ${userConfigPath()}` },
-				];
-				if (localFile !== null) targets.push({ kind: "local", file: localFile, label: `Local (project) — ${localFile}` });
-				const choice = await ctx.ui.select("pi-verdict: which config?", targets.map((t) => t.label));
-				const picked = choice === undefined ? undefined : targets[targets.map((t) => t.label).indexOf(choice)];
-				if (!picked) return;
-				kind = picked.kind;
-				file = picked.file;
-			} else {
-				ctx.ui.notify(`unknown argument: ${arg}\nUsage: /verdict [user|local]`, "warning");
+			if (arg !== "" && arg !== "global" && arg !== "local" && arg !== "session") {
+				ctx.ui.notify(`unknown argument: ${arg}\nUsage: /verdict [global|local|session]`, "warning");
 				return;
 			}
-
-			const loadedRaw = readConfigObject(file, kind);
-			if ("error" in loadedRaw) {
-				ctx.ui.notify(`pi-verdict: ${loadedRaw.error}`, "error");
-				return;
-			}
-			let raw = loadedRaw.raw;
-
-			if (kind === "local") {
-				const root = projectRootOf(file);
-				const trusted = (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, readTrustStore().trusted);
-				if (!trusted) ctx.ui.notify(`pi-verdict: project ${root} is not trusted — edits are saved but not applied until you trust it (prompted at session start)`, "info");
-			}
-
-			/** Write `key` (or drop it when undefined) and hot-reload the rules; false = nothing changed */
-			function save(nextValue: unknown, key: string): boolean {
-				const err = writeConfigKey(file, kind, key, nextValue);
-				if (err) {
-					ctx.ui.notify(`pi-verdict: could not save ${file}: ${err}`, "error");
-					return false;
-				}
-				const next: Record<string, unknown> = { ...raw };
-				if (nextValue === undefined) delete next[key];
-				else next[key] = nextValue;
-				raw = next;
-				reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
-				refreshStatus(ctx);
-				ctx.ui.notify(`pi-verdict: ${key} saved to ${file} — rules reloaded`, "info");
-				return true;
-			}
-
-			/** Boolean switch menu for gateOmpDir; local files can also unset (inherit the global value) */
-			async function editGateOmpDir(): Promise<void> {
-				const ON = "On — ask before any .omp directory access (default)";
-				const OFF = "Off — no forced gate on .omp directories";
-				const UNSET = "× Unset (inherit global gateOmpDir)";
-				const options = [ON, OFF];
-				if (kind === "local" && "gateOmpDir" in raw) options.push(UNSET);
-				const choice = await ctx.ui.select(`gateOmpDir — ${file}`, options);
-				if (choice === ON) save(true, "gateOmpDir");
-				else if (choice === OFF) save(false, "gateOmpDir");
-				else if (choice === UNSET) save(undefined, "gateOmpDir");
-			}
-
-			/** Style menu for footer; local files can also unset (inherit the global value) */
-			async function editFooter(): Promise<void> {
-				const FULL = "full — Nerd Font powerline blocks (default)";
-				const COMPACT = "compact — plain one-line text";
-				const OFF = "off — no footer status";
-				const UNSET = "× Unset (inherit global footer)";
-				const options = [FULL, COMPACT, OFF];
-				if (kind === "local" && "footer" in raw) options.push(UNSET);
-				const choice = await ctx.ui.select(`footer — ${file}`, options);
-				if (choice === FULL) save("full", "footer");
-				else if (choice === COMPACT) save("compact", "footer");
-				else if (choice === OFF) save("off", "footer");
-				else if (choice === UNSET) save(undefined, "footer");
-			}
-
-			/** omp's main config file + YAML codec; null when not on omp (no `getAgentDir`) or not on Bun */
-			function ompRolesTarget(): { file: string; yaml: BunYaml } | null {
-				const yaml = bunYaml();
-				const getAgentDir = ompSettings()?.getAgentDir;
-				if (!yaml || typeof getAgentDir !== "function") return null;
-				try {
-					return { file: ompMainConfigPath(getAgentDir()), yaml };
-				} catch {
-					return null; // omp's settings proxy throws before init
-				}
-			}
-
-			/** Add/remove pi-verdict's two `modelTags` entries in omp's config.yml (confirmed, then omp reloads the file) */
-			async function toggleRoleTags(target: { file: string; yaml: BunYaml }): Promise<void> {
-				const { file: cfgFile, yaml } = target;
-				const loaded = readOmpConfig(cfgFile, yaml);
-				if ("error" in loaded) {
-					ctx.ui.notify(`pi-verdict: ${loaded.error}`, "error");
-					return;
-				}
-				const present = verdictRoleTagsPresent(loaded.raw);
-				const ok = present
-					? await ctx.ui.confirm(`Remove pi-verdict custom roles from ${cfgFile}?`, "Removes the modelTags entries verdict-fallback and explain-gate. Assignments under modelRoles are kept; an assigned role stays listed and active.")
-					: await ctx.ui.confirm(`Add pi-verdict custom roles to ${cfgFile}?`, 'Adds modelTags entries verdict-fallback ("VERDICT FALLBACK") and explain-gate ("EXPLAIN GATE") so both roles are listed in /model → Roles. The file is re-serialized (YAML comments are not kept).');
-				if (!ok) return;
-				const err = writeOmpConfig(cfgFile, withVerdictRoleTags(loaded.raw, !present), yaml);
-				if (err) {
-					ctx.ui.notify(`pi-verdict: could not save ${cfgFile}: ${err}`, "error");
-					return;
-				}
-				try {
-					await ompSettings()?.reloadFromDisk?.();
-				} catch (e) {
-					ctx.ui.notify(`pi-verdict: ${cfgFile} saved, but omp could not reload it (${e instanceof Error ? e.message : String(e)}) — restart omp to apply`, "warning");
-					return;
-				}
-				ctx.ui.notify(present ? `pi-verdict: custom roles removed from ${cfgFile}` : `pi-verdict: custom roles added to ${cfgFile} — assign them in /model → Roles`, "info");
-			}
-
-			/** Normalize + duplicate-check a typed entry; undefined = nothing to save (already notified or cancelled) */
-			function acceptEntry(key: EditableListKey, input: string | undefined, list: unknown[], selfIndex: number): string | undefined {
-				if (input === undefined) return undefined;
-				const n = normalizeEntry(key, input);
-				if (n === null) return undefined;
-				if ("error" in n) {
-					ctx.ui.notify(`pi-verdict: ${key}: ${n.error} — not saved`, "warning");
-					return undefined;
-				}
-				if (list.some((x, j) => j !== selfIndex && x === n.value)) {
-					ctx.ui.notify(`pi-verdict: already in ${key}`, "info");
-					return undefined;
-				}
-				return n.value;
-			}
-
-			// Entry menu for one key; returns when the user goes back
-			async function editKey(key: EditableListKey): Promise<void> {
-				const ADD = "+ Add";
-				const BACK = "← Back";
-				const UNSET = `× Unset (inherit global ${key})`;
-				for (;;) {
-					const cur = raw[key];
-					const list: unknown[] = Array.isArray(cur) ? cur : [];
-					const options = [ADD, ...list.map((x, i) => `${i + 1}. ${entryLabel(x)}`)];
-					if (kind === "local" && key in raw) options.push(UNSET);
-					options.push(BACK);
-					const choice = await ctx.ui.select(`${key} — ${file}`, options);
-					if (choice === undefined || choice === BACK) return;
-					const idx = options.indexOf(choice);
-
-					if (choice === ADD) {
-						const value = acceptEntry(key, await ctx.ui.input(`Add to ${key}`, LIST_KEY_PLACEHOLDER[key]), list, -1);
-						if (value === undefined) continue;
-						let base: unknown[];
-						if (key in raw) base = list;
-						else if (kind === "local") {
-							const start = await projectListStart(ctx.ui, key);
-							if (start === undefined) continue;
-							base = start;
-						} else base = [];
-						save([...base, value], key);
-					} else if (choice === UNSET) {
-						if (await ctx.ui.confirm(`Unset ${key} in ${file}?`, `The project will inherit the global ${key} list.`)) {
-							if (save(undefined, key)) return;
-						}
-					} else {
-						const i = idx - 1;
-						const x = list[i];
-						const actions = ["Edit", "Remove", BACK];
-						const act = await ctx.ui.select(`${key} #${i + 1}: ${entryLabel(x)}`, actions);
-						if (act === "Edit") {
-							const value = acceptEntry(key, await ctx.ui.editor(`Edit ${key} #${i + 1}`, entryLabel(x)), list, i);
-							if (value === undefined || value === x) continue;
-							save(list.map((e, j) => (j === i ? value : e)), key);
-						} else if (act === "Remove") {
-							if (await ctx.ui.confirm(`Remove from ${key}?`, entryLabel(x))) save(list.filter((_, j) => j !== i), key);
-						}
-					}
-				}
-			}
-
-			// Key menu
-			const DONE = "Done";
-			for (;;) {
-				const options = EDITABLE_LIST_KEYS.map((key) => {
-					const v = raw[key];
-					const desc = LIST_KEY_DESC[key];
-					if (v === undefined) return kind === "local" ? `${key} (not set: global applies) — ${desc}` : `${key} (0) — ${desc}`;
-					if (Array.isArray(v)) return `${key} (${v.length}) — ${desc}`;
-					return `${key} (invalid: not an array) — ${desc}`;
-				});
-				const gateIdx = options.length;
-				const gv = raw.gateOmpDir;
-				const gateState = gv === undefined ? (kind === "local" ? "not set: global applies" : "on, default") : typeof gv === "boolean" ? (gv ? "on" : "off") : "invalid: not a boolean";
-				options.push(`gateOmpDir (${gateState}) — ${GATE_OMP_DIR_DESC}`);
-				const footerIdx = options.length;
-				const fv = raw.footer;
-				const footerState = fv === undefined ? (kind === "local" ? "not set: global applies" : "full, default") : fv === "full" || fv === "compact" || fv === "off" ? fv : "invalid";
-				options.push(`footer (${footerState}) — ${FOOTER_DESC}`);
-				let rolesIdx = -1;
-				const rolesTarget = ompRolesTarget();
-				if (rolesTarget) {
-					rolesIdx = options.length;
-					const rc = readOmpConfig(rolesTarget.file, rolesTarget.yaml);
-					if ("error" in rc) options.push("omp custom roles (config.yml unreadable) — select for details");
-					else if (verdictRoleTagsPresent(rc.raw)) options.push("✓ omp custom roles — verdict-fallback, explain-gate listed in /model → Roles (select to remove)");
-					else options.push("omp custom roles — add verdict-fallback, explain-gate to /model → Roles");
-				}
-				options.push(DONE);
-				const choice = await ctx.ui.select(`pi-verdict: edit ${file}`, options);
-				if (choice === undefined || choice === DONE) return;
-				const choiceIdx = options.indexOf(choice);
-				if (choiceIdx === gateIdx) {
-					if (gv !== undefined && typeof gv !== "boolean") {
-						ctx.ui.notify(`pi-verdict: gateOmpDir in ${file} is not a boolean — fix it by hand`, "warning");
-						continue;
-					}
-					await editGateOmpDir();
-					continue;
-				}
-				if (choiceIdx === footerIdx) {
-					if (fv !== undefined && fv !== "full" && fv !== "compact" && fv !== "off") {
-						ctx.ui.notify(`pi-verdict: footer in ${file} is not "full"|"compact"|"off" — fix it by hand`, "warning");
-						continue;
-					}
-					await editFooter();
-					continue;
-				}
-				if (rolesTarget && choiceIdx === rolesIdx) {
-					await toggleRoleTags(rolesTarget);
-					continue;
-				}
-				const key = EDITABLE_LIST_KEYS[choiceIdx];
-				if (key === undefined) return;
-				if (raw[key] !== undefined && !Array.isArray(raw[key])) {
-					ctx.ui.notify(`pi-verdict: ${key} in ${file} is not an array — fix it by hand`, "warning");
-					continue;
-				}
-				await editKey(key);
-			}
+			await openVerdictMenu(ctx, arg === "" ? "global" : arg);
 		},
 	});
 
@@ -4615,14 +4949,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						ctx.ui.notify(`pi-verdict: already active in ${kind}`, "info");
 						return;
 					}
-					const existing = state.sessionOverrides.ruleAdditions;
-					const cur: RuleAdditions = typeof existing === "object" && existing !== null && !Array.isArray(existing) ? (existing as RuleAdditions) : {};
-					const list: string[] = Array.isArray(cur[kind]) ? cur[kind]! : [];
-					state.sessionOverrides.ruleAdditions = { ...cur, [kind]: [...list, rule] };
-					const err = writeSessionOverrides(ctx.sessionManager.getSessionId(), state.sessionOverrides);
-					if (err) ctx.ui.notify(`pi-verdict: session rule not persisted (${err}) — applies until restart`, "warning");
-					reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
-					refreshStatus(ctx);
+					setSessionRuleAdditions(kind, [...sessionAdditions(kind), rule], ctx);
 					ctx.ui.notify(`pi-verdict: ${kind} rule added for this session — rules reloaded`, "info");
 					return;
 				}

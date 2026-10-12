@@ -202,6 +202,38 @@ function driveDialogs(h: Harness, scripts: string[][], rendered: string[], after
 	};
 }
 
+const MENU = { DOWN: "\x1b[B", UP: "\x1b[A", RIGHT: "\x1b[C", LEFT: "\x1b[D", TAB: "\t", ENTER: "\r", ESC: "\x1b", BACKSPACE: "\x7f" };
+const typed = (text: string): string[] => [...text];
+const times = (n: number, key: string): string[] => Array<string>(n).fill(key);
+
+/** Replays one key script against the real settings menu opened by the next `ui.custom` call, then presses Escape until it closes.
+ *  One-shot: the previous `ui.custom` is restored when the menu opens, so a later ask dialog in the same test is not driven by these keys.
+ *  `rendered` gets the first render, `after` the render after each key (width 100, ANSI stripped). */
+function driveMenu(h: Harness, keys: string[], rendered: string[] = [], after: string[] = []): void {
+	const previous = h.ctx.ui.custom;
+	h.ctx.ui.custom = async (factory: DialogFactory) => {
+		h.ctx.ui.custom = previous;
+		// Lazy like the extension's own dialog modules: the pi package is an optional peer dependency, so the suite must not load it statically.
+		const { initTheme } = await import("@earendil-works/pi-coding-agent");
+		initTheme("dark", false);
+		const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		let closed = false;
+		const component = factory({ requestRender() {} }, fakeTheme, undefined, (r) => {
+			closed = true;
+			resolve(r);
+		});
+		const draw = (): string => component.render(100).join("\n").replace(ANSI, "");
+		rendered.push(draw());
+		for (const k of keys) {
+			component.handleInput(k);
+			after.push(draw());
+		}
+		for (let i = 0; i < 6 && !closed; i++) component.handleInput(MENU.ESC);
+		return promise;
+	};
+}
+
 /** 开一个会话:按 cfg 写真实配置 → 建 harness → 装载扩展。顺序约束(配置先于装载)
  *  内化于此;opts 统一收纳全部变体:cwd/ompRegistry 给 makeHarness,
  *  invalid/flag/debug/modelFlag/compatLoader 分别传给 setConfig 与 install。 */
@@ -2468,18 +2500,22 @@ describe("gateOmpDir forced gate", () => {
 describe("/verdict config editor", () => {
 	const USER_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
 	const readUser = () => JSON.parse(fs.readFileSync(USER_FILE(), "utf8"));
-	/** Open a session, then run `/verdict <arg>` against the scripted dialogs */
-	async function run(h: Harness, arg: string, script: { picks: string[]; inputs?: Array<string | undefined>; editors?: Array<string | undefined> }): Promise<void> {
+	const { DOWN, ENTER, LEFT, RIGHT, BACKSPACE } = MENU;
+	const GATE_ROW = times(5, DOWN); // allow → deny → tools → denyPaths → classifier rules → .omp gate
+	const localFileOf = (dir: string) => {
+		const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
+		return path.join(dir, dot, "pi-verdict.json");
+	};
+	/** Open a session, then run `/verdict <arg>` against the scripted menu keys */
+	async function run(h: Harness, arg: string, keys: string[], rendered: string[] = [], after: string[] = []): Promise<void> {
 		await h.handlers.session_start({}, h.ctx);
-		h.selectPicks = script.picks;
-		h.inputs = script.inputs ?? [];
-		h.editors = script.editors ?? [];
+		driveMenu(h, keys, rendered, after);
 		await h.commands.verdict.handler(arg, h.ctx);
 	}
 
-	test("add persists to the user file and takes effect immediately (no classifier call)", async () => {
+	test("add persists to the global file and takes effect immediately (no classifier call)", async () => {
 		const h = session({});
-		await run(h, "user", { picks: ["allow", "+ Add", "← Back", "Done"], inputs: ["^ls\\b"] });
+		await run(h, "", [ENTER, ENTER, ...typed("^ls\\b"), ENTER]);
 		expect(readUser().allow).toEqual(["^ls\\b"]);
 		const r = await toolCall(h, "bash", { command: "ls -la" });
 		expect(r).toBeUndefined();
@@ -2489,52 +2525,98 @@ describe("/verdict config editor", () => {
 	test("invalid regex is rejected: file unchanged, warning notified", async () => {
 		const h = session({ allow: ["^keep"] });
 		const before = fs.readFileSync(USER_FILE(), "utf8");
-		await run(h, "user", { picks: ["allow", "+ Add", "← Back", "Done"], inputs: ["("] });
+		await run(h, "", [ENTER, ENTER, ...typed("("), ENTER]);
 		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("invalid regex"))).toBe(true);
 	});
 
-	test("remove deletes the chosen entry after confirmation", async () => {
+	test("remove needs d twice; a single d only arms", async () => {
 		const h = session({ deny: ["rm "] });
-		h.confirmAnswer = true;
-		await run(h, "user", { picks: ["deny", "1.", "Remove", "← Back", "Done"] });
+		const before = fs.readFileSync(USER_FILE(), "utf8");
+		const after: string[] = [];
+		await run(h, "", [DOWN, ENTER, DOWN, "d"], [], after);
+		expect(after.at(-1)).toContain("press d again to remove");
+		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
+		driveMenu(h, [DOWN, ENTER, DOWN, "d", "d"]);
+		await h.commands.verdict.handler("", h.ctx);
 		expect(readUser().deny).toEqual([]);
 	});
 
-	test("edit replaces the entry and preserves untouched keys; trailing newline stripped", async () => {
+	test("edit replaces the entry in place and preserves untouched keys", async () => {
 		const h = session({ allow: ["^a"], classifierModel: "x/y" });
-		await run(h, "user", { picks: ["allow", "1.", "Edit", "← Back", "Done"], editors: ["^b\n"] });
+		await run(h, "", [ENTER, DOWN, ENTER, BACKSPACE, BACKSPACE, ...typed("^b"), ENTER]);
 		const saved = readUser();
 		expect(saved.allow).toEqual(["^b"]);
 		expect(saved.classifierModel).toBe("x/y");
 	});
 
-	test("local: first add offers a copy of the global list and warns the project is untrusted", async () => {
+	test("local: first add copies the global list, notifies, and the badge flags the untrusted project", async () => {
 		await withTempDir("pv-verdict-cmd-", async (dir) => {
 			const h = session({ allow: ["^g"] }, { cwd: dir });
-			await run(h, "local", { picks: ["allow", "+ Add", "Copy of global", "← Back", "Done"], inputs: ["^p"] });
-			const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
-			const file = path.join(dir, dot, "pi-verdict.json");
-			expect(fs.existsSync(file)).toBe(true);
+			const rendered: string[] = [];
+			await run(h, "local", [ENTER, ENTER, ...typed("^p"), ENTER], rendered);
+			const file = localFileOf(dir);
 			expect(JSON.parse(fs.readFileSync(file, "utf8")).allow).toEqual(["^g", "^p"]);
-			expect(h.notifies.some(([m, l]) => l === "info" && m.includes("is not trusted"))).toBe(true);
+			expect(rendered[0]).toContain("⟨ local · untrusted ⟩");
+			expect(h.notifies.some(([m, l]) => l === "info" && m.includes("local allow created from the global list (1 entries)"))).toBe(true);
+		});
+	});
+
+	test("local: a key set locally can be unset with a confirming second Enter (inherit the global list)", async () => {
+		await withTempDir("pv-verdict-unset-", async (dir) => {
+			const h = session({ allow: ["^g"] }, { cwd: dir });
+			fs.mkdirSync(path.dirname(localFileOf(dir)), { recursive: true });
+			fs.writeFileSync(localFileOf(dir), JSON.stringify({ allow: ["^p"], deny: ["^x"] }));
+			const after: string[] = [];
+			// allow page: add, ^p, (section), unset
+			await run(h, "local", [ENTER, DOWN, DOWN, ENTER], [], after);
+			expect(after.at(-1)).toContain("press enter again to confirm");
+			expect(JSON.parse(fs.readFileSync(localFileOf(dir), "utf8")).allow).toEqual(["^p"]);
+			driveMenu(h, [ENTER, DOWN, DOWN, ENTER, ENTER]);
+			await h.commands.verdict.handler("local", h.ctx);
+			expect(JSON.parse(fs.readFileSync(localFileOf(dir), "utf8"))).toEqual({ deny: ["^x"] });
 		});
 	});
 
 	test("unknown argument → usage warning", async () => {
 		const h = session({});
-		await run(h, "bogus", { picks: [] });
-		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("Usage: /verdict [user|local]"))).toBe(true);
+		await run(h, "bogus", []);
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("Usage: /verdict [global|local|session]"))).toBe(true);
+		await h.commands.verdict.handler("user", h.ctx);
+		expect(h.notifies.filter(([m]) => m.includes("unknown argument: user")).length).toBe(1);
 	});
 
-	test("gateOmpDir: switch persists, applies immediately; On restores the gate", async () => {
+	test("without ui.custom the menu is not available: warning, nothing written", async () => {
 		const h = session({});
-		await run(h, "user", { picks: ["gateOmpDir", "Off", "Done"] });
+		const before = fs.readFileSync(USER_FILE(), "utf8");
+		await h.handlers.session_start({}, h.ctx);
+		await h.commands.verdict.handler("", h.ctx);
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("needs an interactive TUI"))).toBe(true);
+		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
+	});
+
+	test("session scope: add lands in ruleAdditions; inherited global entries show tagged and the cursor skips them", async () => {
+		const h = session({ allow: ["^ls\\b"] });
+		const after: string[] = [];
+		await run(h, "session", [ENTER, ENTER, ...typed("^cargo test\\b"), ENTER, DOWN, DOWN], [], after);
+		const sessionFile = path.join(TMP_AGENT, "config", "pi-verdict-sessions", "s1.json");
+		expect(JSON.parse(fs.readFileSync(sessionFile, "utf8")).ruleAdditions).toEqual({ allow: ["^cargo test\\b"] });
+		expect(readUser().allow).toEqual(["^ls\\b"]);
+		const lines = after.at(-1)!.split("\n");
+		expect(lines.find((l) => l.includes("^ls"))).toMatch(/^ {2}\^ls\\b\s+global\s*$/);
+		expect(lines.find((l) => l.startsWith("› "))).toContain("+ add"); // two DOWNs: session entry, then wrapped back to add
+		expect(await toolCall(h, "bash", { command: "cargo test" })).toBeUndefined();
+		expect(h.calls.length).toBe(0);
+	});
+
+	test("gateOmpDir: switch persists, applies immediately; LEFT restores the gate", async () => {
+		const h = session({});
+		await run(h, "", [...GATE_ROW, RIGHT]); // on → off
 		expect(readUser().gateOmpDir).toBe(false);
 		expect(await toolCall(h, "read", { path: "/proj/.omp/notes.md" })).toBeUndefined();
 		expect(h.confirms).toBe(0);
-		h.selectPicks = ["gateOmpDir", "On", "Done"];
-		await h.commands.verdict.handler("user", h.ctx);
+		driveMenu(h, [...GATE_ROW, LEFT]);
+		await h.commands.verdict.handler("", h.ctx);
 		expect(readUser().gateOmpDir).toBe(true);
 		await toolCall(h, "read", { path: "/proj/.omp/notes.md" });
 		expect(h.confirms).toBe(1);
@@ -2543,46 +2625,58 @@ describe("/verdict config editor", () => {
 	test("gateOmpDir: local file can set and unset (inherit global)", async () => {
 		await withTempDir("pv-verdict-gate-", async (dir) => {
 			const h = session({}, { cwd: dir });
-			const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
-			const file = path.join(dir, dot, "pi-verdict.json");
-			await run(h, "local", { picks: ["gateOmpDir", "Off", "gateOmpDir", "× Unset", "Done"] });
+			const file = localFileOf(dir);
+			await run(h, "local", [...GATE_ROW, RIGHT, RIGHT]); // inherit → on → off
+			expect(JSON.parse(fs.readFileSync(file, "utf8")).gateOmpDir).toBe(false);
+			driveMenu(h, [...GATE_ROW, LEFT, LEFT]); // off → on → inherit
+			await h.commands.verdict.handler("local", h.ctx);
 			expect("gateOmpDir" in JSON.parse(fs.readFileSync(file, "utf8"))).toBe(false);
 		});
 	});
 
-	test("gateOmpDir: non-boolean value is not editable from the menu (warns, file unchanged)", async () => {
+	test("gateOmpDir: non-boolean value is locked in the menu (rendered invalid, file unchanged)", async () => {
 		const h = session({ gateOmpDir: "nope" });
 		const before = fs.readFileSync(USER_FILE(), "utf8");
-		await run(h, "user", { picks: ["gateOmpDir", "Done"] });
+		const after: string[] = [];
+		await run(h, "", [...GATE_ROW, RIGHT, ENTER], [], after);
 		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
-		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("gateOmpDir") && m.includes("not a boolean"))).toBe(true);
+		expect(after.at(-1)).toContain("invalid");
+		expect(after.at(-1)).toContain("fix by hand");
 	});
 });
 
 describe("/verdict omp custom roles", () => {
 	const TAGS = { "verdict-fallback": { name: "VERDICT FALLBACK" }, "explain-gate": { name: "EXPLAIN GATE" } };
 	const parse = (file: string): any => Bun.YAML.parse(fs.readFileSync(file, "utf8"));
-	async function open(h: Harness, dir: string, picks: string[], confirm = true): Promise<void> {
+	const { DOWN, ENTER, LEFT, RIGHT, ESC } = MENU;
+	const ROLES_ROW = times(7, DOWN); // five lists, .omp gate, footer, then custom roles
+	async function open(h: Harness, dir: string, keys: string[], rendered: string[] = [], after: string[] = []): Promise<void> {
 		h.ompAgentDir = dir;
 		await h.handlers.session_start({}, h.ctx);
-		h.confirmAnswer = confirm;
-		h.selectPicks = picks;
-		await h.commands.verdict.handler("user", h.ctx);
+		driveMenu(h, keys, rendered, after);
+		await h.commands.verdict.handler("", h.ctx);
 	}
 
-	test("missing config.yml: add writes both tags, reloads omp once, row then shows ✓", async () => {
+	test("missing config.yml: RIGHT + ENTER writes both tags and reloads omp once; the row then shows on, LEFT only pends", async () => {
 		await withTempDir("pv-roles-", async (dir) => {
 			const h = session({}, { roles: true });
-			await open(h, dir, ["omp custom roles", "Done"]);
+			const rendered: string[] = [];
+			await open(h, dir, [...ROLES_ROW, RIGHT], rendered);
+			expect(rendered[0]).toMatch(/custom roles\s+off/);
+			expect(fs.existsSync(path.join(dir, "config.yml"))).toBe(false); // RIGHT alone is pending, nothing written
+			driveMenu(h, [...ROLES_ROW, RIGHT, ENTER]);
+			await h.commands.verdict.handler("", h.ctx);
 			expect(parse(path.join(dir, "config.yml")).modelTags).toEqual(TAGS);
 			expect(h.ompReloads).toBe(1);
-			expect(h.confirmMsgs.length).toBe(1);
-			// the ✓ row exists now: selecting it reaches the remove confirm (declined → no change)
-			h.confirmAnswer = false;
-			h.selectPicks = ["✓ omp custom roles", "Done"];
-			await h.commands.verdict.handler("user", h.ctx);
-			expect(h.confirmMsgs.length).toBe(2);
+			expect(h.confirms).toBe(0);
+			const rendered2: string[] = [];
+			const after: string[] = [];
+			driveMenu(h, [...ROLES_ROW, LEFT], rendered2, after);
+			await h.commands.verdict.handler("", h.ctx);
+			expect(rendered2[0]).toMatch(/custom roles\s+on/);
+			expect(after.at(-1)).toContain("Removes the modelTags entries");
 			expect(parse(path.join(dir, "config.yml")).modelTags).toEqual(TAGS);
+			expect(h.ompReloads).toBe(1);
 		});
 	});
 
@@ -2591,7 +2685,7 @@ describe("/verdict omp custom roles", () => {
 			const file = path.join(dir, "config.yml");
 			fs.writeFileSync(file, "modelRoles:\n  default: a/b\nmodelTags:\n  mine:\n    name: MINE\n  verdict-fallback:\n    name: X\n");
 			const h = session({}, { roles: true });
-			await open(h, dir, ["omp custom roles", "Done"]);
+			await open(h, dir, [...ROLES_ROW, RIGHT, ENTER]);
 			const out = parse(file);
 			expect(out.modelRoles).toEqual({ default: "a/b" });
 			expect(out.modelTags).toEqual({ mine: { name: "MINE" }, "verdict-fallback": { name: "X" }, "explain-gate": { name: "EXPLAIN GATE" } });
@@ -2604,7 +2698,7 @@ describe("/verdict omp custom roles", () => {
 			const file = path.join(dir, "config.yml");
 			fs.writeFileSync(file, "modelRoles:\n  default: a/b\nmodelTags:\n  verdict-fallback:\n    name: VERDICT FALLBACK\n  explain-gate:\n    name: EXPLAIN GATE\n");
 			const h = session({}, { roles: true });
-			await open(h, dir, ["✓ omp custom roles", "Done"]);
+			await open(h, dir, [...ROLES_ROW, LEFT, ENTER]);
 			const out = parse(file);
 			expect(out).toEqual({ modelRoles: { default: "a/b" } });
 			expect(h.ompReloads).toBe(1);
@@ -2616,40 +2710,40 @@ describe("/verdict omp custom roles", () => {
 			const file = path.join(dir, "config.yml");
 			fs.writeFileSync(file, "modelTags:\n  mine:\n    name: MINE\n  verdict-fallback:\n    name: VERDICT FALLBACK\n  explain-gate:\n    name: EXPLAIN GATE\n");
 			const h = session({}, { roles: true });
-			await open(h, dir, ["✓ omp custom roles", "Done"]);
+			await open(h, dir, [...ROLES_ROW, LEFT, ENTER]);
 			expect(parse(file).modelTags).toEqual({ mine: { name: "MINE" } });
 		});
 	});
 
-	test("declined confirm (add and remove) leaves the file byte-identical and does not reload", async () => {
+	test("an unconfirmed change (moving away or Escape) leaves the file byte-identical and does not reload", async () => {
 		await withTempDir("pv-roles-", async (dir) => {
 			const file = path.join(dir, "config.yml");
 			const addBefore = "modelRoles:\n  default: a/b\n";
 			fs.writeFileSync(file, addBefore);
 			const h = session({}, { roles: true });
-			await open(h, dir, ["omp custom roles", "Done"], false);
+			await open(h, dir, [...ROLES_ROW, RIGHT, DOWN, ENTER]); // DOWN drops the pending value; ENTER lands on another row
 			expect(fs.readFileSync(file, "utf8")).toBe(addBefore);
-			expect(h.confirmMsgs.length).toBe(1);
 			expect(h.ompReloads).toBe(0);
 
 			const removeBefore = "modelTags:\n  verdict-fallback:\n    name: VERDICT FALLBACK\n  explain-gate:\n    name: EXPLAIN GATE\n";
 			fs.writeFileSync(file, removeBefore);
 			const h2 = session({}, { roles: true });
-			await open(h2, dir, ["✓ omp custom roles", "Done"], false);
+			await open(h2, dir, [...ROLES_ROW, LEFT, ESC]);
 			expect(fs.readFileSync(file, "utf8")).toBe(removeBefore);
-			expect(h2.confirmMsgs.length).toBe(1);
 			expect(h2.ompReloads).toBe(0);
 		});
 	});
 
-	test("invalid YAML: row is marked unreadable, selecting it notifies an error and leaves the file alone", async () => {
+	test("invalid YAML: the row is marked unreadable and locked, a warning is notified, the file is left alone", async () => {
 		await withTempDir("pv-roles-", async (dir) => {
 			const file = path.join(dir, "config.yml");
 			fs.writeFileSync(file, "a: [\n");
 			const h = session({}, { roles: true });
-			await open(h, dir, ["omp custom roles (config.yml unreadable)", "Done"]);
-			expect(h.notifies.some(([m, l]) => l === "error" && m.includes("is not valid YAML"))).toBe(true);
-			expect(h.confirms).toBe(0);
+			const after: string[] = [];
+			await open(h, dir, [...ROLES_ROW, RIGHT, ENTER], [], after);
+			expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("is not valid YAML"))).toBe(true);
+			expect(after.at(-1)).toContain("unreadable");
+			expect(after.at(-1)).toContain("see notification");
 			expect(fs.readFileSync(file, "utf8")).toBe("a: [\n");
 		});
 	});
@@ -2659,17 +2753,32 @@ describe("/verdict omp custom roles", () => {
 			const file = path.join(dir, "config.yml");
 			fs.writeFileSync(file, "modelTags: [a]\n");
 			const h = session({}, { roles: true });
-			await open(h, dir, ["omp custom roles (config.yml unreadable)", "Done"]);
-			expect(h.notifies.some(([m, l]) => l === "error" && m.includes("modelTags is not a mapping"))).toBe(true);
+			await open(h, dir, [...ROLES_ROW, RIGHT, ENTER]);
+			expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("modelTags is not a mapping"))).toBe(true);
 			expect(fs.readFileSync(file, "utf8")).toBe("modelTags: [a]\n");
+		});
+	});
+
+	test("local and session scope lock the row as global only", async () => {
+		await withTempDir("pv-roles-", async (dir) => {
+			const file = path.join(dir, "config.yml");
+			const h = session({}, { roles: true });
+			h.ompAgentDir = dir;
+			await h.handlers.session_start({}, h.ctx);
+			const after: string[] = [];
+			driveMenu(h, [...ROLES_ROW, RIGHT, ENTER], [], after);
+			await h.commands.verdict.handler("session", h.ctx);
+			expect(after.at(-1)).toContain("global only");
+			expect(fs.existsSync(file)).toBe(false);
 		});
 	});
 
 	test("real pi (no omp settings): no roles row; nothing is created", async () => {
 		await withTempDir("pv-roles-", async (dir) => {
 			const h = session({});
-			await open(h, dir, ["omp custom roles"]);
-			expect(h.confirms).toBe(0);
+			const rendered: string[] = [];
+			await open(h, dir, [...ROLES_ROW, RIGHT, ENTER], rendered);
+			expect(rendered[0]).not.toContain("custom roles");
 			expect(fs.existsSync(path.join(TMP_AGENT, "omp", "config.yml"))).toBe(false);
 			expect(fs.existsSync(path.join(dir, "config.yml"))).toBe(false);
 		});
@@ -3023,8 +3132,8 @@ describe("footer status", () => {
 		const h = session({ footer: "off" });
 		await h.handlers.session_start({}, h.ctx);
 		expect(h.statusSets.at(-1)).toEqual(["auto-mode", undefined]);
-		h.selectPicks = ["footer", "compact", "Done"];
-		await h.commands.verdict.handler("user", h.ctx);
+		driveMenu(h, [...times(6, MENU.DOWN), MENU.LEFT]); // footer row: off → compact
+		await h.commands.verdict.handler("", h.ctx);
 		expect(JSON.parse(fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8")).footer).toBe("compact");
 		expect(lastStatus(h)).toMatch(/^● auto/);
 	});
@@ -4133,7 +4242,7 @@ describe("approval modes", () => {
 		test("session beats user config, persists per session id, and survives a session_start", async () => {
 			const h = session({ mode: "yolo" });
 			await h.handlers.session_start({}, h.ctx);
-			expect(await statusText(h)).toContain("Approval mode: yolo (user)");
+			expect(await statusText(h)).toContain("Approval mode: yolo (global)");
 			await h.commands.automode.handler("noautodeny", h.ctx);
 			expect(await statusText(h)).toContain("Approval mode: noAutoDeny (session)");
 			expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8"))).toEqual({ mode: "noAutoDeny" });
@@ -4168,8 +4277,8 @@ describe("approval modes", () => {
 					const h = session({}, { cwd: dir });
 					await h.handlers.session_start({}, h.ctx);
 					const before = await statusText(h);
-					expect(before).toContain("Approval mode: noAutoDeny (project)");
-					expect(before).toContain("confidence threshold: 40% (project)");
+					expect(before).toContain("Approval mode: noAutoDeny (local)");
+					expect(before).toContain("confidence threshold: 40% (local)");
 					await h.commands.automode.handler("yolo", h.ctx);
 					expect(await statusText(h)).toContain("Approval mode: yolo (session)");
 				} finally {
@@ -4189,88 +4298,173 @@ describe("approval modes", () => {
 	});
 
 	describe("quick settings panel", () => {
-		/** Replays keys against the real SettingsList-based panel; `\x1b` on the main list closes it. */
-		function drivePanel(h: Harness, keys: string[], rendered: string[] = []): void {
-			h.ctx.ui.custom = async (factory: DialogFactory) => {
-				const { initTheme } = await import("@earendil-works/pi-coding-agent");
-				initTheme("dark", false);
-				const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
-				return new Promise((resolve) => {
-					const component = factory({ requestRender() {} }, fakeTheme, undefined, resolve);
-					rendered.push(component.render(100).join("\n").replace(ANSI, ""));
-					for (const k of keys) component.handleInput(k);
-				});
-			};
-		}
-		const DOWN = "\x1b[B";
-		const RIGHT = "\x1b[C";
+		const { DOWN, RIGHT, TAB, ENTER } = MENU;
+		const readUser = () => JSON.parse(fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8"));
+		const readSession = () => JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8"));
 
-		test("cycling the mode row writes the session scope and applies immediately", async () => {
+		test("RIGHT on the mode row cycles the session scope from inherit, writes and applies; the last value is a dead end and Enter wraps", async () => {
 			const h = session({});
 			const rendered: string[] = [];
-			drivePanel(h, [DOWN, "\r", "\r", "\x1b"], rendered); // mode: inherit → default → yolo
+			driveMenu(h, [RIGHT, RIGHT], rendered); // inherit → default → yolo
 			await h.commands.automode.handler("", h.ctx);
-			expect(rendered[0]).toContain("pi-verdict · approval settings");
-			expect(rendered[0]).toContain("scope");
-			expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8")).mode).toBe("yolo");
+			expect(rendered[0]).toContain("pi-verdict · approval");
+			expect(rendered[0]).toContain("⟨ session ⟩");
+			expect(readSession().mode).toBe("yolo");
 			expect(await statusText(h)).toContain("Approval mode: yolo (session)");
-		});
-		test("the slider edits a percent key: right ×2 from 50 + enter saves 60 at session scope", async () => {
-			const h = session({});
-			drivePanel(h, [DOWN, DOWN, "\r", RIGHT, RIGHT, "\r", "\x1b"]);
+			driveMenu(h, [RIGHT, RIGHT, RIGHT]); // yolo → noAutoDeny → off, then no further value
 			await h.commands.automode.handler("", h.ctx);
-			expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8")).confidenceThreshold).toBe(60);
-			expect(await statusText(h)).toContain("confidence threshold: 60% (session)");
-		});
-		test("slider x stores off (null) and i drops the key; scope=user writes the config file", async () => {
-			const h = session({ confidenceThreshold: 80 });
-			// slider on confidenceThreshold: x → off; saved as null at session scope
-			drivePanel(h, [DOWN, DOWN, "\r", "x", "\r", "\x1b"]);
-			await h.commands.automode.handler("", h.ctx);
-			expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8")).confidenceThreshold).toBeNull();
-			expect(await statusText(h)).toContain("confidence threshold: off (session)");
-			// i → inherit drops the session key again
-			drivePanel(h, [DOWN, DOWN, "\r", "i", "\r", "\x1b"]);
+			expect(readSession().mode).toBe("off");
+			driveMenu(h, [ENTER]); // wraps to inherit, which drops the key
 			await h.commands.automode.handler("", h.ctx);
 			expect(fs.existsSync(SESSION_FILE())).toBe(false);
-			expect(await statusText(h)).toContain("confidence threshold: 80% (user)");
-			// scope row: session → user; then mode: default → yolo is written to the user file
-			drivePanel(h, ["\r", "\r", DOWN, "\r", "\x1b"]);
-			await h.commands.automode.handler("", h.ctx);
-			const user = JSON.parse(fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8"));
-			expect(user.mode).toBe("yolo");
-			expect(await statusText(h)).toContain("Approval mode: yolo (user)");
 		});
-		test("the mode row shows the registered toggle shortcut at a fixed column; other rows and a disabled key stay bare", async () => {
+
+		test("only the selected multi-value row shows chevrons", async () => {
+			const h = session({});
+			const after: string[] = [];
+			driveMenu(h, [RIGHT], [], after);
+			await h.commands.automode.handler("", h.ctx);
+			const lines = after[0]!.split("\n");
+			expect(lines.find((l) => l.startsWith("› mode"))).toContain("‹ default ›");
+			const other = lines.find((l) => l.includes("confidence threshold"))!;
+			expect(other).not.toContain("‹");
+			expect(other).not.toContain("›");
+		});
+
+		test("percent rows: RIGHT walks inherit → off → 0% → +5%, the bar follows, the session file stores the number", async () => {
+			const h = session({});
+			const after: string[] = [];
+			driveMenu(h, [DOWN, RIGHT, RIGHT, ...times(12, RIGHT)], [], after); // inherit → off → 0% → 60%
+			await h.commands.automode.handler("", h.ctx);
+			expect(readSession().confidenceThreshold).toBe(60);
+			expect(await statusText(h)).toContain("confidence threshold: 60% (session)");
+			expect(after.at(-1)).toContain("‹ ██████░░░░ 60% ›");
+		});
+
+		test("x stores off (null), i drops the key", async () => {
+			const h = session({ confidenceThreshold: 80 });
+			driveMenu(h, [DOWN, "x"]);
+			await h.commands.automode.handler("", h.ctx);
+			expect(readSession().confidenceThreshold).toBeNull();
+			expect(await statusText(h)).toContain("confidence threshold: off (session)");
+			driveMenu(h, [DOWN, "i"]);
+			await h.commands.automode.handler("", h.ctx);
+			expect(fs.existsSync(SESSION_FILE())).toBe(false);
+			expect(await statusText(h)).toContain("confidence threshold: 80% (global)");
+		});
+
+		test("Tab cycles the scope badge; a following change writes the global file", async () => {
 			const h = session({});
 			const rendered: string[] = [];
-			drivePanel(h, ["\x1b"], rendered);
+			const after: string[] = [];
+			driveMenu(h, [TAB, RIGHT], rendered, after); // session → global; mode default → yolo
 			await h.commands.automode.handler("", h.ctx);
-			const rows = rendered[0].split("\n");
-			const modeRow = rows.find((l) => l.includes("[ctrl+shift+y]"))!;
-			expect(modeRow).toBeDefined();
-			expect(modeRow).toContain("mode    [ctrl+shift+y]"); // key starts 8 columns into the label
-			expect(rows.filter((l) => l.includes("[ctrl+")).length).toBe(1);
+			expect(rendered[0]).toContain("⟨ session ⟩");
+			expect(after[0]).toContain("⟨ global ⟩");
+			expect(readUser().mode).toBe("yolo");
+			expect(fs.existsSync(SESSION_FILE())).toBe(false);
+			expect(await statusText(h)).toContain("Approval mode: yolo (global)");
+		});
+
+		test("the mode row shows the registered toggle shortcut; other rows and a disabled key stay bare", async () => {
+			const h = session({});
+			const rendered: string[] = [];
+			driveMenu(h, [], rendered);
+			await h.commands.automode.handler("", h.ctx);
+			const rows = rendered[0]!.split("\n");
+			expect(rows.find((l) => l.includes("ctrl+shift+y"))).toContain("mode");
+			expect(rows.filter((l) => l.includes("ctrl+")).length).toBe(1);
 			const h2 = session({ toggleShortcut: null });
 			const rendered2: string[] = [];
-			drivePanel(h2, ["\x1b"], rendered2);
+			driveMenu(h2, [], rendered2);
 			await h2.commands.automode.handler("", h2.ctx);
-			expect(rendered2[0].includes("[ctrl+")).toBe(false);
+			expect(rendered2[0]!.includes("ctrl+")).toBe(false);
 		});
-		test("without ui.custom the panel falls back to select/input", async () => {
-			const h = session({});
-			h.selectPicks = ["mode", "yolo", "confidence threshold", "Done"];
-			h.inputs = ["35"];
+
+		test("only the effective mode's section renders until a lists every mode", async () => {
+			const h = session({ mode: "yolo" });
+			const rendered: string[] = [];
+			const after: string[] = [];
+			driveMenu(h, ["a"], rendered, after);
 			await h.commands.automode.handler("", h.ctx);
-			const s = JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8"));
-			expect(s).toEqual({ mode: "yolo", confidenceThreshold: 35 });
-			const bad = session({});
-			bad.selectPicks = ["confidence threshold", "Done"];
-			bad.inputs = ["lots"];
-			await bad.commands.automode.handler("", bad.ctx);
-			expect(bad.notifies.some(([m, l]) => l === "warning" && m.includes("not a valid value"))).toBe(true);
+			expect(rendered[0]).toContain("─ all modes");
+			expect(rendered[0]).toContain("─ yolo");
+			expect(rendered[0]).not.toContain("─ default ");
+			expect(rendered[0]).not.toContain("─ noAutoDeny");
+			expect(rendered[0]).toContain("▸ show all modes");
+			expect(after[0]).toContain("─ default ");
+			expect(after[0]).toContain("─ noAutoDeny");
+			expect(after[0]).toContain("▾ current mode only");
+		});
+
+		test("the info line names a higher-precedence scope; an untrusted local scope is flagged", async () => {
+			await withTempDir("pv-panel-proj-", async (dir) => {
+				fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
+				fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ mode: "noAutoDeny" }));
+				const trust = path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
+				fs.mkdirSync(path.dirname(trust), { recursive: true });
+				fs.writeFileSync(trust, JSON.stringify({ trusted: [dir], untrusted: [] }));
+				try {
+					const h = session({}, { cwd: dir });
+					await h.handlers.session_start({}, h.ctx);
+					const after: string[] = [];
+					driveMenu(h, [TAB], [], after); // session → global
+					await h.commands.automode.handler("", h.ctx);
+					expect(after[0]).toContain("local sets this too and wins over global");
+					fs.writeFileSync(trust, JSON.stringify({ trusted: [], untrusted: [dir] })); // an undecided project would be offered the trust prompt
+					const h2 = session({}, { cwd: dir });
+					await h2.handlers.session_start({}, h2.ctx);
+					const after2: string[] = [];
+					driveMenu(h2, [TAB, TAB], [], after2); // session → global → local
+					await h2.commands.automode.handler("", h2.ctx);
+					expect(after2[1]).toContain("⟨ local · untrusted ⟩");
+					expect(after2[1]).toContain("not applied until this project is trusted");
+				} finally {
+					fs.rmSync(trust, { force: true });
+				}
+			});
+		});
+
+		test("without ui.custom the panel is not available: warning notify, nothing written", async () => {
+			const h = session({});
+			await h.commands.automode.handler("", h.ctx);
+			expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("needs an interactive TUI"))).toBe(true);
 			expect(fs.existsSync(SESSION_FILE())).toBe(false);
 		});
+	});
+});
+
+describe("session-scoped switches (menu redesign)", () => {
+	const OMP_FILE = "/proj/.omp/notes.md";
+	const SESSION_DIR = () => path.join(TMP_AGENT, "config", "pi-verdict-sessions");
+	const SESSION_FILE = () => path.join(SESSION_DIR(), "s1.json");
+	const { DOWN, LEFT, RIGHT } = MENU;
+	const GATE_ROW = times(5, DOWN);
+
+	test("/verdict session: gateOmpDir off lifts the .omp gate for this session, inherit restores it", async () => {
+		const h = session({});
+		await h.handlers.session_start({}, h.ctx);
+		driveMenu(h, [...GATE_ROW, RIGHT, RIGHT]); // inherit → on → off
+		await h.commands.verdict.handler("session", h.ctx);
+		expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8"))).toEqual({ gateOmpDir: false });
+		expect(await toolCall(h, "read", { path: OMP_FILE })).toBeUndefined();
+		expect(h.confirms).toBe(0);
+		driveMenu(h, [...GATE_ROW, LEFT, LEFT]); // off → on → inherit
+		await h.commands.verdict.handler("session", h.ctx);
+		expect(fs.existsSync(SESSION_FILE())).toBe(false);
+		await toolCall(h, "read", { path: OMP_FILE });
+		expect(h.confirms).toBe(1);
+	});
+
+	test("a session file with a non-boolean gateOmpDir keeps the gate on and reports a skip", async () => {
+		const h = session({});
+		fs.mkdirSync(SESSION_DIR(), { recursive: true });
+		fs.writeFileSync(SESSION_FILE(), JSON.stringify({ gateOmpDir: "nope" }));
+		await h.handlers.session_start({}, h.ctx);
+		await toolCall(h, "read", { path: OMP_FILE });
+		expect(h.confirms).toBe(1);
+		const warnings = h.notifies.filter(([, l]) => l === "warning").map(([m]) => m).join("\n");
+		expect(warnings).toContain('gateOmpDir: "nope"');
 	});
 });
 
