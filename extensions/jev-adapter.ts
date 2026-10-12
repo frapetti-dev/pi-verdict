@@ -1,6 +1,7 @@
 /**
- * pi-verdict jev adapter (ADR-0003) — exposes TypeSafe's jev decisions model
+ * pi-verdict jev adapter (JV-1–JV-6) — exposes TypeSafe's jev decisions model
  * as a pi provider (`typesafe/jev-latest`) so `classifierModel` can name it.
+ * Normative rules: docs/adjudication-rules.md (IDs like JV-2 below refer to it).
  *
  * jev is not an LLM: its decisions API takes `{state, questions}` and returns
  * typed answers, which is why the model cannot ride pi's chat-completions
@@ -15,7 +16,7 @@
  *   - `typesafe`: POST api.typesafe.ai/v1/systemone, model `jev-latest` —
  *     TypeSafe's official v1 API. pi has no typesafe login, so TYPESAFE_API_KEY
  *     is this transport's only source, still resolved through the provider
- *     auth pipeline rather than a bare fetch (ADR-0003 amendment).
+ *     auth pipeline rather than a bare fetch (JV-2).
  *
  * This adapter translates the classifier's completion call into one `choice`
  * question and synthesizes the `<verdict>…</verdict>` contract text from the
@@ -24,13 +25,14 @@
  * agree. Because `hasConfiguredAuth` reads a sync snapshot built
  * before any extension event fires, the provider is re-registered on
  * `session_start` to re-run the availability check with the stashed
- * resolver (see ADR-0003).
+ * resolver (JV-1).
  *
- * Known limitations (ADR-0003): the classifier system prompt — including the
+ * Known limitations (JV-3, JV-5): the classifier system prompt — including the
  * denyPaths existence hint — does not reach jev; jev treats state as data and
  * "does not treat it as hostile by default" (TypeSafe jaggedness docs), so
- * adversarial transcript content can move its judgment; omp hosts have no
- * `registerProvider` and the adapter stays inert there.
+ * adversarial transcript content can move its judgment. On omp (no
+ * `registerProvider`) the model is registered by name + config only and
+ * pi-verdict.ts calls streamDecisions directly, so jev works there too.
  */
 import {
 	createAssistantMessageEventStream,
@@ -438,7 +440,7 @@ export default function jevAdapter(pi: ExtensionAPI): void {
 			openRouterKey = async () => (await ctx.modelRegistry.getProviderAuth("openrouter"))?.auth?.apiKey;
 			// hasConfiguredAuth reads a sync snapshot built at startup, when the
 			// stashed resolver did not exist yet — re-register to re-run the
-			// availability check with credentials now reachable (ADR-0003).
+			// availability check with credentials now reachable (JV-1).
 			pi.registerProvider(provider);
 		});
 	} else {

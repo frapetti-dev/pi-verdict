@@ -170,7 +170,7 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 	if (cfg.modeStatus !== undefined) raw.modeStatus = cfg.modeStatus;
 	if (cfg.subagentGate !== undefined) raw.subagentGate = cfg.subagentGate;
 	if (cfg.subagentAskTimeoutMs !== undefined) raw.subagentAskTimeoutMs = cfg.subagentAskTimeoutMs;
-	// denyPaths (ADR-0002): unknown[] lets negative tests mix in non-string entries
+	// denyPaths (PP-1–PP-9): unknown[] lets negative tests mix in non-string entries
 	if (cfg.denyPaths !== undefined) raw.denyPaths = cfg.denyPaths;
 	// 非法正则测试:把 invalid 条目直接混入 allow 数组
 	if (invalid) raw.allow = [...config.allow, ...invalid];
@@ -926,11 +926,11 @@ describe("debug annotations", () => {
 	});
 });
 
-// ── denyPaths (ADR-0002): deterministic ask + classifier existence hint ──
+// ── denyPaths (PP-1–PP-9): deterministic ask + classifier existence hint ──
 // A local extractor (evidence producer, never an adjudicator) feeds a per-segment
 // prefix comparison over dual-form normalized paths (lexical + realpath);
 // a hit routes to a terminal ask; the classifier only ever sees an existence hint.
-describe("denyPaths (ADR-0002)", () => {
+describe("denyPaths (PP-1–PP-9)", () => {
 	const SENS = path.join(TMP_AGENT, "sensitive"); // real dir under the temp agent dir
 	beforeAll(() => {
 		fs.mkdirSync(SENS, { recursive: true });
@@ -966,7 +966,7 @@ describe("denyPaths (ADR-0002)", () => {
 
 	test("write/edit/grep/find/ls over a denyPath all hit (file names leak too)", async () => {
 		// write/edit use a home-based base: SENS lives under os.tmpdir() → /var/... (S1
-		// system dir), where a write is floor-denied BEFORE denyPaths (ADR-0002 priority:
+		// system dir), where a write is floor-denied BEFORE denyPaths (RL-2 priority:
 		// built-in floor deny > denyPaths ask) — the block, not a confirm, would fire
 		const homeBase = path.join(os.homedir(), ".pi-verdict-denypaths-wtest");
 		for (const [tool, base, input] of [
@@ -1260,7 +1260,7 @@ describe("denyPaths (ADR-0002)", () => {
 		expect(h.notifies.map(([m]) => m).join("\n")).not.toContain(SENS);
 	});
 
-	// ADR-0002: bases are normalized ONCE at session start, anchored to the session cwd —
+	// PP-1: bases are normalized ONCE at session start, anchored to the session cwd —
 	// a later tool_call from a different cwd must not re-anchor the declaration
 	test("relative denyPath entry stays anchored to the session cwd after session_start", async () => {
 		const h = session({ denyPaths: ["sensitive-rel"] });
@@ -1272,7 +1272,7 @@ describe("denyPaths (ADR-0002)", () => {
 	});
 
 	test("tier discipline pinned: nonexistent target through a symlinked alias does NOT hit denyPaths (base tier, #41 ruling)", async () => {
-		// denyPaths is base-tier only (ADR-0002): whole-path realpath, no ancestor
+		// denyPaths is base-tier only (PP-4): whole-path realpath, no ancestor
 		// rebuild — a nonexistent target under a symlinked dir produces only the
 		// lexical form and misses, falling to the classifier + existence hint.
 		// Contrast: an EXISTING target in the same alias resolves through the
@@ -2271,7 +2271,7 @@ describe("adjudicate pipeline (interface level)", () => {
 		expect(await run({}, "bash", { command: "echo hello" }, adjudicateEnv({ failModel: true }))).toMatchObject({ verdict: "deny", source: "fail-closed", degraded: false });
 	});
 
-	test("denyPaths zero-leak regression: no protected-path plaintext in any reason or notification (ADR-0002 story 11)", async () => {
+	test("denyPaths zero-leak regression: no protected-path plaintext in any reason or notification (PP-6)", async () => {
 		const protectedPath = path.join(secret, "notes.md");
 		// Verdict 面:ask 与降级 deny 的 reason 都不得含路径明文
 		setConfig({ denyPaths: [secret] });
@@ -3766,7 +3766,7 @@ describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 		});
 	});
 
-	test("ADR-0004 carve-out holds for subagents: a demoted first-layer deny is never auto-allowed", async () => {
+	test("CS-7 carve-out holds for subagents: a demoted first-layer deny is never auto-allowed", async () => {
 		const cfg = { subagentGate: "auto", confidenceThreshold: 50, classifierFallbackModel: "mock/fb" };
 		await withBridge(cfg, async (_root, sub) => {
 			sub.responses = [{ text: JEV_DENY_29 }, ALLOW];
