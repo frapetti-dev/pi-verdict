@@ -144,6 +144,11 @@ The user's free-text rules, the `rules` config key, appended to the classifier's
 _Avoid_: user rules (those are the allow and deny regular expressions)
 Rules: [CL-5](docs/adjudication-rules.md#cl-5-system-prompt-composition)
 
+**Root rule**:
+The single free-text baseline policy for the classifier, drafted by the session model and accepted by the user; classification rules apply on top of it.
+_Avoid_: root role, base rule, project policy
+Rules: [RR-1](docs/adjudication-rules.md#rr-1-storage-and-resolution), [RR-2](docs/adjudication-rules.md#rr-2-composition)
+
 **Typed decision**:
 The output form of a non-generative model: a choice among predefined options with a probability distribution and a confidence.
 Rules: [JV-3](docs/adjudication-rules.md#jv-3-translation)

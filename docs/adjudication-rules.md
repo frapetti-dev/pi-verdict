@@ -4,7 +4,7 @@ This document is the normative definition of pi-verdict's gate behavior. The key
 
 Each rule is a `####` heading followed by a normative statement, then `Why:` (the reason, with a link when the reason is a measurement), `Code:` (implementing symbols, no line numbers) and `Pinned by:` (the `describe › test` titles in `tests/` that assert the rule, or `unpinned`).
 
-Contents: [RL Rule layer](#rl-rule-layer) · [PG Path grading](#pg-path-grading) · [PP Protected paths and the forced .omp gate](#pp-protected-paths-and-the-forced-omp-gate) · [CL Classifier](#cl-classifier) · [JV jev adapter](#jv-jev-adapter) · [CS Confidence floor, mode thresholds, fallback cascade](#cs-confidence-floor-mode-thresholds-fallback-cascade) · [MD Approval modes](#md-approval-modes) · [PR Outcome and presentation](#pr-outcome-and-presentation) · [SG Subagent gate](#sg-subagent-gate) · [CF Configuration, scopes, trust](#cf-configuration-scopes-trust) · [AU Audit log and shadow cache](#au-audit-log-and-shadow-cache) · [RG Rule generator](#rg-rule-generator) · [Decision tables](#decision-tables)
+Contents: [RL Rule layer](#rl-rule-layer) · [PG Path grading](#pg-path-grading) · [PP Protected paths and the forced .omp gate](#pp-protected-paths-and-the-forced-omp-gate) · [CL Classifier](#cl-classifier) · [JV jev adapter](#jv-jev-adapter) · [CS Confidence floor, mode thresholds, fallback cascade](#cs-confidence-floor-mode-thresholds-fallback-cascade) · [MD Approval modes](#md-approval-modes) · [PR Outcome and presentation](#pr-outcome-and-presentation) · [SG Subagent gate](#sg-subagent-gate) · [CF Configuration, scopes, trust](#cf-configuration-scopes-trust) · [AU Audit log and shadow cache](#au-audit-log-and-shadow-cache) · [RG Rule generator](#rg-rule-generator) · [RR Root rule](#rr-root-rule) · [Decision tables](#decision-tables)
 
 ## RL: Rule layer
 
@@ -241,7 +241,7 @@ Pinned by: transcript line injection (#22) › multi-line user message cannot fo
 
 #### CL-5: System prompt composition
 
-The system prompt is built from the effective verdict set of the approval mode (MD-1): the criteria of the allowed verdicts only, the guidance line, a marker line `Allowed verdicts: …` when the set is restricted, and the verdict-prefix format line. It is followed by the existence hint when `denyPaths` is non-empty (PP-7) and then by the user's classification rules (the `rules` key), which apply wherever they cover the action and take precedence over the default criteria. The marker line precedes the hint and the rules block so the jev adapter's user-rules slice excludes it.
+The system prompt is built from the effective verdict set of the approval mode (MD-1): the criteria of the allowed verdicts only, the guidance line, a marker line `Allowed verdicts: …` when the set is restricted, and the verdict-prefix format line. It is followed by the existence hint when `denyPaths` is non-empty (PP-7) and then by the user policy block: the root rule (the `rootRule` key, RR-2) and the user's classification rules (the `rules` key). Where a rule applies it takes precedence over the default criteria, and a classification rule takes precedence over the root rule. The marker line precedes the hint and the policy block so the jev adapter's user-rules slice excludes it.
 
 Why: the default three-verdict prompt is kept byte-identical so unrestricted behavior does not drift; restricted sets must reach jev through the marker (JV-3).
 Code: `classifierSystem`, `modeChoices`, `userRulesHint`, `classifyWithModel`
@@ -283,7 +283,7 @@ Pinned by: transport selection and endpoint override › the typesafe transport 
 
 #### JV-3: Translation
 
-The jev state is the last user message of the classifier request (the transcript, CL-4). The `verdict` question is a `choice` whose criteria mirror the LLM prompt, restricted to the verdicts named by the `Allowed verdicts:` marker line (yolo: allow/deny with a no-human instruction; noAutoDeny: allow/ask with ask absorbing the deny criterion). The slice of the system prompt starting at the user-rules header is appended to the question's instructions; the rest of the system prompt, including the existence hint, is dropped. A second `choice` question, `concern`, names the risk category; its answer is cosmetic: a known non-`none` category is appended to the reason as ` — concern: <label>`, anything else is omitted and never fails the call. The answer is synthesized into `<verdict>X</verdict> jev: X p% (confidence c%; …)`, which satisfies CL-6.
+The jev state is the last user message of the classifier request (the transcript, CL-4). The `verdict` question is a `choice` whose criteria mirror the LLM prompt, restricted to the verdicts named by the `Allowed verdicts:` marker line (yolo: allow/deny with a no-human instruction; noAutoDeny: allow/ask with ask absorbing the deny criterion). The slice of the system prompt starting at the user-rules header (the root rule and the classification rules, RR-2) is appended to the question's instructions; the rest of the system prompt, including the existence hint, is dropped. A second `choice` question, `concern`, names the risk category; its answer is cosmetic: a known non-`none` category is appended to the reason as ` — concern: <label>`, anything else is omitted and never fails the call. The answer is synthesized into `<verdict>X</verdict> jev: X p% (confidence c%; …)`, which satisfies CL-6.
 
 Why: jev treats state as data, so splicing an LLM-voiced system prompt into it would disturb its calibration; the typed reason lets the ask dialog render probabilities and the concern.
 Code: `extractState`, `buildDecisionsBody`, `parseVerdictChoices`, `verdictText`, `parseJevReason`, `USER_RULES_HEADER`, `VERDICT_CHOICES_PREFIX`
@@ -704,6 +704,40 @@ A candidate `allow` or `tools` rule is replayed over the recent tool calls throu
 Why: an allow rule that an earlier layer always overrides (RL-2) is useless and misleads the user.
 Code: `evaluateRuleOnHistory`, `critiqueRule`, `validateRule`
 Pinned by: /rule command › shadowed allow is retried with feedback; the corrected rule is shown as reviewed; /rule command › critic revise feeds the next attempt
+
+## RR: Root rule
+
+#### RR-1: Storage and resolution
+
+The root rule is one object under the config key `rootRule`: `{text, strictness, history, codebase, clarifications}`. `text` is the policy prose (`null` = none), `strictness` is `relaxed` | `balanced` | `strict`, `history` and `codebase` select the generator inputs, and `clarifications` are the user's instructions to the generator. It exists at global, local and session scope; the highest scope that sets a `rootRule` object wins wholesale, with no field merge, and the local scope counts only when its project is trusted (CF-3). An invalid field falls back to its default and is reported through the load warning channel (CF-6); a non-object `rootRule` is ignored as a whole. `clarifications` and the other generator inputs are NEVER sent to the classifier.
+
+Why: one baseline policy per project is easier to reason about than a merged one, and the generator inputs belong to the policy they produced.
+Code: `parseRootRule`, `ROOT_RULE_DEFAULTS`, `loadUserRules`, `sanitizeSessionRaw`
+Pinned by: root rule (RR-1–RR-4) › highest scope wins wholesale; root rule (RR-1–RR-4) › invalid rootRule fields are skipped with a warning
+
+#### RR-2: Composition
+
+The root rule text is placed inside the user policy block of the classifier system prompt (CL-5), after the user-rules header so the jev slice carries it (JV-3): first `Root rule (the project's baseline policy):` with the text, then, when classification rules exist, `Classification rules (applied on top of the root rule; …)` with the bullets, then the apply sentence. Precedence is classification rules, then root rule, then the built-in criteria. Without a root rule the block is byte-identical to the classification-rules-only form. The fallback classifier receives the same policy as the first layer.
+
+Why: the root rule is a baseline, so specific rules must be able to override it; keeping the no-root-rule prompt unchanged avoids drift for existing users.
+Code: `userRulesHint`, `classifierPolicy`, `classifyWithModel`
+Pinned by: root rule (RR-1–RR-4) › root rule sits inside the user rules block; rules win on conflict; root rule (RR-1–RR-4) › clarifications are persisted and sent to the generator only
+
+#### RR-3: Generator inputs
+
+`/automode-setup` sends the model (the session model, reasoning off): the strictness level and its definition, the clarifications, and, when enabled, the current session branch transcript (the last 20 user lines and the last 100 tool-call lines; tool results never) and a deterministic project snapshot. The snapshot is the top-level listing, a fixed file set (project docs, build and manifest files, up to 5 CI workflows; at most 6000 characters per file and 40000 in total) and the git remote names and URLs with userinfo removed. A file that is a credential path (S0, regardless of `builtinDenyFloor`) or matches `denyPaths` is skipped and only counted (PP-6); protected names are also omitted from the listing. The generator output and the file contents are untrusted data, and the clarifications are the only trusted instructions. The user's config is never sent.
+
+Why: the root rule is drafted from evidence the user already exposed to the session; protected-path plaintext must never reach a model (PP-6).
+Code: `collectProjectContext`, `generateRootRule`, `STRICTNESS_DOC`
+Pinned by: root rule (RR-1–RR-4) › codebase context skips protected files and strips remote userinfo; root rule (RR-1–RR-4) › /automode-setup: generate → review → save to session; root rule (RR-1–RR-4) › nothing to analyze → warning, no model call
+
+#### RR-4: Loop and review
+
+Generation makes at most 3 attempts. A candidate over 4000 characters, unparseable output or a critic `revise` is fed back into the next attempt; a model transport failure is not retried; an unavailable critic yields an unconfirmed result; exhausted attempts return the last candidate unconfirmed with a note. A candidate over the length limit cannot be saved. The user always sees a preview (text, summary, review status, sources) and nothing is stored until they choose to save; they may edit the text, regenerate with feedback, or discard.
+
+Why: the root rule steers every gray-zone verdict, so a human must accept it; the length limit bounds the prompt cost.
+Code: `generateRootRuleReviewed`, `critiqueRootRule`, `ROOT_RULE_MAX_CHARS`, `openRootRuleMenu`
+Pinned by: root rule (RR-1–RR-4) › critic revise feeds the next attempt; over-long draft is rejected; root rule (RR-1–RR-4) › /automode-setup: generate → review → save to session
 
 ## Decision tables
 

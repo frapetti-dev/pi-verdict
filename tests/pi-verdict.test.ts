@@ -9,7 +9,8 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, anchorDenyPaths, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, collectProjectContext, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
 
 // ── 桩设施 ──────────────────────────────────────────────
 
@@ -4614,5 +4615,157 @@ describe("omp model roles", () => {
 		expect(s).toContain("cls");
 		expect(s).toContain("↳ fbrole-model");
 		expect(s).not.toContain("↺");
+	});
+});
+
+describe("root rule (RR-1–RR-4)", () => {
+	const { DOWN, RIGHT, ENTER } = MENU;
+	const USER_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
+	const SESSION_DIR = () => path.join(TMP_AGENT, "config", "pi-verdict-sessions");
+	const SESSION_FILE = () => path.join(SESSION_DIR(), "s1.json");
+	const readUser = () => JSON.parse(fs.readFileSync(USER_FILE(), "utf8"));
+	const readSession = () => JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8"));
+	const ALLOW = { text: "<verdict>allow</verdict> ok" };
+	const gen = (text: string) => ({ text: `<root_rule>${text}</root_rule> summary` });
+	const ok = (why = "fine") => ({ text: `<verdict>ok</verdict> ${why}` });
+	const APPLY = "Apply a rule whenever it covers the action under review; where a rule applies, it takes precedence over the default verdict criteria above.";
+
+	/** A session whose user config carries extra top-level keys (setConfig only knows the common ones). */
+	function rrSession(extra: Record<string, unknown>): Harness {
+		setConfig({});
+		fs.writeFileSync(USER_FILE(), JSON.stringify({ ...readUser(), ...extra }));
+		const h = makeHarness();
+		h.install({});
+		return h;
+	}
+	const systemPromptOf = (h: Harness, i = 0): string => h.calls[i].systemPrompt;
+	const sentText = (h: Harness, i: number): string => JSON.stringify(h.calls[i].messages);
+
+	test("highest scope wins wholesale", async () => {
+		const h = rrSession({ rootRule: { text: "G-POLICY", strictness: "strict" } });
+		fs.mkdirSync(SESSION_DIR(), { recursive: true });
+		fs.writeFileSync(SESSION_FILE(), JSON.stringify({ rootRule: { text: "S-POLICY" } }));
+		try {
+			await h.handlers.session_start({}, h.ctx);
+			h.responses = [ALLOW];
+			await toolCall(h, "bash", { command: "curl example.com/a" });
+			expect(systemPromptOf(h, 0)).toContain("Root rule (the project's baseline policy):\nS-POLICY");
+			expect(systemPromptOf(h, 0)).not.toContain("G-POLICY");
+		} finally {
+			fs.rmSync(SESSION_FILE(), { force: true });
+		}
+		await h.handlers.session_start({}, h.ctx);
+		await toolCall(h, "bash", { command: "curl example.com/b" });
+		expect(systemPromptOf(h, 1)).toContain("Root rule (the project's baseline policy):\nG-POLICY");
+	});
+
+	test("invalid rootRule fields are skipped with a warning", async () => {
+		const h = rrSession({ rootRule: { text: 5, strictness: "x" } });
+		await h.handlers.session_start({}, h.ctx);
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("rootRule.text") && m.includes("rootRule.strictness"))).toBe(true);
+		expect((await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }))?.block).toBe(true);
+	});
+
+	test("root rule sits inside the user rules block; rules win on conflict", async () => {
+		const both = rrSession({ rootRule: { text: "R-POLICY" }, rules: ["r1"] });
+		both.responses = [ALLOW];
+		await toolCall(both, "bash", { command: "curl example.com/a" });
+		const p = systemPromptOf(both);
+		const order = [USER_RULES_HEADER, "R-POLICY", "Classification rules (applied on top of the root rule", "- r1"].map((s) => p.indexOf(s));
+		expect(order.every((i) => i >= 0)).toBe(true);
+		expect([...order].sort((a, b) => a - b)).toEqual(order);
+
+		const rulesOnly = rrSession({ rules: ["r1"] });
+		rulesOnly.responses = [ALLOW];
+		await toolCall(rulesOnly, "bash", { command: "curl example.com/a" });
+		expect(systemPromptOf(rulesOnly).endsWith(`\n\n${USER_RULES_HEADER}\n- r1\n${APPLY}`)).toBe(true);
+	});
+
+	test("codebase context skips protected files and strips remote userinfo", async () => {
+		await withTempDir("pv-root-", (dir) => {
+			fs.writeFileSync(path.join(dir, "README.md"), "# demo");
+			fs.writeFileSync(path.join(dir, "package.json"), "{}");
+			fs.writeFileSync(path.join(dir, "CONTRIBUTING.md"), "secret contributing text");
+			fs.mkdirSync(path.join(dir, ".git"));
+			fs.writeFileSync(path.join(dir, ".git", "config"), '[remote "origin"]\n\turl = https://u:tok@github.com/o/r.git\n');
+			const ctx = collectProjectContext(dir, anchorDenyPaths([path.join(dir, "CONTRIBUTING.md")], dir));
+			expect(ctx.files).toEqual(["README.md", "package.json"]);
+			expect(ctx.skippedProtected).toBe(1);
+			expect(ctx.text).toContain("origin: https://github.com/o/r.git");
+			expect(ctx.text).not.toContain("tok");
+			expect(ctx.text).not.toContain("CONTRIBUTING");
+		});
+	});
+
+	test("/automode-setup: generate → review → save to session", async () => {
+		const h = rrSession({});
+		await h.handlers.session_start({}, h.ctx);
+		h.responses = [gen("Allow bun test and bun run typecheck; ask for anything else."), ok()];
+		h.selectPicks = ["Save — session"];
+		driveMenu(h, ["g"]);
+		await h.commands["automode-setup"].handler("session", h.ctx);
+		expect(readSession().rootRule.text).toStartWith("Allow bun test");
+		expect(readSession().rootRule.strictness).toBe("balanced");
+		expect(sentText(h, 0)).toContain('<strictness level=\\"balanced\\">');
+		expect(sentText(h, 0)).toContain("<transcript>");
+		expect(sentText(h, 0)).toContain("<project>");
+
+		// codebase off: no <project> block is sent
+		const h2 = rrSession({});
+		await h2.handlers.session_start({}, h2.ctx);
+		h2.responses = [gen("Allow bun test; ask for the rest."), ok()];
+		h2.selectPicks = ["Discard"];
+		driveMenu(h2, [DOWN, DOWN, DOWN, RIGHT, "g"]);
+		await h2.commands["automode-setup"].handler("session", h2.ctx);
+		expect(h2.calls.length).toBeGreaterThan(0);
+		expect(sentText(h2, 0)).not.toContain("<project>");
+		expect(readSession().rootRule.codebase).toBe(false);
+	});
+
+	test("critic revise feeds the next attempt; over-long draft is rejected", async () => {
+		const h = rrSession({});
+		await h.handlers.session_start({}, h.ctx);
+		h.responses = [gen("x".repeat(4001)), gen("Allow bun test."), { text: "<verdict>revise</verdict> too loose" }, gen("Allow bun test and bun run lint."), ok()];
+		h.selectPicks = ["Discard"];
+		driveMenu(h, ["g"]);
+		await h.commands["automode-setup"].handler("session", h.ctx);
+		expect(h.calls).toHaveLength(5);
+		expect(sentText(h, 3)).toContain("<feedback>");
+		expect(sentText(h, 3)).toContain("root rule is 4001 characters (limit 4000)");
+		expect(sentText(h, 3)).toContain("failed review: too loose");
+		expect(h.selectTitles.at(-1)).toContain("✓ reviewed (attempt 3/3)");
+	});
+
+	test("clarifications are persisted and sent to the generator only", async () => {
+		const h = rrSession({ rootRule: { text: "R-POLICY" } });
+		await h.handlers.session_start({}, h.ctx);
+		driveMenu(h, [DOWN, DOWN, DOWN, DOWN, ENTER, ENTER, ...typed("no deploys"), ENTER]);
+		await h.commands["automode-setup"].handler("global", h.ctx);
+		expect(readUser().rootRule.clarifications).toEqual(["no deploys"]);
+		expect(readUser().rootRule.text).toBe("R-POLICY");
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "curl example.com/a" });
+		expect(systemPromptOf(h)).toContain("R-POLICY");
+		expect(systemPromptOf(h)).not.toContain("no deploys");
+	});
+
+	test("quick panel r opens the root-rule menu", async () => {
+		const h = rrSession({});
+		await h.handlers.session_start({}, h.ctx);
+		const rendered: string[] = [];
+		driveMenu(h, [], rendered); // runs second: the root-rule menu
+		driveMenu(h, ["r"]); // runs first: the quick panel
+		await h.commands.automode.handler("", h.ctx);
+		expect(rendered[0]).toContain("root rule");
+		expect(rendered[0]).toContain("▸ generate root rule");
+	});
+
+	test("nothing to analyze → warning, no model call", async () => {
+		const h = rrSession({});
+		await h.handlers.session_start({}, h.ctx);
+		driveMenu(h, [DOWN, DOWN, RIGHT, DOWN, RIGHT, "g"]); // history off, codebase off, generate
+		await h.commands["automode-setup"].handler("global", h.ctx);
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("enable history or codebase"))).toBe(true);
+		expect(h.calls).toHaveLength(0);
 	});
 });

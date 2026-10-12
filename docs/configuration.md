@@ -27,6 +27,7 @@ Defaults are the built-in values used when a key is absent. The first-run templa
 | `explainGateModel` | `provider/id[:level]` or `null` | `null` (session model) | no | [PR-5](adjudication-rules.md#pr-5-explain-gate) |
 | `explainGatePrompt` | string or `null` | `null` (built-in task) | no | [PR-5](adjudication-rules.md#pr-5-explain-gate) |
 | `rules` | free-text string list | `[]` | list additions | [CL-5](adjudication-rules.md#cl-5-system-prompt-composition) |
+| `rootRule` | object `{text, strictness, history, codebase, clarifications}` or `null` | `null` | whole object (highest scope wins, no field merge) | [RR-1](adjudication-rules.md#rr-1-storage-and-resolution) to [RR-4](adjudication-rules.md#rr-4-loop-and-review) |
 | `subagentGate` | `off`, `normal`, `auto` (omp only) | `"off"` | no | [SG-1](adjudication-rules.md#sg-1-identity-and-off) to [SG-5](adjudication-rules.md#sg-5-never-auto-allowed) |
 | `subagentAskTimeoutMs` | positive integer | `60000` | no | [SG-2](adjudication-rules.md#sg-2-normal), [SG-6](adjudication-rules.md#sg-6-omp-handler-timeout) |
 | `audit` | boolean | `false` | no | [AU-1](adjudication-rules.md#au-1-audit-scope) to [AU-4](adjudication-rules.md#au-4-observe-only-and-fail-soft) |
