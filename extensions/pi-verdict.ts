@@ -4,16 +4,17 @@
  * Tool-call permission is adjudicated automatically by "rule layer + model classifier",
  * no per-call human approval. Semantically aligned with Claude Code Auto Mode but
  * inverted: pi defaults to allowing → this extension intercepts.
+ * Normative rules: docs/adjudication-rules.md (IDs like PP-6 below refer to it).
  *
  * Pipeline (tool_call hook):
  *   1. Rule layer (built-in deny floor + user declarations):
- *      - built-in floor: bash danger regexes + path sensitivity S0-S5 → hard deny
+ *      - built-in floor: bash danger regexes + path sensitivity S0-S3 → hard deny
  *        (on by default; builtinDenyFloor:false turns the whole floor off, at your
  *        own risk)
  *      - user rules: allow/deny regexes in config/pi-verdict.json (deny wins over
- *        allow); no built-in allowlist (every "always allow" claim is the user's,
+ *        allow); no built-in command allowlist (every "always allow" claim is the user's,
  *        #12/audit response)
- *      - denyPaths (ADR-0002): user-declared protected paths; path-semantic
+ *      - denyPaths (PP-1–PP-9): user-declared protected paths; path-semantic
  *        comparison with tool-owned normalization (~, $HOME, relative, .., symlink
  *        forms all resolve); a hit → terminal ask (non-interactive degrades to
  *        deny), after user deny, before user allow — a protected path is the user's
@@ -42,11 +43,11 @@
  * non-interactive modes (no UI) ask → deny.
  *
  * Configuration:
- *   --auto-mode / --no-auto-mode   CLI flag, master switch (default on)
- *   ctrl+shift+y                   master-switch toggle shortcut (default; silent
- *                                   toggle, footer always visible as the only
- *                                   feedback; config toggleShortcut rebinds/null
- *                                   disables, new session applies)
+ *   --verdict-mode default|yolo|noAutoDeny|off   approval mode for this session
+ *   ctrl+shift+y                   approval-mode cycle shortcut (default; silent
+ *                                   cycle, footer/mode chip is the only feedback;
+ *                                   config toggleShortcut rebinds/null disables,
+ *                                   new session applies)
  *   --auto-mode-model provider/id[:thinking]  classifier model + optional thinking
  *                                   suffix (pi-native --model syntax; default off
  *                                   = thinking explicitly disabled)
@@ -60,6 +61,7 @@
  *                                   explainGatePrompt, toggleShortcut }
  *                                   match target: bash = full command string /
  *                                   file tools = absolute path; new session applies
+ *                                   (full key list: docs/configuration.md)
  *
  * Known prototype simplifications (see README "Status & limitations"):
  *   - no built-in bash allowlist; danger detection is regex floor (no AST parsing)
@@ -70,7 +72,7 @@
  *   - AGENTS.md not passed to the classifier as downweighted intent evidence
  *   - denyPaths bash extraction is token-level: command substitution, base64-
  *     embedded paths and external script contents produce no hit signal — those
- *     fall back to the classifier's existence-hint vigilance (ADR-0002)
+ *     fall back to the classifier's existence-hint vigilance (PP-2)
  *
  * Design basis: research/claude-code-classifier-prompts.md,
  *               research/pi-model-call-and-ref-implementations.md
@@ -114,7 +116,7 @@ interface RuleResult {
 	reason?: string;
 	/** UI-only plaintext (e.g. the matched protected path). Never reaches the agent
 	 *  context: block reasons and notifications travel back to the model, so only the
-	 *  local confirm dialog may show it (ADR-0002 story: zero path plaintext leaves the machine). */
+	 *  local confirm dialog may show it (PP-6: zero path plaintext leaves the machine). */
 	detail?: string;
 	/** Which forced gate produced an ask: the `.omp` directory gate or a denyPaths hit (yolo picks its action per gate). */
 	gate?: "omp-dir" | "deny-paths";
@@ -143,7 +145,7 @@ function classifyBash(command: string, floorOn: boolean): RuleResult {
 // ============================================================================
 
 /**
- * 基础档(ADR-0002):词法绝对形 + 整路径 realpath 形(realpath 解析 symlink
+ * 基础档(PP-4):词法绝对形 + 整路径 realpath 形(realpath 解析 symlink
  * 间接;失败——目标不存在、glob token——降级为仅词法形)。denyPaths 与一切
  * 「基址侧」双形集合(cwd 基址、agentDir、安装根)走这一档。
  */
@@ -161,7 +163,7 @@ function baseForms(p: string): string[] {
 /**
  * 祖先重建档(#20):基础形之外,目标尚不存在时自最近存在祖先的 realpath 逐级
  * 重建真实形——symlink 别名即使最终段不存在也暴露其真实位置。误放行代价高的
- * 判定(路径敏感度 floor)走这一档;denyPaths 不升档(ADR-0002)。
+ * 判定(路径敏感度 floor)走这一档;denyPaths 不升档(PP-4)。
  */
 function rebuiltForms(abs: string): string[] {
 	const out = new Set<string>([abs]);
@@ -293,7 +295,7 @@ type RuleAdditions = Partial<Record<EditableListKey, string[]>>;
 interface UserRules {
 	allow: RegExp[];
 	deny: RegExp[];
-	/** User-declared protected paths (ADR-0002): plain paths, tool-owned normalization; hit → ask */
+	/** User-declared protected paths (PP-1–PP-9): plain paths, tool-owned normalization; hit → ask */
 	denyPaths: string[];
 	/** [tools allowlist] exact tool-name allowlist for the MCP/custom family (toolKind() === null, e.g. "ask", "propose_commit", "propose_changelog") — a case-sensitive exact match on the tool's registered name bypasses the classifier and returns allow directly. Does not touch the built-in floor or denyPaths (none of those cover this family either). Empty = unchanged default (always classifier). Config key: "tools". */
 	tools: string[];
@@ -986,7 +988,7 @@ function userRuleTarget(toolName: string, input: Record<string, unknown>, cwd: s
 }
 
 // ============================================================================
-// denyPaths (ADR-0002): user-declared protected paths — deterministic ask
+// denyPaths (PP-1–PP-9): user-declared protected paths — deterministic ask
 //
 // A path-semantic declaration: unlike deny regexes (string patterns, the user
 // owns the normalization assumptions), the tool owns normalization here —
@@ -998,7 +1000,7 @@ function userRuleTarget(toolName: string, input: Record<string, unknown>, cwd: s
 // sits INSIDE the searched subtree hits as well. The extractor is an evidence producer, never an
 // adjudicator: a hit routes to a terminal ask (the declaring user owns the
 // exception); non-interactive sessions degrade to deny. External script
-// contents are never read (unsound by construction, ADR-0002); the classifier
+// contents are never read (unsound by construction, PP-2); the classifier
 // only ever sees a fixed existence hint — zero path plaintext.
 // ============================================================================
 
@@ -1006,7 +1008,7 @@ function userRuleTarget(toolName: string, input: Record<string, unknown>, cwd: s
 const BASH_PATH_TOKENS =
 	/(?:~|\$HOME)(?:\/[\w.@*-]+)*|\/(?:[\w.@*-]+\/)*[\w.@*-]*|\.{1,2}(?:\/[\w.@*-]+)+|[\w.-]+(?:\/[\w.-]+)+/g;
 
-/** Normalized forms of one path for denyPaths comparison: base tier only (ADR-0002) —
+/** Normalized forms of one path for denyPaths comparison: base tier only (PP-4) —
  *  no ancestor rebuild; a nonexistent target under a symlinked dir falls to the
  *  classifier + existence hint instead (pinned by a regression test). */
 function denyPathForms(raw: string, cwd: string): string[] {
@@ -1016,7 +1018,7 @@ function denyPathForms(raw: string, cwd: string): string[] {
 	return baseForms(path.resolve(cwd, expanded));
 }
 
-/** Normalize the configured denyPaths against one cwd (ADR-0002: anchored once per session, never re-derived) */
+/** Normalize the configured denyPaths against one cwd (PP-1: anchored once per session, never re-derived) */
 const anchorDenyPaths = (paths: string[], cwd: string): string[] => paths.flatMap((b) => denyPathForms(b, cwd));
 
 /** Every path candidate a tool call exposes to denyPaths comparison (MCP/custom tools: none — classifier + hint covers).
@@ -1085,12 +1087,12 @@ function hitOmpDir(toolName: string, input: Record<string, unknown>, cwd: string
 }
 
 /**
- * Tool call → rule-layer verdict. Order (#12; ADR-0002 inserts denyPaths):
+ * Tool call → rule-layer verdict. Order (#12; RL-2, with denyPaths per PP-5):
  *   1. built-in base (bash danger regex floor / path sensitivity grading) — deny is terminal
  *      (the floor can be turned off via builtinDenyFloor)
  *   2. user deny → deny (beats allow)
  *      2a. gateOmpDir (default on): path/command touching a `.omp` directory → terminal ask
- *   3. denyPaths hit → terminal ask (ADR-0002: the declaring user adjudicates; before user allow)
+ *   3. denyPaths hit → terminal ask (PP-5: the declaring user adjudicates; before user allow)
  *   4. user allow → allow
  *   5. custom-tool exact match (user.tools) → allow (bypasses classifier for that tool)
  *   6. base (path tools' default allow/gray; everything else gray) → classifier
@@ -1129,7 +1131,7 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 			const omp = hitOmpDir(toolName, input, cwd);
 			if (omp) return { verdict: "ask", reason: "forced gate: access to a .omp directory (gateOmpDir)", detail: omp, gate: "omp-dir" };
 		}
-		// denyPaths hit → terminal ask (ADR-0002): after user deny, before user allow —
+		// denyPaths hit → terminal ask (RL-2, PP-5): after user deny, before user allow —
 		// a protected path is the user's exception to their own allow rules.
 		// The matched path goes to `detail` (confirm dialog only): reasons travel back
 		// into the agent context, so plaintext there would leak the declaration.
@@ -1183,7 +1185,7 @@ ${full ? "" : `${VERDICT_CHOICES_PREFIX}${choices.join(", ")}\n\n`}Your ENTIRE r
 const CLASSIFIER_SYSTEM = classifierSystem(["allow", "ask", "deny"]);
 
 /**
- * Existence hint (ADR-0002), appended to the classifier system prompt when the user
+ * Existence hint (PP-7), appended to the classifier system prompt when the user
  * has configured denyPaths. Deliberately signal-only: the classifier must know THAT
  * protected paths exist and stay strict about edge-probing (copy-then-read, archiving,
  * indirection) — never WHAT they are. Path plaintext never leaves the machine.
@@ -1726,7 +1728,7 @@ export interface FallbackAudit {
 
 /** One adjudication record (#54; #62 widened the surface to protected-path asks and
  *  added the ground-truth fields). Full fidelity on purpose: the file is
- *  local-trust-domain (same as pi-verdict.json, per the ADR-0002 boundary note),
+ *  local-trust-domain (same as pi-verdict.json, per AU-1/PP-6),
  *  so protected-path plaintext is allowed here — it never leaves the machine nor
  *  flows into agent context. */
 export interface AuditRecord {
@@ -1886,19 +1888,19 @@ export class SessionState {
 		return rules.audit && this.agentDir ? new AuditLog(path.join(this.agentDir, "verdicts")) : null;
 	}
 
-	/** Reload user (+ trusted project) rules and re-anchor denyPaths to `cwd` (ADR-0002: once per session
+	/** Reload user (+ trusted project) rules and re-anchor denyPaths to `cwd` (PP-1: once per session
 	 *  start; /verdict re-anchors after a config edit). Leaves shadow-cache / fallback stats untouched. */
 	reloadRules(cwd: string, sessionTrustedRoot: string | null = null): RulesLoadReport {
 		const loaded = loadUserRules(cwd, sessionTrustedRoot, this.sessionOverrides);
 		this.userRules = loaded.rules;
 		this.settingSources = loaded.settingSources;
-		this.denyPathBases = anchorDenyPaths(loaded.rules.denyPaths, cwd); // anchored to the session cwd, once (ADR-0002)
+		this.denyPathBases = anchorDenyPaths(loaded.rules.denyPaths, cwd); // anchored to the session cwd, once (PP-1)
 		this.audit = this.makeAudit(loaded.rules);
 		return { skipped: loaded.skipped, shortcutWarning: loaded.shortcutWarning, project: loaded.project, settingSources: loaded.settingSources };
 	}
 
 	/** 会话重置:重载用户规则(配置改动新会话生效)+ 按会话 cwd 重锚 denyPaths
-	 *  (ADR-0002: 每会话锚定一次)+ 清影子缓存;返回加载报告供表现层通知 */
+	 *  (PP-1: 每会话锚定一次)+ 清影子缓存;返回加载报告供表现层通知 */
 	reset(cwd: string, sessionTrustedRoot: string | null = null, sessionOverrides: Record<string, unknown> = {}): RulesLoadReport {
 		this.sessionOverrides = { ...sessionOverrides };
 		const report = this.reloadRules(cwd, sessionTrustedRoot);
@@ -1927,7 +1929,7 @@ export class SessionState {
 export type VerdictSource = "rule" | "protected-path" | "classifier" | "fail-closed";
 
 /** 判定管线的输出值对象:一次 tool_call 的完整裁决。detail 为 UI-only 明文(受保护
- *  路径仅入本地确认框,ADR-0002 零泄漏承诺——reason 与通知永不携带);degraded 标记
+ *  路径仅入本地确认框,PP-6 零泄漏承诺——reason 与通知永不携带);degraded 标记
  *  ask 在无 UI 会话的降级产物;shadow 为影子缓存标注(仅 debug 呈现拼接用)。 */
 export interface Verdict {
 	verdict: "allow" | "ask" | "deny";
@@ -2158,7 +2160,7 @@ export async function adjudicate(
 			state.audit?.append(ppRecord);
 			return { verdict: action, reason: rule.reason ?? "", source: "protected-path", degraded: false };
 		}
-		// denyPaths 命中 → ask 终局(ADR-0002):声明者本人裁决例外;无 UI 降级为 deny
+		// denyPaths 命中 → ask 终局(PP-5):声明者本人裁决例外;无 UI 降级为 deny
 		if (env.hasUI) {
 			const ppRecord: AuditRecord = { ...buildRecord({ verdict: "ask", reason: rule.reason ?? "", source: "protected-path", degraded: false }, null, "-"), detail: rule.detail };
 			return { verdict: "ask", reason: rule.reason ?? "", detail: rule.detail, source: "protected-path", degraded: false, autoResolve: "deny", ...(state.audit ? { pendingAudit: ppRecord } : {}) };
@@ -2263,7 +2265,7 @@ export async function adjudicate(
 	// every other outcome appends immediately as before
 	const denyAsAsk = mode === "noAutoDeny" && effVerdict === "deny";
 	if (env.hasUI && (effVerdict === "ask" || denyAsAsk)) {
-		// Subagent gate: how this ask resolves without a human. ADR-0004 carve-out: a demoted deny is never auto-allowed.
+		// Subagent gate: how this ask resolves without a human. CS-7 carve-out: a demoted deny is never auto-allowed.
 		const autoResolve: NonNullable<Verdict["autoResolve"]> = effVerdict === "deny" || effSource !== "classifier"
 			? "deny"
 			: cascade.fb
@@ -2764,7 +2766,7 @@ export function buildSettingsMenu(
 // in the dialog and never reaches the agent, the verdict, the audit log or the
 // classifier. Never offered for protected-path asks (including the `.omp` gate):
 // their path plaintext is UI-only and must not leave the machine for a model
-// provider (ADR-0002).
+// provider (PP-9).
 // ============================================================================
 
 export const EXPLAIN_GATE_ROLE = "EXPLAIN-GATE";
@@ -2863,7 +2865,7 @@ export interface GenerateRuleArgs {
 export type GenerateRuleResult = { ok: true; kind: EditableListKey; value: string; rationale: string } | { ok: false; error: string; transport: boolean; raw?: string };
 
 /** One rule-generation model call (session model, thinking off). Never throws; failures come back as `{ ok: false }`.
- *  No config (denyPaths etc.) is sent: protected-path plaintext must never reach a model (ADR-0002). */
+ *  No config (denyPaths etc.) is sent: protected-path plaintext must never reach a model (PP-6, RG-1). */
 export async function generateRule(a: GenerateRuleArgs): Promise<GenerateRuleResult> {
 	const { userLines, toolLines } = collectTranscriptParts(a.host);
 	const transcript = [...userLines.slice(-MAX_USER_MESSAGES), ...toolLines.slice(-RULE_GEN_MAX_TOOL_CALLS)].join("\n");
@@ -2915,7 +2917,7 @@ export type RuleHistoryEval =
 /** Which of `calls` a rule would match, with the same targets/semantics as `classifyByRules`. `rules` (free text) cannot be checked.
  *  For `allow`/`tools`, each matching call is re-run through `classifyByRules` with the candidate appended: a verdict other than `allow` means an
  *  earlier layer (floor, user deny, `.omp` gate, denyPaths) pre-empts the rule. `deny`/`denyPaths` are never shadowed (earlier layers are at least as strict).
- *  Only `after.reason` is reported, never `after.detail` (it can carry protected-path plaintext, ADR-0002). */
+ *  Only `after.reason` is reported, never `after.detail` (it can carry protected-path plaintext, PP-6). */
 export function evaluateRuleOnHistory(kind: EditableListKey, value: string, calls: RecentToolCall[], cwd: string, user: UserRules, denyPathBases: string[]): RuleHistoryEval {
 	if (kind === "rules") return { checked: false };
 	let test: (c: RecentToolCall) => boolean;
@@ -2985,7 +2987,7 @@ export interface CritiqueRuleArgs {
 export type CritiqueRuleResult = { ok: true; verdict: "ok" | "revise"; reason: string } | { ok: false; error: string };
 
 /** One review call (session model, thinking off) over a candidate that already passed the deterministic checks. Never throws.
- *  Only transcript-derived lines are sent (history hits/non-hits); no config, so ADR-0002 holds. */
+ *  Only transcript-derived lines are sent (history hits/non-hits); no config, so PP-6 holds. */
 export async function critiqueRule(a: CritiqueRuleArgs): Promise<CritiqueRuleResult> {
 	const free = a.kind === "rules";
 	const FREE_TEXT_NOTE = "(free-text rule: not checked against history)";
@@ -3280,7 +3282,7 @@ export function renderJevBar(j: JevReason, minConfidence: number | null, width: 
 }
 
 export const VERDICT_LABEL_TYPE = "pi-verdict-label";
-/** Status row after an allowed call's block. Carries no reason text and no path (ADR-0002): tool name, how it passed, jev numbers only. */
+/** Status row after an allowed call's block. Carries no reason text and no path (PP-6): tool name, how it passed, jev numbers only. */
 export interface VerdictLabel {
 	tool: string;
 	how: "rule" | "classifier" | "user" | "second-model";
@@ -3861,7 +3863,7 @@ export interface AutoModeDeps {
 // Footer status
 //
 // Pure model + renderer (UI-free, exported for tests). Carries no command, path or
-// denyPaths text (ADR-0002). The host joins every extension status onto ONE footer line
+// denyPaths text (PP-6). The host joins every extension status onto ONE footer line
 // (sorted by key, truncated from the right), so the order below is also the truncation
 // priority: gate state, risks, classifier model, counters, info badges.
 // ============================================================================
@@ -4112,7 +4114,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	/** Verdict → UI(本扩展唯一的裁决呈现点):按 source × degraded 查模板,文案与
 	 *  重构前逐字节一致。受保护路径分支的通知永不携带路径明文与 action 行
-	 *  (ADR-0002 story 11:通知与 block reason 回流 agent context)。 */
+	 *  (PP-6:通知与 block reason 回流 agent context)。 */
 	async function presentVerdict(v: Verdict, call: { toolName: string; input: Record<string, unknown> }, action: string, ui: UiContext, opts: { label: string | null; signal?: AbortSignal; ctx: ExtensionContext }): Promise<{ block: true; reason: string } | undefined | "aborted"> {
 		const note = (msg: string, level: "info" | "warning" | "error"): void => ui.notify(opts.label ? msg.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : msg, level);
 		const titled = (t: string): string => (opts.label ? t.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : t);
@@ -4136,7 +4138,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				return { block: true, reason: blockedReason("yolo-retry", v.reason) };
 			}
 			if (v.source === "protected-path" && !v.degraded) {
-				// yolo: no action line and no detail — the path plaintext must not reach notifications or the agent (ADR-0002)
+				// yolo: no action line and no detail — the path plaintext must not reach notifications or the agent (PP-6)
 				note(`🛡️ Auto Mode (yolo) blocked protected-path access: ${v.reason}`, "warning");
 				return { block: true, reason: blockedReason("protected-path", `yolo mode denies protected-path access: ${v.reason}`) };
 			}
@@ -4158,7 +4160,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		}
 		// ask → 人工确认;非交互已在管线内降级,能走到这里的必有 UI
 		if (v.source === "protected-path") {
-			// no EXPLAIN-GATE here: the protected path plaintext must not reach a model provider (ADR-0002)
+			// no EXPLAIN-GATE here: the protected path plaintext must not reach a model provider (PP-9)
 			const d = await confirmAsk(ui, {
 				title: titled("🛡️ Auto Mode: protected path"),
 				toolName: call.toolName,
@@ -4379,7 +4381,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 	/** Usage 行的 toggle 提示(#15):无注册键位时不显示;显示注册时固定的键 */
 	const toggleHint = () => (registeredToggleKey ? ` · toggle: ${registeredToggleKey}` : "");
-	/** Status line denyPaths count (ADR-0002): shown only when configured */
+	/** Status line denyPaths count (PP-5): shown only when configured */
 	const denyPathsHint = () => (state.userRules.denyPaths.length > 0 ? `\ndenyPaths: ${state.userRules.denyPaths.length} active` : "");
 	/** Status line audit hint (#54): shown only while the sink is active */
 	const auditHint = () => (state.audit ? `\naudit: on → ${state.audit.dir}` : "");
@@ -5234,7 +5236,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 
 	// Verdict label after the block: a separate transcript row (pi: TUI-only custom entry; omp: aside custom message, model-visible). Rule-allow labels are recorded but not rendered (pi: renderer yields nothing; omp: display:false).
-	// No reason text, no path (ADR-0002). The result content stays untouched.
+	// No reason text, no path (PP-6). The result content stays untouched.
 	pi.on("tool_result", (event) => {
 		const l = typeof event.toolCallId === "string" ? state.takeLabel(event.toolCallId) : undefined;
 		if (l && labelSink) labelSink(l);
@@ -5261,7 +5263,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const allowedHow = (v: Verdict): VerdictLabel["how"] => (v.verdict === "ask" ? "user" : v.source === "classifier" ? "classifier" : "rule");
 
 		// Live status (root session + UI only): one widget row above the editor while a model call runs.
-		// Text is phase + tool name + model id only; never command or path text (ADR-0002).
+		// Text is phase + tool name + model id only; never command or path text (PP-6).
 		const statusUi = !sub && ctx.hasUI && typeof ctx.ui.setWidget === "function" ? ctx.ui : null;
 		let statusShown = false;
 		const onPhase = statusUi
@@ -5322,7 +5324,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 		// Root session (and pi): unchanged behavior; no signal is passed, so "aborted" cannot occur
 		if (!sub) {
-			// the awaiting row names the tool only (never command or path text, ADR-0002)
+			// the awaiting row names the tool only (never command or path text, PP-6)
 			const awaiting = verdict.verdict === "ask" && statusUi !== null;
 			if (awaiting) statusUi.setWidget(STATUS_WIDGET_KEY, [statusUi.theme.fg("warning", `🛡️ verdict: awaiting your approval · ${event.toolName}`)]);
 			let r: Presented;
@@ -5353,7 +5355,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				noteAllowed(verdictLabelFor(event.toolName, "second-model", res.reason));
 				return undefined;
 			}
-			// no path plaintext in notifications (ADR-0002): protected-path asks omit the action line
+			// no path plaintext in notifications (PP-6): protected-path asks omit the action line
 			out(`🛡️ [${label}] Auto Mode blocked (subagent ask, no human): ${res.reason}${verdict.source === "protected-path" ? "" : `\n  ${action}`}`, "warning");
 			return { block: true, reason: blockedReason("subagent-auto", res.reason) };
 		};

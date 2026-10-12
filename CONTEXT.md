@@ -1,113 +1,326 @@
-# CONTEXT
+# pi-verdict
 
-本项目的领域术语表。只收录术语定义,不含实现细节与决策记录(决策见 docs/adr/)。
+The glossary of pi-verdict, a permission gate for coding-agent tool calls built from a deterministic rule layer and a model classifier. It defines terms only; behavior is specified in [docs/adjudication-rules.md](docs/adjudication-rules.md), whose rule IDs each entry links to.
 
-## 术语
+## Language
 
-### Auto Mode
+### Gate
 
-本产品(pi-verdict)的核心裁决模式:工具调用的权限不由人工逐次批准,也不全然放行(Pi 默认的 YOLO 行为),而是由**规则层 + 模型分类器**自动判定。语义对齐 Claude Code 的 Auto Mode,但方向相反:Claude Code 是"默认提示 → 分类器自动批准",Pi 是"默认放行 → 分类器自动拦截"。命名分层:扩展实体与持久物(包、入口文件、配置文件)用产品名 pi-verdict;运行时接口(CLI flag、`/automode` 命令、env 变量)用功能名 auto-mode 前缀。
+**Permission gate**:
+The extension that adjudicates every tool call of a coding agent before it runs and answers allow, ask or deny.
+_Avoid_: guard, firewall, sandbox
+Rules: [RL-2](docs/adjudication-rules.md#rl-2-evaluation-order), [CL-1](docs/adjudication-rules.md#cl-1-gray-zone)
 
-### 审批模式 (approval mode)
+**Auto Mode**:
+The allow-unless-intercepted posture: a tool call passes unless the rule layer or the classifier intercepts it, the reverse of Claude Code's prompt-unless-approved default.
+_Avoid_: YOLO (for the posture; `yolo` names one approval mode)
+Rules: [MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets)
 
-工具调用审批的总体姿态,四档:`default`(deny/ask/allow)、`yolo`(deny/allow,永不弹确认——本应 ask 的一律转为「解释或改写」式拦截)、`noAutoDeny`(ask/allow,自动 deny 转为人工 ask)、`off`(门禁停用,仅会话级)。每个审批键可在 user / project(受信项目)/ session 三个作用域设定,session > project > user > 默认;session 作用域按会话 id 持久化。操作面——`--verdict-mode` flag、`/automode` 命令与面板、快捷键轮换——都写入 session 作用域,语义等价,无确认弹窗;状态可见性由 footer 的模式 chip 承载。
+**Tool call**:
+One request by the agent to run a host tool (a command, a file operation, an MCP or custom tool); the unit the gate adjudicates.
+Rules: [RL-1](docs/adjudication-rules.md#rl-1-tool-families)
 
-### 判定管线 (adjudication pipeline)
+**Action line**:
+The one-line rendering of the tool call under review, pinned as the last line of the transcript.
+Rules: [CL-4](docs/adjudication-rules.md#cl-4-input-transcript)
 
-从 tool_call 到三态裁决的完整判定流程,按序:内置 floor → 用户 deny → 强制 `.omp` 门禁(`gateOmpDir`,默认开)ask → denyPaths ask → 用户 allow → 灰区交分类器;ask 降级(无 UI → deny)与 fail-closed 内建于管线语义。实现形态:`adjudicate(session, call, env) → Verdict` 纯函数——零 UI 依赖的 deep module,表现(notify/confirm/select)由扩展 handler 承担。_Avoid_: 裁决管线(全仓统一用「判定管线」)。
+**Verdict**:
+The result of adjudicating one tool call: allow, ask or deny, with a reason and a verdict source.
+_Avoid_: decision, ruling, judgment
+Rules: [PR-2](docs/adjudication-rules.md#pr-2-block-reason)
 
-### 裁决 (verdict)
+**Three-state verdict**:
+The value set of a verdict: allow (the call runs), deny (the call is blocked), ask (a human decides).
+Rules: [MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets), [PR-1](docs/adjudication-rules.md#pr-1-ask-degradation)
 
-对单次工具调用的判定结果。由 `tool_call` 钩子产出,放行则不做干预,拦截则返回 `{ block: true, reason }`。运行时载体为 `Verdict` 值对象(verdict / reason / detail / source / degraded / shadow):`detail` 为 UI-only 明文(受保护路径仅入本地确认框,ADR-0002 零泄漏承诺),`source` 区分 rule / protected-path / classifier / fail-closed,`degraded` 标记 ask 降级产物。
+**Verdict source**:
+The stage that produced a verdict: `rule` (the rule layer), `protected-path` (a gate ask), `classifier` (the classifier, including its failure) or `fail-closed` (no classifier model, or an unavailable enforce fallback).
+Rules: [PR-2](docs/adjudication-rules.md#pr-2-block-reason), [CS-8](docs/adjudication-rules.md#cs-8-fallback-failure)
 
-### 通知 (verdict notification)
+**Adjudication pipeline**:
+The full sequence that turns a tool call into a verdict: rule layer, classifier, confidence floor and mode thresholds, fallback cascade, approval-mode shaping and presentation.
+_Avoid_: verdict pipeline, judgment pipeline
+Rules: [RL-2](docs/adjudication-rules.md#rl-2-evaluation-order), [CL-1](docs/adjudication-rules.md#cl-1-gray-zone), [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers), [MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets)
 
-门禁对用户的信息呈现通道,只承载**值得注意的判断**:deny/ask 恒通知;classifier 的 allow 经用户规则 `notifyAllows`(默认关)开启;机械放行恒静默——rule allow 是用户自己声明的正则回显,protected-path confirm 的可见性即确认框本身。与「裁决审计」分工:通知负责判断,审计日志负责完整记录。诊断标注(shadow 反事实拼接)属 debug 开关(flag/env),与 `notifyAllows` 正交;两者同开时 classifier allow 通知只呈现一条。
+**Approval mode**:
+The overall posture of the gate for a session: `default`, `yolo`, `noAutoDeny` or `off`.
+_Avoid_: master switch, autoDeny
+Rules: [MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets), [MD-2](docs/adjudication-rules.md#md-2-off), [MD-3](docs/adjudication-rules.md#md-3-default), [MD-4](docs/adjudication-rules.md#md-4-yolo), [MD-5](docs/adjudication-rules.md#md-5-noautodeny), [MD-6](docs/adjudication-rules.md#md-6-setting-a-mode)
 
-### 裁决审计 (verdict audit records)
+### Rule layer
 
-灰区裁决的 opt-in JSONL 决策记录(#54)。`pi-verdict.json` 的 `"audit": true` 开启;每条记录自包含(时间戳/会话 id/cwd/模型/工具与输入/action 行/思考级别/完整转录/原始响应/解析裁决/来源/影子探针/降级标记),按会话落 `<agentDir>/verdicts/<sessionId>.jsonl`,保留最近 20 个。#62 起审计面扩至 protected-path ask——其用户应答是对 denyPaths 声明质量的反馈——且交互式 ask 记录 ground truth(`userAnswer`/`answeredAt` 于确认应答后落盘,`ts` 仍为裁决时间;确认中途会话中断丢该条,已接受的代价);规则层 allow/deny 仍不入审计。observe-only:append-only、永不回流裁决输入(影子缓存同款纪律);全保真(受保护路径明文仅存本地,ADR-0002 边界注);目录不受特殊保护,与任何路径同经规则层与分类器裁决(记录含不可信原始输出,读回时自行判断);写失败 fail-soft 不影响裁决。
+**Rule layer**:
+The deterministic first stage of the pipeline; it decides allow, deny or ask from rules without calling a model, or leaves the call gray.
+Rules: [RL-2](docs/adjudication-rules.md#rl-2-evaluation-order)
 
-### 规则层 (rule layer)
+**Built-in deny floor**:
+The built-in part of the rule layer, made of danger rules and path grading, that declares denies and never declares a command allowed.
+_Avoid_: built-in allowlist
+Rules: [RL-5](docs/adjudication-rules.md#rl-5-danger-rules), [RL-6](docs/adjudication-rules.md#rl-6-builtindenyfloor), [PG-3](docs/adjudication-rules.md#pg-3-s0-secrets)
 
-判定管线的第一段:确定性规则给出硬性 allow 或 deny。由两部分组成:**内置 deny floor**(bash 危险正则 + 文件路径敏感度分级,只做 deny 声明——误报方向安全)与**用户规则**(allow/deny 正则,由用户配置并背书)。内置层不提供白名单(0.2.0 起,安全审计结论:白名单健全性需要 shell AST 分析)。
+**Danger rule**:
+A built-in regular expression, identified by an id, whose match on a command string denies the call.
+Rules: [RL-5](docs/adjudication-rules.md#rl-5-danger-rules)
 
-### 双形匹配
+**Path grading**:
+The built-in classification of a file path into a sensitivity grade that yields allow, gray or deny for a file tool.
+Rules: [PG-1](docs/adjudication-rules.md#pg-1-applicability), [PG-4](docs/adjudication-rules.md#pg-4-reads), [PG-5](docs/adjudication-rules.md#pg-5-writes)
 
-路径类规则判定的归一化纪律:同一目标路径产出**全部规范形**——词法绝对形 + realpath 形;规则匹配对每个形逐一测试,任一形命中即生效。词法形位于 cwd 内而真实形出走 cwd 的 symlink 别名不得因此获得「项目内写入」放行(要求全部形位于 cwd 的词法/真实形之内)。纪律分两档:**基础档** = 整路径 realpath、失败降级词法形(实现 `baseForms`;denyPaths 与一切基址侧双形集合自始遵循,ADR-0002);**祖先重建档** = 目标尚不存在时自最近存在祖先的 realpath 逐级重建(实现 `rebuiltForms`;路径敏感度 floor 自 #20 起遵循——误放行代价高的判定取强档)。denyPaths 不做祖先重建:不存在目标经 symlink 别名的写入不命中,落分类器 + 存在性话术兜底。_Avoid_: 只测词法形的单形匹配(对 symlink 别名整体旁路);把祖先重建记到 denyPaths 头上(denyPaths 是基础档,ADR-0002,有回归测试钉住)。
+**Sensitivity grade**:
+One of S0 (secrets and credentials), S1 (system directories), S2 (user persistence entry points) or S3 (git metadata), each a set of path patterns.
+Rules: [PG-3](docs/adjudication-rules.md#pg-3-s0-secrets), [PG-4](docs/adjudication-rules.md#pg-4-reads), [PG-5](docs/adjudication-rules.md#pg-5-writes)
 
-### 用户规则 (user rules)
+**User rules**:
+The allow and deny regular expressions the user configures; deny beats allow.
+Rules: [RL-2](docs/adjudication-rules.md#rl-2-evaluation-order), [RL-3](docs/adjudication-rules.md#rl-3-rule-target), [RL-4](docs/adjudication-rules.md#rl-4-user-regexes)
 
-`<agentDir>/config/pi-verdict.json` 中用户配置的 allow/deny 正则:deny 优先于 allow,黑名单命中即拦截;匹配目标为 bash 完整命令串 / 文件类工具的绝对路径。`builtinDenyFloor: false` 可整体关闭内置 deny floor(风险自担)。安全声明(「永远放行」)由用户背书而非作者。
+**Rule target**:
+The string a user regular expression is tested against: the command string, or the resolved path of a file tool.
+Rules: [RL-3](docs/adjudication-rules.md#rl-3-rule-target)
 
-### agentDir 自锚定 (agentDir self-anchoring)
+**Tools allowlist**:
+The exact names of tools outside the command and file families that the user allows without the classifier.
+Rules: [RL-7](docs/adjudication-rules.md#rl-7-tools-allowlist)
 
-`<agentDir>` 的解析纪律(#35,双宿主):`PI_CODING_AGENT_DIR` 显式覆盖恒优先;否则从扩展自身安装位置反推——位于 `<home>/<dot-dir>/(agent/)?(plugins/node_modules/<pkg>/)?extensions/` 之下时锚定到 `<home>/<dot-dir>/agent`(覆盖 pi 的 `~/.pi/agent` 与 omp 的 `~/.omp/agent`;omp 插件目录在 18.1+ 与 agent/ 平级(`<dot-dir>/plugins/...`),≤18.0 在其下,两种布局均匹配,配置树恒在 `<dot-dir>/agent/config/`);无从锚定时回退 `~/.pi/agent`(dev checkout)。**禁止**以宿主目录树存在性探测代替自锚定:双宿主并存的机器上,`~/.omp` 的存在不得让 pi 下的运行改道。S0 凭据 deny 规则随同一锚点覆盖两种宿主形态。
+**Scope tool**:
+A file tool whose optional path defaults to the working directory and whose search covers a subtree: `grep`, `find`, `ls`.
+Rules: [RL-1](docs/adjudication-rules.md#rl-1-tool-families), [PP-3](docs/adjudication-rules.md#pp-3-matching)
 
-### denyPaths (受保护路径)
+**Dual-form matching**:
+Testing every canonical form of a path, lexical and realpath, and treating a match on any form as a match.
+_Avoid_: single-form matching
+Rules: [PG-2](docs/adjudication-rules.md#pg-2-forms), [PP-4](docs/adjudication-rules.md#pp-4-base-tier-only)
 
-用户在 config 中声明的敏感路径列表,是**路径语义声明**:归一化(`~` 展开、词法 resolve、realpath 消解符号链接,realpath 失败降级词法层,macOS/Windows 上大小写折叠)与路径段前缀比对由**工具负责**,提取范围覆盖文件类工具的绝对路径与 bash 命令串中可提取的路径 token。命中即 **ask 终局**(非交互降级 deny),优先于用户 allow、劣后于用户 deny 与内置 floor。与用户规则的 deny(正则黑名单,用户自负归一化假设)相对:同一安全声明,声明更强的通道。路径提取与命中判定全部在本地完成,分类器只见**存在性话术**(不知路径明文、不见命中调用的裁决)。_Avoid_: denyPath(单数)。
+**Base tier**:
+The dual-form variant that takes the lexical absolute form plus the realpath of the whole path when it exists.
+Rules: [PP-4](docs/adjudication-rules.md#pp-4-base-tier-only)
 
-### 存在性话术 (existence hint)
+**Rebuilt tier**:
+The dual-form variant that adds, for a target that does not exist yet, a form rebuilt from the realpath of its nearest existing ancestor.
+_Avoid_: ancestor rebuild for protected paths
+Rules: [PG-2](docs/adjudication-rules.md#pg-2-forms), [PP-4](docs/adjudication-rules.md#pp-4-base-tier-only)
 
-注入分类器 system prompt 的固定背景句:告知用户配置了受保护路径,擦边行为(拷贝到临时目录再读、打包、间接引用)应从紧裁决。是 denyPaths 泄漏面为零承诺的推论:分类器知道"有",不知道"是什么"。
+**Protected path**:
+A path the user declares sensitive in the `denyPaths` config key; any call touching it asks the user.
+_Avoid_: denyPath, sensitive path
+Rules: [PP-1](docs/adjudication-rules.md#pp-1-declaration-normalization-and-anchoring), [PP-2](docs/adjudication-rules.md#pp-2-candidate-extraction), [PP-3](docs/adjudication-rules.md#pp-3-matching), [PP-5](docs/adjudication-rules.md#pp-5-hit-is-a-terminal-ask)
 
-### 强制 .omp 门禁 (forced .omp gate)
+**Forced .omp gate**:
+The built-in gate, on by default, that turns any call touching a `.omp` directory into a terminal ask.
+Rules: [PP-8](docs/adjudication-rules.md#pp-8-forced-omp-gate)
 
-Opt-out rule-layer gate (`gateOmpDir`, default on): any tool call whose file path or bash command resolves into a `.omp` path segment (lexical or realpath form, base tier) ends in a terminal ask (non-interactive → deny). It is a built-in declaration, not a user-listed path: it ranks after the built-in floor and user deny, before denyPaths and user allow. Unlike denyPaths it leaves no existence hint for the classifier (the ask is terminal) and scope tools (grep/find/ls) compare their own target only, not their subtree. Switchable from `/verdict` (the one scalar key it edits).
+**Terminal ask**:
+An ask raised by a gate that no later rule-layer step and no classifier can override.
+Rules: [PP-5](docs/adjudication-rules.md#pp-5-hit-is-a-terminal-ask), [PP-8](docs/adjudication-rules.md#pp-8-forced-omp-gate)
 
-### 灰区 (gray zone)
+**Existence hint**:
+A fixed sentence added to the classifier's system prompt stating that protected paths are configured, without naming any of them.
+Rules: [PP-7](docs/adjudication-rules.md#pp-7-existence-hint)
 
-规则层未给出硬性结论的工具调用,移交模型分类器判定的集合。
+**Gray zone**:
+The set of tool calls the rule layer leaves undecided and hands to the classifier.
+Rules: [CL-1](docs/adjudication-rules.md#cl-1-gray-zone)
 
-### 分类器 (classifier)
+### Classifier
 
-对灰区工具调用做风险判定的模型调用。模型**可配置**,默认**自省**;后端形态不限生成式——类型化决策模型经 jev 适配器以同一调用接口接入。
+**Classifier**:
+The first-layer model call that judges a gray tool call and answers in the verdict prefix contract.
+Rules: [CL-1](docs/adjudication-rules.md#cl-1-gray-zone), [CL-2](docs/adjudication-rules.md#cl-2-classifier-model-resolution), [CL-7](docs/adjudication-rules.md#cl-7-attempts-timeouts-fail-closed)
 
-### 自省 (self-reflection)
+**Self-reflection**:
+The classifier's default model source: the model of the running session.
+Rules: [CL-2](docs/adjudication-rules.md#cl-2-classifier-model-resolution)
 
-分类器的默认模型来源:继承当前会话正在使用的 provider/model 发起裁决调用(而非固定外部模型)。
+**Transcript**:
+The condensed, sanitized text the classifier reads: recent user messages, recent tool calls and the action line last, never tool results.
+Rules: [CL-4](docs/adjudication-rules.md#cl-4-input-transcript)
 
-### EXPLAIN-GATE role
+**Verdict prefix contract**:
+The response form every classifier backend is normalized to: a leading `<verdict>allow|ask|deny</verdict>` followed by a short reason.
+Rules: [CL-6](docs/adjudication-rules.md#cl-6-verdict-prefix-contract)
 
-A human-invoked model role behind the "Explain…" option of the ask dialog. It receives the held action, the transcript and the gate's stated reason and writes an advisory explanation for the human (a fixed system prompt plus a default task, or the human's own question). Configured by `explainGateModel` (default: the session model) and `explainGatePrompt`. Its output is display-only: it never reaches the agent, the verdict, the audit log or the classifier. Not offered for protected-path asks (ADR-0002: path plaintext stays off the model channel).
+**Classification rules**:
+The user's free-text rules, the `rules` config key, appended to the classifier's system prompt.
+_Avoid_: user rules (those are the allow and deny regular expressions)
+Rules: [CL-5](docs/adjudication-rules.md#cl-5-system-prompt-composition)
 
-### jev 适配器 (jev adapter)
+**Typed decision**:
+The output form of a non-generative model: a choice among predefined options with a probability distribution and a confidence.
+Rules: [JV-3](docs/adjudication-rules.md#jv-3-translation)
 
-随包分发的伴生扩展:在 pi 模型注册表中把 typesafe 的 jev 呈现为一个模型(`typesafe/jev-latest`),将分类器的模型调用翻译为 decisions 请求(默认 OpenRouter 端点,或 `PI_VERDICT_JEV_TRANSPORT=typesafe` 直连官方 v1 API)、把类型化决策合成为裁决前缀契约文本。仅在 `classifierModel` 指向它且凭证可解析时参与判定,否则惰性无效(分类器按既有逻辑回退)。凭证均经 provider 凭证管道:openrouter transport 沿用 pi 的 OpenRouter 登录态,typesafe transport 读 `TYPESAFE_API_KEY`(pi 无 typesafe 登录可复用);不经扩展自带通道。
+**jev adapter**:
+The companion extension that presents TypeSafe's jev decisions model as a registered model and translates the classifier call into a decisions request.
+Rules: [JV-1](docs/adjudication-rules.md#jv-1-inert-unless-selected), [JV-3](docs/adjudication-rules.md#jv-3-translation), [JV-5](docs/adjudication-rules.md#jv-5-omp-support)
 
-### 类型化决策 (typed decision)
+**Transport**:
+The route a jev request takes: `openrouter` or `typesafe`.
+Rules: [JV-2](docs/adjudication-rules.md#jv-2-transports-and-credentials)
 
-非生成式模型的输出形态:预定义选项上的取值 + 概率分布 + 置信度,构造上不可能产出约定 schema 之外的形态。jev 属此类,与 LLM 自由文本相对;适配器合成 reason 时透传概率与置信度。
+**Concern**:
+The risk category jev names in a second typed question, shown as a cosmetic label in the reason.
+Rules: [JV-3](docs/adjudication-rules.md#jv-3-translation)
 
-### 裁决前缀契约 (verdict prefix contract)
+**Confidence floor**:
+The `confidenceThreshold` below which a first-layer jev verdict is demoted.
+_Avoid_: classifierMinConfidence, confidence threshold
+Rules: [CS-1](docs/adjudication-rules.md#cs-1-confidence-floor)
 
-分类器响应的文本形态约定:必须以 `<verdict>allow|ask|deny</verdict>` 开头、后随一行理由;违反即解析失败,按 fail-closed 处理。后端无论是生成式还是类型化决策,最终都归一到该形态。
+**Demotion**:
+The abstention of the first layer when its confidence is strictly below the confidence floor; the call cascades.
+Rules: [CS-1](docs/adjudication-rules.md#cs-1-confidence-floor), [CS-4](docs/adjudication-rules.md#cs-4-no-fallback)
 
-### 三态裁决 (allow / ask / deny)
+**Mode threshold**:
+A per-mode jev probability threshold that re-maps a non-demoted first-layer jev verdict.
+Rules: [CS-2](docs/adjudication-rules.md#cs-2-mode-thresholds)
 
-裁决的三档取值:规则层或分类器判定安全 → **allow**(自动放行);判定危险 → **deny**(自动拦截,返回 block 与理由);无法确定 → **ask**(转人工确认)。
+**Fallback classifier**:
+The second-layer model, never the session model, that the cascade consults.
+_Avoid_: second opinion
+Rules: [CS-5](docs/adjudication-rules.md#cs-5-fallback-resolution-and-budget)
 
-### ask 降级
+**Cascade**:
+The escalation of a triggered call from the first layer to the fallback classifier, or to the human when none is configured.
+Rules: [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers), [CS-4](docs/adjudication-rules.md#cs-4-no-fallback)
 
-无 UI 可用时(非交互模式:`pi -p` / json / rpc)ask 的处置:一律按 deny 处理。是 fail-closed 在无人值守场景的推论。
+**Cascade trigger**:
+One of the three events that start the cascade: a demotion, a fail-closed first layer, a yolo-ask slip.
+Rules: [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers)
 
-### fail-closed
+**Shadow fallback mode**:
+The fallback mode in which the fallback classifier's opinion is recorded and never changes a verdict.
+Rules: [CS-6](docs/adjudication-rules.md#cs-6-shadow-mode)
 
-任何异常路径(分类器报错、超时、输出无法解析)的默认行为:拦截,绝不静默放行。
+**Enforce fallback mode**:
+The fallback mode in which the fallback classifier's verdict applies to the triggered call, with one carve-out for a demoted deny.
+Rules: [CS-7](docs/adjudication-rules.md#cs-7-enforce-mode), [CS-8](docs/adjudication-rules.md#cs-8-fallback-failure)
 
-### 影子缓存 (shadow cache)
+**yolo-ask slip**:
+A first-layer ask in `yolo` mode, where no human exists to receive it.
+Rules: [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers), [MD-4](docs/adjudication-rules.md#md-4-yolo)
 
-为「是否引入生效裁决缓存」积累实测数据的 observe-only 遥测:每次灰区裁决前后同步回放「双键 LRU(128)」的 would-be 命中(命令键 = 工具+输入+cwd,上下文键 = 最近 5 条 user 行),**只记录永不生效** —— 裁决永远来自模型。只回写真实模型 allow/deny,ask 与 fail-closed 不入;会话内存态,`session_start` 重置。观察口:`/automode` 统计行与 `PI_AUTO_MODE_DEBUG=1` 通知标注。
+### Outcomes
 
-### 置信降级 (confidence demotion)
+**Ask degradation**:
+The turning of an ask into a deny when no UI is available to answer it.
+Rules: [PR-1](docs/adjudication-rules.md#pr-1-ask-degradation)
 
-置信地板(`confidenceThreshold`,ADR-0004 amendment)触发时第一层裁决被降级的机制:jev 裁决的 confidence 严格低于地板时,**无论 allow/ask/deny 一律降级**——级联到回退分类器(若配置),否则转人工 ask(非交互降级 deny)。不低于地板时第一层完全自主。地板可独立采用(无需第二层);LLM 第一层无数值置信度,地板对其惰性。
+**Fail-closed**:
+The default outcome when the gate cannot establish an answer: the call is blocked.
+Rules: [CL-7](docs/adjudication-rules.md#cl-7-attempts-timeouts-fail-closed), [JV-4](docs/adjudication-rules.md#jv-4-confidence-is-required), [CS-4](docs/adjudication-rules.md#cs-4-no-fallback), [CS-8](docs/adjudication-rules.md#cs-8-fallback-failure)
 
-### 回退分类器 (fallback classifier)
+**Explain-or-rewrite block**:
+The block `yolo` returns in place of an ask, asking the agent to justify the action or rewrite it more narrowly.
+Rules: [MD-4](docs/adjudication-rules.md#md-4-yolo)
 
-级联的第二层(`classifierFallbackModel` 配置),仅在置信降级或第一层 fail-closed 时参与。shadow 模式(默认)只记录意见——结果落审计记录的 `fallback` 子对象与 `/automode` 会话计数,降级调用仍由人工裁决,fail-closed 的 deny 照旧;enforce 模式**全权裁决**(de novo),唯一例外:降级 deny 不可被翻成自动 allow,转人工。fallback 调用失败或不可解析时,该级联调用转人工(非交互降级 deny)——该裁决的层级已失效,人工是下一级。审计顶层恒为第一层语义(`demoted: true` 标记降级),生效裁决在 `fallback.effective`(仅 enforce 行)。jev 侧 confidence 为硬要求(契约保证,缺失即 fail-closed)。
+**Block reason**:
+The agent-facing text of a blocked call: a tag, a fixed statement that the action did not run, and the detail.
+Rules: [PR-2](docs/adjudication-rules.md#pr-2-block-reason)
 
-### 子代理门禁 (subagent gate)
+**Block tag**:
+The label in a block reason that names the kind of block, such as `rule` or `yolo-retry`.
+Rules: [PR-2](docs/adjudication-rules.md#pr-2-block-reason)
 
-仅 omp:子代理会话无自带 UI,其 ask 由 `subagentGate` 决定去向——`off`(默认)子代理内门禁惰性;`normal` 呈现于根会话 UI(带子代理标签),`subagentAskTimeoutMs` 内无人应答或根无 UI 则「无人裁决」;`auto` 始终无人裁决。无人裁决时仅分类器产生的 ask 才咨询回退分类器,且只有其明确 allow 放行,其余一律 deny;protected-path、`.omp` 门禁及仅因 `mode: "noAutoDeny"` 产生的 ask 永远 deny。
+**Ask dialog**:
+The confirmation dialog with Yes, No and Explain… through which a human answers an ask.
+Rules: [PR-4](docs/adjudication-rules.md#pr-4-ask-dialog), [PP-9](docs/adjudication-rules.md#pp-9-no-explain-for-gate-asks)
+
+**Decline reason**:
+The text a user types into the No row, forwarded to the agent in the block reason.
+Rules: [PR-4](docs/adjudication-rules.md#pr-4-ask-dialog)
+
+**EXPLAIN-GATE role**:
+The model role behind Explain…, producing an explanation for the human only.
+Rules: [PR-5](docs/adjudication-rules.md#pr-5-explain-gate)
+
+**Verdict notification**:
+A user-facing message about a verdict; deny blocks always produce one, allows only when enabled.
+Rules: [PR-3](docs/adjudication-rules.md#pr-3-notifications)
+
+**Verdict label**:
+The status row recorded after an allowed call, naming how it passed.
+Rules: [PR-7](docs/adjudication-rules.md#pr-7-verdict-label)
+
+**Status widget**:
+The one-row live indicator shown while a model call or an approval is pending.
+Rules: [PR-6](docs/adjudication-rules.md#pr-6-status-widget)
+
+**Footer**:
+The status display of the gate's mode, models and verdict counters.
+Rules: [PR-8](docs/adjudication-rules.md#pr-8-verdict-counters)
+
+**Mode chip**:
+The compact approval-mode badge in the prompt status bar.
+Rules: [MD-6](docs/adjudication-rules.md#md-6-setting-a-mode)
+
+### Observability
+
+**Verdict audit log**:
+The opt-in per-session JSONL record of gray-zone and gate adjudications.
+Rules: [AU-1](docs/adjudication-rules.md#au-1-audit-scope), [AU-2](docs/adjudication-rules.md#au-2-top-level-semantics), [AU-4](docs/adjudication-rules.md#au-4-observe-only-and-fail-soft)
+
+**Ground truth**:
+The user's answer to an interactive ask, stored on its audit record.
+Rules: [AU-3](docs/adjudication-rules.md#au-3-interactive-asks)
+
+**Shadow cache**:
+The observe-only cache that measures how often a gray call would repeat an earlier verdict and never supplies one.
+Rules: [AU-5](docs/adjudication-rules.md#au-5-shadow-cache)
+
+### Configuration
+
+**agentDir**:
+The host's agent directory under which the gate keeps its config, trust store, session overrides and audit logs.
+Rules: [CF-1](docs/adjudication-rules.md#cf-1-agentdir-resolution)
+
+**Self-anchoring**:
+Deriving agentDir from the extension's own install path instead of probing the host tree.
+Rules: [CF-1](docs/adjudication-rules.md#cf-1-agentdir-resolution)
+
+**Scope**:
+A layer a setting can be stored in: `session`, `local`, `global`, or the built-in default.
+Rules: [CF-5](docs/adjudication-rules.md#cf-5-session-scope)
+
+**Global scope**:
+The user config file under agentDir.
+_Avoid_: user scope
+Rules: [CF-2](docs/adjudication-rules.md#cf-2-user-file)
+
+**Local scope**:
+The trusted project's config file.
+_Avoid_: project scope
+Rules: [CF-3](docs/adjudication-rules.md#cf-3-project-discovery-and-trust), [CF-4](docs/adjudication-rules.md#cf-4-merge-semantics)
+
+**Session scope**:
+The overrides of one session, stored per session id.
+Rules: [CF-5](docs/adjudication-rules.md#cf-5-session-scope)
+
+**Session override**:
+A setting stored in session scope.
+Rules: [CF-5](docs/adjudication-rules.md#cf-5-session-scope)
+
+**Rule additions**:
+The entries a session appends to the merged allow, deny, denyPaths, tools and rules lists.
+Rules: [CF-5](docs/adjudication-rules.md#cf-5-session-scope)
+
+**Project trust**:
+The user's recorded decision whether a project's config may be applied.
+Rules: [CF-3](docs/adjudication-rules.md#cf-3-project-discovery-and-trust)
+
+**Model role**:
+A named omp model assignment the gate reads: `judge`, `verdict-fallback` or `explain-gate`.
+Rules: [CL-2](docs/adjudication-rules.md#cl-2-classifier-model-resolution), [CS-5](docs/adjudication-rules.md#cs-5-fallback-resolution-and-budget), [PR-5](docs/adjudication-rules.md#pr-5-explain-gate)
+
+**Rule generator**:
+The `/rule` command that drafts a rule from a description and checks it against recent history.
+Rules: [RG-1](docs/adjudication-rules.md#rg-1-transcript-only), [RG-2](docs/adjudication-rules.md#rg-2-attempts-and-feedback), [RG-3](docs/adjudication-rules.md#rg-3-history-replay-and-critic)
+
+### Subagents
+
+**Subagent gate**:
+The omp-only setting that decides whether and how the gate applies to subagent sessions.
+Rules: [SG-1](docs/adjudication-rules.md#sg-1-identity-and-off), [SG-2](docs/adjudication-rules.md#sg-2-normal), [SG-3](docs/adjudication-rules.md#sg-3-auto)
+
+**Resolution without a human**:
+The settling of an ask when nobody answers it, in which only an explicit fallback allow permits the call.
+_Avoid_: auto-resolve (as a noun)
+Rules: [SG-4](docs/adjudication-rules.md#sg-4-resolution-without-a-human), [SG-5](docs/adjudication-rules.md#sg-5-never-auto-allowed)
