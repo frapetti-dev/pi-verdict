@@ -266,8 +266,8 @@ export type PercentKey = (typeof PERCENT_KEYS)[number];
 export const APPROVAL_KEYS = ["mode", ...PERCENT_KEYS, "yoloDenyPaths", "yoloOmpDir", "classifierFallbackMode"] as const;
 export type ApprovalKey = (typeof APPROVAL_KEYS)[number];
 export type SettingSource = "session" | "local" | "global" | "default";
-/** Keys a session override may carry: the approval keys plus the two switches the `/verdict` menu edits per session. */
-export const SESSION_KEYS = [...APPROVAL_KEYS, "gateOmpDir", "footer"] as const;
+/** Keys a session override may carry: the approval keys plus the three switches the `/verdict` menu edits per session. */
+export const SESSION_KEYS = [...APPROVAL_KEYS, "gateOmpDir", "footer", "modeStatus"] as const;
 export type SessionKey = (typeof SESSION_KEYS)[number];
 const isSessionKey = (k: string): k is SessionKey => (SESSION_KEYS as readonly string[]).includes(k);
 const EDITABLE_LIST_KEYS = ["allow", "deny", "denyPaths", "tools", "rules"] as const;
@@ -342,9 +342,11 @@ interface UserRules {
 	subagentAskTimeoutMs: number;
 	/** Footer status style: "full" = Nerd Font powerline blocks, "compact" = plain one-line text, "off" = no status. Default "full". */
 	footer: "full" | "compact" | "off";
+	/** Approval-mode chip ("🛡 AUTO" …) in the prompt status bar (omp: the status line's `status` segment). Default true. Not shown while the footer itself is rendered into that bar (pi with footer on). Config key: "modeStatus". */
+	modeStatus: boolean;
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", confidenceThreshold: null, defaultDenyThreshold: null, defaultAllowThreshold: null, yoloDenyThreshold: null, noAutoDenyAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierRules: [] };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", modeStatus: true, confidenceThreshold: null, defaultDenyThreshold: null, defaultAllowThreshold: null, yoloDenyThreshold: null, noAutoDenyAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierRules: [] };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -579,7 +581,7 @@ function pruneSessionOverrides(): void {
 const DEFAULT_ALLOWED_TOOLS = ["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"];
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: default (deny/ask/allow) | yolo (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | noAutoDeny (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. defaultDenyThreshold/defaultAllowThreshold, yoloDenyThreshold, noAutoDenyAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). yoloDenyPaths/yoloOmpDir (deny|allow): what yolo does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status).",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: default (deny/ask/allow) | yolo (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | noAutoDeny (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. defaultDenyThreshold/defaultAllowThreshold, yoloDenyThreshold, noAutoDenyAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). yoloDenyPaths/yoloOmpDir (deny|allow): what yolo does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status). modeStatus (default true): approval-mode chip (🛡 AUTO/YOLO/…) in the prompt status bar — on omp it appears in the status line's \"status\" segment; hidden on pi while the footer is on (the footer already shows the mode).",
 	allow: ["^ls\\b"],
 	deny: [],
 	tools: DEFAULT_ALLOWED_TOOLS,
@@ -601,6 +603,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	audit: false,
 	notifyAllows: false,
 	footer: "full",
+	modeStatus: true,
 	confidenceThreshold: null,
 	defaultDenyThreshold: null,
 	defaultAllowThreshold: null,
@@ -705,8 +708,11 @@ function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[])
 	const footer = session.footer;
 	const footerOk = footer === "full" || footer === "compact" || footer === "off";
 	if (footer !== undefined && !footerOk) skipped.push(`footer: ${JSON.stringify(footer)}`);
+	let modeStatus = true;
+	if (typeof session.modeStatus === "boolean") modeStatus = session.modeStatus;
+	else if (session.modeStatus !== undefined) skipped.push(`modeStatus: ${JSON.stringify(session.modeStatus)}`);
 	return {
-		rules: { ...EMPTY_RULES, ...parseApprovalKeys(session, skipped), classifierFallbackMode: fbMode === "enforce" ? "enforce" : "shadow", gateOmpDir, footer: footerOk ? footer : EMPTY_RULES.footer },
+		rules: { ...EMPTY_RULES, ...parseApprovalKeys(session, skipped), classifierFallbackMode: fbMode === "enforce" ? "enforce" : "shadow", gateOmpDir, modeStatus, footer: footerOk ? footer : EMPTY_RULES.footer },
 		skipped,
 		shortcutWarning: null,
 		project: null,
@@ -834,6 +840,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 		const footerOk = footerRaw === "full" || footerRaw === "compact" || footerRaw === "off";
 		if (footerRaw !== undefined && !footerOk) skipped.push(`footer: ${JSON.stringify(footerRaw)}`);
 		if (raw.gateOmpDir !== undefined && typeof raw.gateOmpDir !== "boolean") skipped.push(`gateOmpDir: ${JSON.stringify(raw.gateOmpDir)}`);
+		if (raw.modeStatus !== undefined && typeof raw.modeStatus !== "boolean") skipped.push(`modeStatus: ${JSON.stringify(raw.modeStatus)}`);
 		const sgRaw = raw.subagentGate;
 		const sgOk = sgRaw === "off" || sgRaw === "normal" || sgRaw === "auto";
 		if (sgRaw !== undefined && !sgOk) skipped.push(`subagentGate: ${JSON.stringify(sgRaw)}`);
@@ -848,6 +855,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 				tools,
 				builtinDenyFloor: raw.builtinDenyFloor !== false,
 				gateOmpDir: raw.gateOmpDir !== false,
+				modeStatus: raw.modeStatus !== false,
 				classifierModel: typeof raw.classifierModel === "string" && raw.classifierModel.trim() ? raw.classifierModel.trim() : null,
 				explainGateModel: typeof raw.explainGateModel === "string" && raw.explainGateModel.trim() ? raw.explainGateModel.trim() : null,
 				explainGatePrompt: typeof raw.explainGatePrompt === "string" && raw.explainGatePrompt.trim() ? raw.explainGatePrompt.trim() : null,
@@ -2402,7 +2410,7 @@ const ENUM_VALUES: Partial<Record<SessionKey, readonly string[]>> = {
 };
 
 /** What a key means when no scope sets it (global scope shows these instead of `inherit`). */
-const MENU_DEFAULTS: Partial<Record<SessionKey, string>> = { mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierFallbackMode: "shadow", gateOmpDir: "on", footer: "full" };
+const MENU_DEFAULTS: Partial<Record<SessionKey, string>> = { mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierFallbackMode: "shadow", gateOmpDir: "on", footer: "full", modeStatus: "on" };
 
 /** One-line meaning of each enum value, shown under the selected row (`inherit` and percent values are composed by the controller). */
 const VALUE_MEANING: Record<string, Record<string, string>> = {
@@ -2417,6 +2425,7 @@ const VALUE_MEANING: Record<string, Record<string, string>> = {
 	classifierFallbackMode: { shadow: "shadow — the second model only records its opinion", enforce: "enforce — the second model decides" },
 	gateOmpDir: { on: "on — ask before any .omp directory access (default)", off: "off — no forced gate on .omp directories" },
 	footer: { full: "full — Nerd Font powerline blocks (default)", compact: "compact — plain one-line text", off: "off — no footer status" },
+	modeStatus: { on: "on — mode chip in the prompt status bar (default; hidden on pi while the footer is on)", off: "off — no mode chip in the prompt status bar" },
 };
 
 /** What each percent key does when set (the value `off` disables it). */
@@ -2428,11 +2437,11 @@ const PERCENT_MEANING: Record<PercentKey, string> = {
 	noAutoDenyAllowThreshold: "noAutoDeny mode: jev allow probability needed to allow (otherwise ask)",
 };
 
-/** Percent keys store a number, `null` = off; enum keys store their string; gateOmpDir stores a boolean. Parse a menu value back; `undefined` = inherit (drop the key), `"invalid"` = not a value. */
+/** Percent keys store a number, `null` = off; enum keys store their string; gateOmpDir/modeStatus store a boolean. Parse a menu value back; `undefined` = inherit (drop the key), `"invalid"` = not a value. */
 export function parseMenuValue(key: SessionKey, text: string): unknown | "invalid" {
 	const t = text.trim();
 	if (t === "inherit") return undefined;
-	if (key === "gateOmpDir") return t === "on" ? true : t === "off" ? false : "invalid";
+	if (key === "gateOmpDir" || key === "modeStatus") return t === "on" ? true : t === "off" ? false : "invalid";
 	const values = ENUM_VALUES[key];
 	if (values) return values.includes(t) ? t : "invalid";
 	if (t === "off") return null;
@@ -3987,7 +3996,7 @@ export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full"
 	return parts.join(theme.fg("dim", " · "));
 }
 
-/** Prompt status-bar chip of the approval mode (omp strips ANSI from setStatus; the text stays readable). */
+/** Prompt status-bar chip of the approval mode, published by `refreshStatus` unless `modeStatus` is off (omp strips ANSI from setStatus; the text stays readable). */
 export function modeStatusText(mode: ApprovalMode, theme: Pick<Theme, "fg">): string {
 	const chip = {
 		default: { color: "success", text: "🛡 AUTO" },
@@ -3998,7 +4007,7 @@ export function modeStatusText(mode: ApprovalMode, theme: Pick<Theme, "fg">): st
 	return theme.fg(chip[mode].color, chip[mode].text);
 }
 
-/** Status-bar key of the mode chip (separate from the footer's "auto-mode" key). */
+/** Status-bar key of the mode chip (separate from the footer's "auto-mode" key); controlled by the `modeStatus` switch. */
 const MODE_STATUS_KEY = "verdict-mode";
 
 /** omp model roles pi-verdict reads: `judge` is omp's built-in role (gray-zone classifier); the other two are custom chat roles (listed in `/model` → Roles when assigned or tagged via omp's `modelTags`). */
@@ -4236,10 +4245,12 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	function refreshStatus(ctx: ExtensionContext): void {
 		const style = state.userRules.footer;
 		const text = style === "off" ? undefined : renderFooter(footerInfo(ctx), ctx.ui.theme, style);
-		// The mode chip rides the prompt status bar only when the footer is off; with the footer on (status bar on pi, below-editor
-		// widget on omp) the footer already shows the mode, so a chip would duplicate it.
-		ctx.ui.setStatus(MODE_STATUS_KEY, style === "off" ? modeStatusText(state.userRules.mode, ctx.ui.theme) : undefined);
-		if (isOmpHost && typeof ctx.ui.setWidget === "function") {
+		const footerAsWidget = isOmpHost && typeof ctx.ui.setWidget === "function";
+		// The mode chip rides the prompt status bar (omp: the status line's `status` segment) when modeStatus is on, except while the
+		// footer itself is rendered into that bar (pi, footer on): there the footer's lead chip already shows the mode.
+		const footerInStatusBar = style !== "off" && !footerAsWidget;
+		ctx.ui.setStatus(MODE_STATUS_KEY, state.userRules.modeStatus && !footerInStatusBar ? modeStatusText(state.userRules.mode, ctx.ui.theme) : undefined);
+		if (footerAsWidget) {
 			ctx.ui.setStatus("auto-mode", undefined);
 			ctx.ui.setWidget(FOOTER_WIDGET_KEY, text === undefined ? undefined : [text], { placement: "belowEditor" });
 			return;
@@ -4582,7 +4593,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		session: "Added for this session only; appended to the local/global list.",
 	};
 
-	/** /verdict menu: list pages (allow/deny/tools/denyPaths/classifier rules), the gateOmpDir + footer switches and omp custom roles, at global / local / session scope. */
+	/** /verdict menu: list pages (allow/deny/tools/denyPaths/classifier rules), the gateOmpDir / footer / modeStatus switches and omp custom roles, at global / local / session scope. */
 	async function openVerdictMenu(ctx: ExtensionContext, initial: MenuScope): Promise<void> {
 		const mods = typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
 		if (!mods) {
@@ -4650,11 +4661,12 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			return true;
 		};
 
-		const switchRow = (scope: MenuScope, key: "gateOmpDir" | "footer", label: string): MenuRow => {
+		const switchRow = (scope: MenuScope, key: "gateOmpDir" | "footer" | "modeStatus", label: string): MenuRow => {
 			const raw = storedAt(scope, localFile);
 			const stored = raw[key];
-			const base = key === "gateOmpDir" ? ["on", "off"] : (ENUM_VALUES.footer as readonly string[]);
-			const valid = stored === undefined || (key === "gateOmpDir" ? typeof stored === "boolean" : typeof stored === "string" && base.includes(stored));
+			const isBool = key !== "footer";
+			const base = isBool ? ["on", "off"] : (ENUM_VALUES.footer as readonly string[]);
+			const valid = stored === undefined || (isBool ? typeof stored === "boolean" : typeof stored === "string" && base.includes(stored));
 			return {
 				kind: "choice",
 				id: key,
@@ -4686,7 +4698,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 							info: () => [{ tone: "text", text: `${LIST_KEY_DESC[key][0]!.toUpperCase()}${LIST_KEY_DESC[key].slice(1)}` }, { tone: "muted", text: LIST_SCOPE_LINE[scope] }, ...untrustedWarn(scope)],
 						});
 					}
-					rows.push({ kind: "section", label: "switches" }, switchRow(scope, "gateOmpDir", ".omp gate"), switchRow(scope, "footer", "footer"));
+					rows.push({ kind: "section", label: "switches" }, switchRow(scope, "gateOmpDir", ".omp gate"), switchRow(scope, "footer", "footer"), switchRow(scope, "modeStatus", "mode in status bar"));
 					if (rolesTarget) {
 						const rc = readOmpConfig(rolesTarget.file, rolesTarget.yaml);
 						const readError = "error" in rc ? rc.error : null;
@@ -4745,7 +4757,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					if (rolesTarget && (value === "on" || value === "off")) pendingOps.push(applyRoleTags(ctx, rolesTarget, value === "on"));
 					return;
 				}
-				if (id === "gateOmpDir" || id === "footer") applySetting(ctx, scope, id, value, localFile);
+				if (id === "gateOmpDir" || id === "footer" || id === "modeStatus") applySetting(ctx, scope, id, value, localFile);
 			},
 			action: (scope, id) => {
 				if (id.startsWith("unset:")) saveList(scope, id.slice("unset:".length) as EditableListKey, undefined);
@@ -4819,7 +4831,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	});
 
 	pi.registerCommand("verdict", {
-		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch, footer style, omp custom roles) in a settings menu: /verdict [global|local|session]",
+		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch, footer style, modeStatus switch, omp custom roles) in a settings menu: /verdict [global|local|session]",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("pi-verdict: /verdict needs an interactive UI", "warning");

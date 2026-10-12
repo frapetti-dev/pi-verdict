@@ -147,7 +147,7 @@ const clearAudit = () => fs.rmSync(VERDICTS(), { recursive: true, force: true })
 beforeAll(() => { process.env.PI_CODING_AGENT_DIR = TMP_AGENT; });
 afterAll(() => { delete process.env.PI_CODING_AGENT_DIR; });
 
-function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; explainGateModel?: string | null; explainGatePrompt?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; footer?: unknown; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; confidenceThreshold?: unknown; classifierFallbackMode?: unknown; mode?: unknown; autoDeny?: unknown; defaultDenyThreshold?: unknown; defaultAllowThreshold?: unknown; yoloDenyThreshold?: unknown; noAutoDenyAllowThreshold?: unknown; yoloDenyPaths?: unknown; yoloOmpDir?: unknown; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
+function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; explainGateModel?: string | null; explainGatePrompt?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; footer?: unknown; modeStatus?: unknown; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; confidenceThreshold?: unknown; classifierFallbackMode?: unknown; mode?: unknown; autoDeny?: unknown; defaultDenyThreshold?: unknown; defaultAllowThreshold?: unknown; yoloDenyThreshold?: unknown; noAutoDenyAllowThreshold?: unknown; yoloDenyPaths?: unknown; yoloOmpDir?: unknown; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
 	fs.rmSync(path.join(TMP_AGENT, "config", "pi-verdict-sessions"), { recursive: true, force: true }); // session overrides never leak between tests
 	config = { allow: cfg.allow ?? [], deny: cfg.deny ?? [] };
 	const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
@@ -167,6 +167,7 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 	if (cfg.classifierFallbackMode !== undefined) raw.classifierFallbackMode = cfg.classifierFallbackMode;
 	for (const k of ["mode", "autoDeny", "defaultDenyThreshold", "defaultAllowThreshold", "yoloDenyThreshold", "noAutoDenyAllowThreshold", "yoloDenyPaths", "yoloOmpDir"] as const) if (cfg[k] !== undefined) raw[k] = cfg[k];
 	if (cfg.footer !== undefined) raw.footer = cfg.footer;
+	if (cfg.modeStatus !== undefined) raw.modeStatus = cfg.modeStatus;
 	if (cfg.subagentGate !== undefined) raw.subagentGate = cfg.subagentGate;
 	if (cfg.subagentAskTimeoutMs !== undefined) raw.subagentAskTimeoutMs = cfg.subagentAskTimeoutMs;
 	// denyPaths (ADR-0002): unknown[] lets negative tests mix in non-string entries
@@ -2649,7 +2650,7 @@ describe("/verdict omp custom roles", () => {
 	const TAGS = { "verdict-fallback": { name: "VERDICT FALLBACK" }, "explain-gate": { name: "EXPLAIN GATE" } };
 	const parse = (file: string): any => Bun.YAML.parse(fs.readFileSync(file, "utf8"));
 	const { DOWN, ENTER, LEFT, RIGHT, ESC } = MENU;
-	const ROLES_ROW = times(7, DOWN); // five lists, .omp gate, footer, then custom roles
+	const ROLES_ROW = times(8, DOWN); // five lists, .omp gate, footer, mode in status bar, then custom roles
 	async function open(h: Harness, dir: string, keys: string[], rendered: string[] = [], after: string[] = []): Promise<void> {
 		h.ompAgentDir = dir;
 		await h.handlers.session_start({}, h.ctx);
@@ -3105,12 +3106,13 @@ describe("footer status", () => {
 		expect(w[1]![0]).toContain("\uF132 AUTO");
 		expect(opts).toEqual({ placement: "belowEditor" });
 		expect(omp.statusSets.filter(([k]) => k === "auto-mode").every(([, t]) => t === undefined)).toBe(true); // no duplicate plain line
-		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined(); // omp with the footer on: the widget already shows the mode, no chip
+		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 AUTO"); // omp: the footer is a below-editor widget, so the powerbar chip is shown (modeStatus on)
 		await omp.commands.automode.handler("yolo", omp.ctx);
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("YOLO");
-		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined();
+		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 YOLO");
 		await omp.commands.automode.handler("off", omp.ctx);
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("AUTO OFF");
+		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 OFF · ungated");
 
 		const pi = session({});
 		await pi.handlers.session_start({}, pi.ctx);
@@ -3126,6 +3128,51 @@ describe("footer status", () => {
 		await omp.handlers.session_start({}, omp.ctx);
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)).toEqual(["auto-mode", undefined]);
 		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)).toEqual(["verdict-mode", "🛡 AUTO"]); // footer off: the chip is the only indicator
+	});
+
+	test("modeStatus:false hides the powerbar chip on omp and with the footer off", async () => {
+		setConfig({ modeStatus: false });
+		const omp = makeHarness("/proj");
+		omp.install({ ompHost: true });
+		omp.ctx.ui.theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s, getBgAnsi: () => "\x1b[48;2;1;2;3m", getFgAnsi: () => "\x1b[38;2;4;5;6m" };
+		omp.ctx.ui.setWidget = (key: string, content: string[] | undefined) => { omp.widgetSets.push([key, content]); };
+		await omp.handlers.session_start({}, omp.ctx);
+		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined();
+		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("AUTO");
+
+		const off = session({ footer: "off", modeStatus: false });
+		await off.handlers.session_start({}, off.ctx);
+		expect(off.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined();
+	});
+
+	test("invalid modeStatus is reported and the chip stays on", async () => {
+		const h = session({ footer: "off", modeStatus: "yes" });
+		await h.handlers.session_start({}, h.ctx);
+		expect(h.notifies.some(([m]) => m.includes('modeStatus: "yes"'))).toBe(true);
+		expect(h.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 AUTO");
+	});
+
+	test("/verdict modeStatus edit persists and redraws immediately", async () => {
+		const h = session({ footer: "off", modeStatus: false });
+		await h.handlers.session_start({}, h.ctx);
+		driveMenu(h, [...times(7, MENU.DOWN), MENU.LEFT]); // mode-in-status-bar row: off → on
+		await h.commands.verdict.handler("", h.ctx);
+		expect(JSON.parse(fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8")).modeStatus).toBe(true);
+		expect(h.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 AUTO");
+	});
+
+	test("session scope overrides the user config for modeStatus", async () => {
+		const dir = path.join(TMP_AGENT, "config", "pi-verdict-sessions");
+		const file = path.join(dir, "s1.json");
+		const h = session({ footer: "off" });
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(file, JSON.stringify({ modeStatus: false }));
+		try {
+			await h.handlers.session_start({}, h.ctx);
+			expect(h.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined();
+		} finally {
+			fs.rmSync(file, { force: true });
+		}
 	});
 
 	test("/verdict footer edit persists and redraws immediately", async () => {
