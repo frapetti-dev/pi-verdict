@@ -1157,6 +1157,9 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 		// effective target, so user rules and denyPaths compare against it (#48)
 		const p = typeof input.path === "string" ? input.path : undefined;
 		base = p ? classifyPath(toolName, p, cwd, false, user.builtinDenyFloor) : { verdict: "allow" };
+	} else if (toolName === SETTINGS_TOOL_NAME) {
+		// RL-8: the tool confirms every change with the user itself; no target, so user rules/denyPaths never apply
+		base = { verdict: "allow", reason: "pi-verdict settings tool (confirms every change with the user)" };
 	} else if (user.tools.includes(toolName)) {
 		base = { verdict: "allow", reason: "user tools allow rule" };
 	} else {
@@ -2943,6 +2946,85 @@ export function validateRule(kind: EditableListKey, value: string): { value: str
 	if ("error" in n) return n;
 	if (kind === "tools" && toolKind(n.value) !== null) return { error: `${n.value} takes a path or command — gate it with allow/deny regexes, not tools` };
 	return { value: n.value };
+}
+
+// ============================================================================
+// Settings tool (ST-1–ST-5): pure validation
+// ============================================================================
+
+export const SETTINGS_TOOL_NAME = "verdict_settings";
+export const SETTINGS_TOOL_KEYS = [
+	"allow", "deny", "denyPaths", "tools", "rules",
+	"builtinDenyFloor", "gateOmpDir", "mode", "yoloDenyPaths", "yoloOmpDir",
+	"confidenceThreshold", "defaultDenyThreshold", "defaultAllowThreshold", "yoloDenyThreshold", "noAutoDenyAllowThreshold",
+	"classifierModel", "classifierFallbackModel", "classifierFallbackMode", "explainGateModel", "explainGatePrompt",
+	"toggleShortcut", "audit", "notifyAllows", "subagentGate", "subagentAskTimeoutMs", "footer", "modeStatus", "rootRule",
+] as const;
+export type SettingsToolKey = (typeof SETTINGS_TOOL_KEYS)[number];
+export const SETTINGS_TOOL_ACTIONS = ["get", "set", "unset", "add", "remove"] as const;
+const isListKey = (k: string): k is EditableListKey => (EDITABLE_LIST_KEYS as readonly string[]).includes(k);
+
+const SETTINGS_BOOLEAN_KEYS: readonly string[] = ["builtinDenyFloor", "gateOmpDir", "audit", "notifyAllows", "modeStatus"];
+const SETTINGS_ENUMS: Record<string, readonly string[]> = {
+	mode: APPROVAL_MODES,
+	yoloDenyPaths: ["deny", "allow"],
+	yoloOmpDir: ["deny", "allow"],
+	classifierFallbackMode: ["shadow", "enforce"],
+	footer: ["full", "compact", "off"],
+	subagentGate: ["off", "normal", "auto"],
+};
+const SETTINGS_STRING_KEYS: readonly string[] = ["classifierModel", "classifierFallbackModel", "explainGateModel", "explainGatePrompt"];
+
+/** Validate a `set` value for the settings tool; returns the canonical value to store. Errors read `<key>: <why>`. */
+export function validateSettingValue(key: SettingsToolKey, value: unknown): { value: unknown } | { error: string } {
+	const bad = (why: string) => ({ error: `${key}: ${why}` });
+	if (isListKey(key)) {
+		if (!Array.isArray(value)) return bad("must be an array of strings");
+		const out: string[] = [];
+		for (const e of value) {
+			if (typeof e !== "string") return bad("every entry must be a string");
+			const v = validateRule(key, e);
+			if ("error" in v) return bad(v.error);
+			out.push(v.value);
+		}
+		return { value: out };
+	}
+	if (SETTINGS_BOOLEAN_KEYS.includes(key)) return typeof value === "boolean" ? { value } : bad("must be true or false");
+	const enumValues = SETTINGS_ENUMS[key];
+	if (enumValues) return typeof value === "string" && enumValues.includes(value) ? { value } : bad(`must be one of ${enumValues.join(", ")}`);
+	if ((PERCENT_KEYS as readonly string[]).includes(key)) {
+		if (value === null) return { value };
+		return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? { value } : bad("must be null or a number from 0 to 100");
+	}
+	if (SETTINGS_STRING_KEYS.includes(key)) {
+		if (value === null) return { value };
+		return typeof value === "string" && value.trim() ? { value: value.trim() } : bad("must be null or a non-empty string");
+	}
+	if (key === "toggleShortcut") {
+		if (value === null) return { value };
+		if (typeof value !== "string") return bad("must be null or a key string");
+		const r = resolveToggleShortcut(value);
+		return r.warning === null && r.key !== null ? { value } : bad(r.warning ?? "not a valid shortcut");
+	}
+	if (key === "subagentAskTimeoutMs") return typeof value === "number" && Number.isInteger(value) && value >= 1 ? { value } : bad("must be an integer >= 1");
+	if (key === "rootRule") {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return bad("must be an object");
+		const skipped: string[] = [];
+		const parsed = parseRootRule(value, skipped);
+		if (skipped.length > 0) return bad(`invalid fields: ${skipped.join("; ")}`);
+		if (parsed === null || (parsed.text ?? "").length > ROOT_RULE_MAX_CHARS) return bad(`text must be at most ${ROOT_RULE_MAX_CHARS} characters`);
+		return { value: parsed };
+	}
+	return bad("unsupported key");
+}
+
+/** Scope rules of the settings tool; returns the first violated one, or null. */
+export function settingScopeError(action: string, key: SettingsToolKey, scope: MenuScope, value: unknown): string | null {
+	if ((action === "add" || action === "remove") && !isListKey(key)) return "add/remove apply only to list keys (allow, deny, denyPaths, tools, rules)";
+	if (scope === "session" && !isSessionKey(key) && !isListKey(key) && key !== "rootRule") return `${key} cannot be set per session — use scope local or global`;
+	if (scope === "local" && key === "toggleShortcut") return "toggleShortcut is not overridable per project — use scope global";
+	if (action === "set" && key === "mode" && value === "off" && scope !== "session") return 'mode "off" is session-only';
+	return null;
 }
 
 interface RecentToolCall {
@@ -5613,6 +5695,148 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 		},
 	});
+
+	// ---- Agent settings tool (ST-1–ST-5): read settings, propose changes, the user always confirms ----
+
+	const settingsToolText = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
+	const settingsToolParameters = {
+		type: "object",
+		additionalProperties: false,
+		required: ["action"],
+		properties: {
+			action: { type: "string", enum: [...SETTINGS_TOOL_ACTIONS], description: "get = read settings (no approval); set/unset/add/remove = propose a change the user must approve" },
+			key: { type: "string", enum: [...SETTINGS_TOOL_KEYS], description: "setting key; get without key returns all" },
+			scope: { type: "string", enum: ["global", "local", "session"], description: "where the change is stored; required for changes, ignored by get" },
+			value: { description: "set: the full new value (JSON type per key); add/remove: one list entry string" },
+			reason: { type: "string", description: "why the change is needed; shown to the user; required for changes" },
+		},
+	};
+	const settingsToolDescription =
+		"Read pi-verdict (permission gate) settings or propose a change. Actions: get (read effective and per-scope values; no approval), set (replace a key's whole value), unset (drop a key at one scope), add/remove (one entry of a list key: allow, deny, denyPaths, tools, rules). " +
+		"Scopes: global = the user config; local = the project config (applied only when the project is trusted); session = this session only, highest precedence. " +
+		"Session scope takes only the approval keys (mode, thresholds, yoloDenyPaths, yoloOmpDir, classifierFallbackMode), gateOmpDir, footer, modeStatus and rootRule; on list keys it appends to the effective list. " +
+		"Every change opens a confirmation dialog for the user, so always give a clear `reason`; nothing is saved unless the user approves. denyPaths values are never returned (only a count). Not available in subagents.";
+
+	pi.registerTool({
+		name: SETTINGS_TOOL_NAME,
+		label: "Verdict settings",
+		description: settingsToolDescription,
+		promptSnippet: "Read pi-verdict gate settings or propose a change (every change needs the user's approval)",
+		parameters: settingsToolParameters,
+		...(isOmpHost ? { approval: "write" } : {}),
+		execute: async (_toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) => {
+			if (subagentIdentity(ctx) !== null) throw new Error("verdict_settings is not available in subagents — ask the user to make the change in the main session");
+			const action = params.action as (typeof SETTINGS_TOOL_ACTIONS)[number];
+			const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
+
+			if (action === "get") {
+				const keys: readonly SettingsToolKey[] = params.key === undefined ? SETTINGS_TOOL_KEYS : [params.key as SettingsToolKey];
+				const globalStored = storedAt("global", localFile);
+				const localStored = localFile === null ? {} : storedAt("local", localFile);
+				const settings = keys.map((key) => {
+					const rules = state.userRules as unknown as Record<string, unknown>;
+					const redact = (v: unknown) => (key === "denyPaths" && v !== undefined ? (Array.isArray(v) ? { redacted: true, count: v.length } : { redacted: true }) : v);
+					let effective: unknown;
+					if (key === "allow" || key === "deny") effective = state.userRules[key].map((r) => r.source);
+					else if (key === "rules") effective = state.userRules.classifierRules;
+					else effective = rules[key];
+					const g = redact(globalStored[key]);
+					const l = redact(localStored[key]);
+					let s: unknown;
+					if (isListKey(key)) {
+						const add = sessionAdditions(key);
+						s = add.length > 0 ? redact(add) : undefined;
+					} else s = state.sessionOverrides[key];
+					const source = s !== undefined ? "session" : l !== undefined && localFile !== null && projectTrusted(localFile) ? "local" : g !== undefined ? "global" : "default";
+					const entry: Record<string, unknown> = { key, effective: redact(effective), source };
+					if (g !== undefined) entry.global = g;
+					if (l !== undefined) entry.local = l;
+					if (s !== undefined) entry.session = s;
+					return entry;
+				});
+				const project = localFile === null ? null : { file: localFile, trusted: projectTrusted(localFile) };
+				return settingsToolText(JSON.stringify({ settings, project }, null, 2));
+			}
+
+			if (!ctx.hasUI) throw new Error("verdict_settings changes need the interactive UI to ask the user — none is available");
+			if (!(SETTINGS_TOOL_ACTIONS as readonly string[]).includes(action)) throw new Error(`unknown action: ${String(params.action)}`);
+			const key = params.key as SettingsToolKey | undefined;
+			const scope = params.scope as MenuScope | undefined;
+			const reason = typeof params.reason === "string" ? params.reason.trim() : "";
+			if (key === undefined) throw new Error(`key is required for ${action}`);
+			if (scope === undefined) throw new Error(`scope is required for ${action}`);
+			if (!reason) throw new Error(`reason is required for ${action}`);
+			if (reason.length > 500) throw new Error("reason must be at most 500 characters");
+			if (scope === "local" && localFile === null) throw new Error("no project config location here (cwd is your home dir or the agent tree root)");
+			const scopeErr = settingScopeError(action, key, scope, params.value);
+			if (scopeErr) throw new Error(scopeErr);
+
+			const notes: string[] = [];
+			const sessionList = scope === "session" && isListKey(key);
+			const stored = storedAt(scope, localFile);
+			const cur = sessionList ? sessionAdditions(key as EditableListKey) : [];
+			let before: unknown = sessionList ? (cur.length > 0 ? cur : undefined) : stored[key];
+			let after: unknown;
+			let noChange = false;
+
+			if (action === "set") {
+				const v = validateSettingValue(key, params.value);
+				if ("error" in v) throw new Error(v.error);
+				after = v.value;
+			} else if (action === "unset") {
+				if (before === undefined) throw new Error(`${key} is not set at ${scope} scope`);
+				after = undefined;
+			} else {
+				const listKey = key as EditableListKey;
+				if (typeof params.value !== "string") throw new Error(`value must be one list entry string for ${action}`);
+				const v = validateRule(listKey, params.value);
+				if ("error" in v) throw new Error(`${key}: ${v.error}`);
+				const strings = (x: unknown): string[] => (Array.isArray(x) ? x.filter((e): e is string => typeof e === "string") : []);
+				let base: string[];
+				if (sessionList) base = cur;
+				else if (scope === "global" || stored[key] !== undefined) base = strings(stored[key]);
+				else {
+					base = strings(storedAt("global", localFile)[key]);
+					notes.push(`The project list replaces the global one; it starts as a copy of the global list (${base.length} entries).`);
+				}
+				before = sessionList ? before : stored[key] !== undefined ? base : undefined;
+				const present = base.includes(v.value);
+				if (action === "add") {
+					if (present && key !== "denyPaths") throw new Error(`entry already present at ${scope} scope`);
+					after = present ? base : [...base, v.value];
+				} else {
+					if (!present && key !== "denyPaths") throw new Error(`entry not found at ${scope} scope`);
+					after = base.filter((e) => e !== v.value);
+				}
+				// denyPaths: no membership signal before the dialog (PP-6); a no-op is reported only after approval
+				noChange = key === "denyPaths" && (after as string[]).length === base.length;
+			}
+
+			if (scope === "local" && localFile !== null && !projectTrusted(localFile)) notes.push("Project not trusted: saved, but not applied until you trust this project.");
+			if (key === "toggleShortcut") notes.push("Takes effect after /reload or a new session.");
+			if (sessionList) notes.push("Session entries are appended to the effective list; they cannot remove global/local entries.");
+
+			const [beforeText, afterText] = [before, after].map((v) => (v === undefined ? "(not set)" : displaySafe(JSON.stringify(v, null, 2))));
+			const where = scope === "global" ? userConfigPath() : scope === "local" ? String(localFile) : "this session only";
+			const message = [`Scope: ${scope} — ${where}`, `Key: ${key}`, `Action: ${action}`, `Before: ${beforeText}`, `After: ${afterText}`, ...notes, `Agent's reason: ${displaySafe(reason)}`].join("\n");
+			let approved = false;
+			try {
+				approved = (await serializeDialog(() => ctx.ui.confirm("🛡️ pi-verdict: the agent wants to change a setting", message, signal ? { signal } : undefined))) === true;
+			} catch {
+				approved = false;
+			}
+			if (signal?.aborted) approved = false;
+			if (!approved) return settingsToolText("The user declined the change — nothing was saved.");
+			if (noChange) return settingsToolText("No change needed — the denyPaths list already has the requested content.");
+
+			if (sessionList) setSessionRuleAdditions(key as EditableListKey, after as string[] | undefined, ctx);
+			else {
+				const err = writeScoped(scope, key, after, localFile, ctx);
+				if (err) throw new Error(`could not save ${key} (${scope}): ${err}`);
+			}
+			return settingsToolText([`Saved: ${action} ${key} at ${scope} scope.`, ...notes].join("\n"));
+		},
+	} as unknown as Parameters<ExtensionAPI["registerTool"]>[0]);
 
 	let warnedClassifierModel = false;
 	/** 思考级别集(pi 原生 EXTENDED_THINKING_LEVELS;后缀语法对齐 pi --model provider/id:thinking) */

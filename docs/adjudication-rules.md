@@ -4,7 +4,7 @@ This document is the normative definition of pi-verdict's gate behavior. The key
 
 Each rule is a `####` heading followed by a normative statement, then `Why:` (the reason, with a link when the reason is a measurement), `Code:` (implementing symbols, no line numbers) and `Pinned by:` (the `describe › test` titles in `tests/` that assert the rule, or `unpinned`).
 
-Contents: [RL Rule layer](#rl-rule-layer) · [PG Path grading](#pg-path-grading) · [PP Protected paths and the forced .omp gate](#pp-protected-paths-and-the-forced-omp-gate) · [CL Classifier](#cl-classifier) · [JV jev adapter](#jv-jev-adapter) · [CS Confidence floor, mode thresholds, fallback cascade](#cs-confidence-floor-mode-thresholds-fallback-cascade) · [MD Approval modes](#md-approval-modes) · [PR Outcome and presentation](#pr-outcome-and-presentation) · [SG Subagent gate](#sg-subagent-gate) · [CF Configuration, scopes, trust](#cf-configuration-scopes-trust) · [AU Audit log and shadow cache](#au-audit-log-and-shadow-cache) · [RG Rule generator](#rg-rule-generator) · [RR Root rule](#rr-root-rule) · [Decision tables](#decision-tables)
+Contents: [RL Rule layer](#rl-rule-layer) · [PG Path grading](#pg-path-grading) · [PP Protected paths and the forced .omp gate](#pp-protected-paths-and-the-forced-omp-gate) · [CL Classifier](#cl-classifier) · [JV jev adapter](#jv-jev-adapter) · [CS Confidence floor, mode thresholds, fallback cascade](#cs-confidence-floor-mode-thresholds-fallback-cascade) · [MD Approval modes](#md-approval-modes) · [PR Outcome and presentation](#pr-outcome-and-presentation) · [SG Subagent gate](#sg-subagent-gate) · [CF Configuration, scopes, trust](#cf-configuration-scopes-trust) · [AU Audit log and shadow cache](#au-audit-log-and-shadow-cache) · [RG Rule generator](#rg-rule-generator) · [RR Root rule](#rr-root-rule) · [ST Settings tool](#st-settings-tool) · [Decision tables](#decision-tables)
 
 ## RL: Rule layer
 
@@ -18,7 +18,7 @@ Pinned by: denyPaths (PP-1–PP-9) › omitted path hits in both directions for 
 
 #### RL-2: Evaluation order
 
-The rule layer MUST evaluate a tool call in this order and stop at the first terminal result: (1) the built-in base (RL-5 danger rules for command tools, PG path grading for file tools); a deny here is terminal and nothing below can override it; (2) user `deny` regexes → deny; (3) the forced `.omp` gate (PP-8) → ask; (4) `denyPaths` (PP-5) → ask; (5) user `allow` regexes → allow; (6) the base result: a path-grading allow, a `tools` allowlist allow (RL-7), or gray (the call goes to the classifier, CL-1). Steps 2–5 run only when the call has a rule target (RL-3). Deny beats allow.
+The rule layer MUST evaluate a tool call in this order and stop at the first terminal result: (1) the built-in base (RL-5 danger rules for command tools, PG path grading for file tools); a deny here is terminal and nothing below can override it; (2) user `deny` regexes → deny; (3) the forced `.omp` gate (PP-8) → ask; (4) `denyPaths` (PP-5) → ask; (5) user `allow` regexes → allow; (6) the base result: a path-grading allow, a `tools` allowlist allow (RL-7), the settings-tool allow (RL-8), or gray (the call goes to the classifier, CL-1). Steps 2–5 run only when the call has a rule target (RL-3). Deny beats allow.
 
 Why: a protected path is the user's exception to their own allow rules ("not even my allow list may touch these"), and a hard deny must not depend on user configuration; deny-beats-allow follows the rule-layer audit ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md)).
 Code: `classifyByRules`
@@ -80,6 +80,14 @@ A `tools` entry is an exact, case-sensitive tool name. It applies only to tools 
 Why: MCP and custom tools default to the classifier; `tools` is the user's exact-name exception declaration, and the starter list holds only tools without side effects of their own (code comment on `UserRules.tools` and `DEFAULT_ALLOWED_TOOLS`).
 Code: `classifyByRules`, `UserRules.tools`, `DEFAULT_ALLOWED_TOOLS`
 Pinned by: denyPaths (PP-1–PP-9) › template ships the starter tools allowlist, active from the next session
+
+#### RL-8: Settings tool
+
+A call to the tool named `verdict_settings` is allowed by the rule layer with reason `pi-verdict settings tool (confirms every change with the user)`, without a classifier call and silently (PR-3). It sits where the `tools` allowlist sits (RL-2 step 6) and needs no `tools` entry. The tool has no rule target (RL-3), so user regexes, the `.omp` gate and `denyPaths` are not consulted for it.
+
+Why: the tool's own confirmation dialog is the human gate for every change (ST-2); a classifier call or a second gate prompt would only duplicate it.
+Code: `classifyByRules`, `SETTINGS_TOOL_NAME`
+Pinned by: settings tool (ST-1–ST-5) › tool call is a mechanical allow, no classifier call
 
 ## PG: Path grading
 
@@ -631,7 +639,7 @@ Pinned by: confidence floor + cascade (#67) › invalid confidenceThreshold warn
 
 #### CF-8: When changes take effect
 
-Hand edits of a config file apply at the next session start; `toggleShortcut` binds when the extension loads. Saves made through `/verdict`, `/rule` and `/automode` reload the rules immediately, re-anchor `denyPaths` (PP-1) and leave shadow-cache and fallback statistics untouched.
+Hand edits of a config file apply at the next session start; `toggleShortcut` binds when the extension loads. Saves made through `/verdict`, `/rule`, `/automode` and the settings tool (ST-5) reload the rules immediately, re-anchor `denyPaths` (PP-1) and leave shadow-cache and fallback statistics untouched.
 
 Why: hand edits stay deliberate and visible; menu edits must feel immediate.
 Code: `SessionState.reloadRules`, `SessionState.reset`
@@ -738,6 +746,48 @@ Generation makes at most 3 attempts. A candidate over 4000 characters, unparseab
 Why: the root rule steers every gray-zone verdict, so a human must accept it; the length limit bounds the prompt cost.
 Code: `generateRootRuleReviewed`, `critiqueRootRule`, `ROOT_RULE_MAX_CHARS`, `openRootRuleMenu`
 Pinned by: root rule (RR-1–RR-4) › critic revise feeds the next attempt; over-long draft is rejected; root rule (RR-1–RR-4) › /automode-setup: generate → review → save to session
+
+## ST: Settings tool
+
+#### ST-1: Actions and keys
+
+The tool `verdict_settings` takes `action` = `get`, `set`, `unset`, `add` or `remove`; `key` from `SETTINGS_TOOL_KEYS` (every config key except `_hint`); `scope` = `global`, `local` or `session`; `value`; and `reason`. `set` replaces a key's whole value and validates it like the config loader (lists via `validateRule`, booleans, enums, percent keys 0–100 or `null`, model and prompt strings, `toggleShortcut`, `subagentAskTimeoutMs` integer ≥ 1, `rootRule` object with no skipped fields); `unset` drops a key at one scope; `add`/`remove` take one entry of a list key (`allow`, `deny`, `denyPaths`, `tools`, `rules`). Scope rules, first violated one wins: `add`/`remove` apply only to list keys; `session` takes only `SESSION_KEYS`, list keys (entries are appended to the effective list) and `rootRule`; `toggleShortcut` is not overridable at `local`; `mode` `off` is session-only. `reason` is required for changes (at most 500 characters). Invalid input is rejected before any dialog.
+
+Why: one validation path means an approved change is always one the loader accepts; the per-scope limits mirror what the menus offer.
+Code: `SETTINGS_TOOL_KEYS`, `validateSettingValue`, `settingScopeError`
+Pinned by: settings tool (ST-1–ST-5) › invalid value is rejected before the dialog; settings tool (ST-1–ST-5) › mode off only at session scope
+
+#### ST-2: Confirmation
+
+Every change (`set`, `unset`, `add`, `remove`) opens a confirmation dialog in every approval mode, showing scope and file, key, action, the stored value before and after, notes and the agent's reason. Nothing is written unless the user approves; a decline, an aborted signal or a dialog error writes nothing and the tool reports the decline as a normal result.
+
+Why: agent-initiated policy changes weaken or tighten the gate the agent runs under, so the user decides every one (security principle 8); the dialog is the tool's own approval, not a gate ask, so yolo does not skip it.
+Code: the `execute` handler registered as `SETTINGS_TOOL_NAME` in `autoMode`
+Pinned by: settings tool (ST-1–ST-5) › approved set writes the global config; settings tool (ST-1–ST-5) › declined change writes nothing
+
+#### ST-3: Fail closed
+
+Calls from a subagent are refused. Changes are refused when there is no UI to ask the user; `get` still works without a UI.
+
+Why: nobody can approve a change from a subagent or a headless session, and a refused change is the safe outcome.
+Code: the `execute` handler registered as `SETTINGS_TOOL_NAME` in `autoMode`, `subagentIdentity`
+Pinned by: settings tool (ST-1–ST-5) › no UI refuses changes without a dialog; settings tool (ST-1–ST-5) › subagent call is refused
+
+#### ST-4: Plaintext
+
+`get` returns, per key, the effective value, its source and the stored value at each scope; `denyPaths` is reduced to `{redacted: true, count}`. For `denyPaths` `add`/`remove` there is no membership check before the dialog, and a no-op is reported only after approval, so the agent learns nothing about the list. Results never echo a stored value; the dialog shows `denyPaths` plaintext to the user only (PP-6).
+
+Why: the tool's output reaches the agent, and protected-path plaintext must not (PP-6).
+Code: the `execute` handler registered as `SETTINGS_TOOL_NAME` in `autoMode`
+Pinned by: settings tool (ST-1–ST-5) › get never returns denyPaths plaintext
+
+#### ST-5: Writes
+
+An approved change goes through the same writers as the menus (`writeScoped`, `setSessionRuleAdditions`) and takes effect immediately (CF-8). The first `local` list change on a key the project does not override starts from a copy of the global list, and the dialog says so. A change at `local` in a project that is not trusted is saved but not applied until the project is trusted (CF-3).
+
+Why: one writer per scope keeps menu and tool edits identical; the copy-first rule matches the project-replaces-global list semantics (CF-4).
+Code: `writeScoped`, `setSessionRuleAdditions`
+Pinned by: settings tool (ST-1–ST-5) › local add starts from a copy of the global list; settings tool (ST-1–ST-5) › session add to deny takes effect immediately
 
 ## Decision tables
 
