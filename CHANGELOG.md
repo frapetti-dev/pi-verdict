@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+
+- **Settings tool** `verdict_settings` ([ST-1](docs/adjudication-rules.md#st-1-actions-and-keys) to [ST-5](docs/adjudication-rules.md#st-5-writes)): an agent-callable tool, registered on pi and omp, with actions `get`, `set`, `unset`, `add` and `remove` over every config key except `_hint` at `global`, `local` or `session` scope (session takes the approval keys, `gateOmpDir`, `footer`, `modeStatus`, `rootRule` and list additions; `toggleShortcut` is global only; `mode: "off"` is session only). `get` returns the effective value, its source and the stored value per scope, and works without a UI; `denyPaths` is reduced to `{redacted: true, count}` and `denyPaths` `add`/`remove` give no membership signal before the dialog, so no protected path reaches the agent ([PP-6](docs/adjudication-rules.md#pp-6-plaintext-confinement)). Every change opens a confirmation dialog in every approval mode (including `yolo`) showing scope, key, action, before/after and the agent's `reason`; nothing is written unless the user approves, and a decline is a normal tool result. Values are validated like the config loader before the dialog, writes reuse `writeScoped` / `setSessionRuleAdditions` (a first `local` list change starts from a copy of the global list; an untrusted project is saved but not applied), and calls from subagents are refused, as are changes with no UI.
+
+### Changed
+
+- The rule layer allows calls to `verdict_settings` mechanically ([RL-8](docs/adjudication-rules.md#rl-8-settings-tool), [RL-2](docs/adjudication-rules.md#rl-2-evaluation-order) step 6): no classifier call, no user-regex, `.omp` gate or `denyPaths` check (the tool has no rule target), silent per PR-3; the tool's own confirmation dialog is the human gate.
+
 ## [0.19.0] - 2026-10-12
 
 ### Added

@@ -58,9 +58,9 @@ Enforced by: [PP-1](adjudication-rules.md#pp-1-declaration-normalization-and-anc
 
 ### 8. User policy may restrict, and may only weaken by explicit opt-in
 
-User rules are the user's own security declarations (deny beats allow; protected paths are the stronger declaration channel). The built-in deny floor *can* be turned off — but only by an explicit, documented `builtinDenyFloor: false` in a config the user controls, i.e. a deliberate downgrade the user owns, never a silent or accidental weakening. A project config cannot do so unless the user has trusted that project, and `off` mode exists only per session so no file can ungate the tool calls.
+User rules are the user's own security declarations (deny beats allow; protected paths are the stronger declaration channel). The built-in deny floor *can* be turned off — but only by an explicit, documented `builtinDenyFloor: false` in a config the user controls, i.e. a deliberate downgrade the user owns, never a silent or accidental weakening. A project config cannot do so unless the user has trusted that project, and `off` mode exists only per session so no file can ungate the tool calls. Agent-initiated policy changes go only through the `verdict_settings` tool, and every one needs the user's explicit approval in a confirmation dialog; the tool is refused in subagents and without a UI.
 
-Enforced by: [RL-2](adjudication-rules.md#rl-2-evaluation-order), [RL-6](adjudication-rules.md#rl-6-builtindenyfloor), [MD-2](adjudication-rules.md#md-2-off), [CF-3](adjudication-rules.md#cf-3-project-discovery-and-trust), [CF-4](adjudication-rules.md#cf-4-merge-semantics)
+Enforced by: [RL-2](adjudication-rules.md#rl-2-evaluation-order), [RL-6](adjudication-rules.md#rl-6-builtindenyfloor), [MD-2](adjudication-rules.md#md-2-off), [CF-3](adjudication-rules.md#cf-3-project-discovery-and-trust), [CF-4](adjudication-rules.md#cf-4-merge-semantics), [ST-2](adjudication-rules.md#st-2-confirmation), [ST-3](adjudication-rules.md#st-3-fail-closed)
 
 ### 9. Platform differences are documented, not silently weaker
 

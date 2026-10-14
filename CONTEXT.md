@@ -82,6 +82,10 @@ Rules: [RL-3](docs/adjudication-rules.md#rl-3-rule-target)
 The exact names of tools outside the command and file families that the user allows without the classifier.
 Rules: [RL-7](docs/adjudication-rules.md#rl-7-tools-allowlist)
 
+**Settings tool**:
+The agent-callable tool `verdict_settings` that reads the gate's settings and proposes changes to them; the rule layer allows it and the user confirms every change.
+Rules: [RL-8](docs/adjudication-rules.md#rl-8-settings-tool), [ST-1](docs/adjudication-rules.md#st-1-actions-and-keys), [ST-2](docs/adjudication-rules.md#st-2-confirmation)
+
 **Scope tool**:
 A file tool whose optional path defaults to the working directory and whose search covers a subtree: `grep`, `find`, `ls`.
 Rules: [RL-1](docs/adjudication-rules.md#rl-1-tool-families), [PP-3](docs/adjudication-rules.md#pp-3-matching)

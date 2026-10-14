@@ -17,6 +17,12 @@ import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
 const TMP_AGENT = fs.mkdtempSync(path.join(os.tmpdir(), "pi-verdict-test-"));
 let config: { allow: string[]; deny: string[] } = { allow: [], deny: [] };
 
+/** The part of a registered tool definition the tests drive. */
+interface ToolDefinitionStub {
+	name: string;
+	execute: (toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
+}
+
 interface Harness {
 	handlers: Record<string, any>;
 	commands: Record<string, any>;
@@ -55,6 +61,8 @@ interface Harness {
 	entries: Array<[string, any]>;
 	messageRenderers: Record<string, any>;
 	entryRenderers: Record<string, any>;
+	/** `pi.registerTool` definitions by name */
+	tools: Record<string, ToolDefinitionStub>;
 	install: (opts?: { verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }>; ompHost?: boolean }) => void;
 }
 
@@ -74,6 +82,8 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 	const entryRenderers: Record<string, any> = {};
 	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectTitles: [] as string[], selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined, roles: undefined, ompAgentDir: undefined, ompReloads: 0 };
 	h.widgetSets = widgetSets;
+	const tools: Record<string, ToolDefinitionStub> = {};
+	h.tools = tools;
 	const rolesEnabled = opts?.roles === true; // install()'s own `opts` shadows this function's
 
 	const ctx: any = {
@@ -126,6 +136,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 			getFlag: (n: string) => flags[n],
 			on: (e: string, fn: any) => { handlers[e] = fn; },
 			registerCommand: (n: string, c: any) => { commands[n] = c; },
+			registerTool: (t: ToolDefinitionStub) => { tools[t.name] = t; },
 			registerShortcut: (k: string, o: any) => { shortcuts[k] = o; },
 			registerMessageRenderer: (t: string, r: any) => { messageRenderers[t] = r; },
 			sendMessage: (message: any, options: any) => { sent.push({ message, options }); },
@@ -4767,5 +4778,95 @@ describe("root rule (RR-1–RR-4)", () => {
 		await h.commands["automode-setup"].handler("global", h.ctx);
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("enable history or codebase"))).toBe(true);
 		expect(h.calls).toHaveLength(0);
+	});
+});
+
+// ── Settings tool (ST-1–ST-5) ─────────────────────────────
+
+describe("settings tool (ST-1–ST-5)", () => {
+	const USER_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
+	const readUser = () => JSON.parse(fs.readFileSync(USER_FILE(), "utf8"));
+	const call = (h: Harness, params: Record<string, unknown>) => h.tools.verdict_settings.execute("t1", params, undefined, undefined, h.ctx);
+	async function open(cfg: Parameters<typeof setConfig>[0], opts: { cwd?: string } = {}): Promise<Harness> {
+		const h = session(cfg, opts);
+		await h.handlers.session_start({}, h.ctx);
+		return h;
+	}
+
+	test("tool call is a mechanical allow, no classifier call", async () => {
+		const h = await open({});
+		expect(await toolCall(h, "verdict_settings", { action: "get" })).toBeUndefined();
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("approved set writes the global config", async () => {
+		const h = await open({});
+		const r = await call(h, { action: "set", key: "audit", value: true, scope: "global", reason: "r" });
+		expect(h.confirms).toBe(1);
+		expect(readUser().audit).toBe(true);
+		expect(r.content[0].text.startsWith("Saved")).toBe(true);
+	});
+
+	test("declined change writes nothing", async () => {
+		const h = await open({});
+		h.confirmAnswer = false;
+		const r = await call(h, { action: "set", key: "audit", value: true, scope: "global", reason: "r" });
+		expect(h.confirms).toBe(1);
+		expect(readUser().audit).toBeUndefined();
+		expect(r.content[0].text).toContain("declined");
+	});
+
+	test("no UI refuses changes without a dialog", async () => {
+		const h = await open({});
+		h.ctx.hasUI = false;
+		await expect(call(h, { action: "set", key: "audit", value: true, scope: "global", reason: "r" })).rejects.toThrow("interactive UI");
+		expect(h.confirms).toBe(0);
+		expect(readUser().audit).toBeUndefined();
+	});
+
+	test("subagent call is refused", async () => {
+		const h = await open({});
+		h.ctx.agent = { kind: "sub", id: "a", name: "n", depth: 1 };
+		await expect(call(h, { action: "get" })).rejects.toThrow("not available in subagents");
+	});
+
+	test("invalid value is rejected before the dialog", async () => {
+		const h = await open({});
+		await expect(call(h, { action: "set", key: "defaultDenyThreshold", value: 150, scope: "global", reason: "r" })).rejects.toThrow("defaultDenyThreshold");
+		expect(h.confirms).toBe(0);
+	});
+
+	test("mode off only at session scope", async () => {
+		const h = await open({});
+		await expect(call(h, { action: "set", key: "mode", value: "off", scope: "global", reason: "r" })).rejects.toThrow("session-only");
+		expect(h.confirms).toBe(0);
+		await call(h, { action: "set", key: "mode", value: "off", scope: "session", reason: "r" });
+		expect(h.confirms).toBe(1);
+		expect(await toolCall(h, "bash", { command: "some-gray-cmd" })).toBeUndefined();
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("session add to deny takes effect immediately", async () => {
+		const h = await open({});
+		await call(h, { action: "add", key: "deny", value: "^curl\\b", scope: "session", reason: "r" });
+		expect((await toolCall(h, "bash", { command: "curl x" }))?.block).toBe(true);
+		expect(readUser().deny).toEqual([]);
+	});
+
+	test("local add starts from a copy of the global list", async () => {
+		await withTempDir("pv-settings-tool-", async (dir) => {
+			const h = await open({ allow: ["^ls\\b"] }, { cwd: dir });
+			await call(h, { action: "add", key: "allow", value: "^pwd\\b", scope: "local", reason: "r" });
+			const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
+			expect(JSON.parse(fs.readFileSync(path.join(dir, dot, "pi-verdict.json"), "utf8")).allow).toEqual(["^ls\\b", "^pwd\\b"]);
+			expect(h.confirmMsgs[0]).toContain("starts as a copy of the global list (1 entries)");
+		});
+	});
+
+	test("get never returns denyPaths plaintext", async () => {
+		const h = await open({ denyPaths: ["~/pv-secret-x"] });
+		const text = (await call(h, { action: "get", key: "denyPaths" })).content[0].text;
+		expect(text).not.toContain("pv-secret-x");
+		expect(text).toContain('"count": 1');
 	});
 });
