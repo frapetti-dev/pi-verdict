@@ -10,10 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ### Added
 
 - **Settings tool** `verdict_settings` ([ST-1](docs/adjudication-rules.md#st-1-actions-and-keys) to [ST-5](docs/adjudication-rules.md#st-5-writes)): an agent-callable tool, registered on pi and omp, with actions `get`, `set`, `unset`, `add` and `remove` over every config key except `_hint` at `global`, `local` or `session` scope (session takes the approval keys, `gateOmpDir`, `footer`, `modeStatus`, `rootRule` and list additions; `toggleShortcut` is global only; `mode: "off"` is session only). `get` returns the effective value, its source and the stored value per scope, and works without a UI; `denyPaths` is reduced to `{redacted: true, count}` and `denyPaths` `add`/`remove` give no membership signal before the dialog, so no protected path reaches the agent ([PP-6](docs/adjudication-rules.md#pp-6-plaintext-confinement)). Every change opens a confirmation dialog in every approval mode (including `yolo`) showing scope, key, action, before/after and the agent's `reason`; nothing is written unless the user approves, and a decline is a normal tool result. Values are validated like the config loader before the dialog, writes reuse `writeScoped` / `setSessionRuleAdditions` (a first `local` list change starts from a copy of the global list; an untrusted project is saved but not applied), and calls from subagents are refused, as are changes with no UI.
+- **Permission grants** ([GR-1](docs/adjudication-rules.md#gr-1-request-tool) to [GR-6](docs/adjudication-rules.md#gr-6-lifetime-revocation-and-visibility), [RL-9](docs/adjudication-rules.md#rl-9-grant-tool)): the agent-callable tool `verdict_grant` (`request`, `release`, `list`; mechanical allow in the rule layer) asks for a session-long, natural-language authorization, optionally with protected-path access entries (`{path, access: read|write|full}`). The user approves through a new dialog (I approve / I reject / ask for clarification or revision; no Explain…), or, in `yolo`, the judge classifier and a configured `classifierFallbackModel` must both allow. Active grants (at most 20, ids `G<n>` never reused) are part of the user policy block of every classifier and fallback prompt and are authoritative within their literal scope; protected-path entries are sent only to the grant coverage check, which runs before a `denyPaths` or `.omp` gate ask (and before the yolo outcome): every touched protected path must lie under a grant entry with a fitting access level, then the judge and fallback must both allow, otherwise the ask stands (the exception to [PP-6](docs/adjudication-rules.md#pp-6-plaintext-confinement); uncovered calls never reach a model; headless works too). Grants persist in the session file (`grants`), are listed and revoked with `/grants [list|revoke <id>|revoke all]` (a revocation messages the agent), and show in the footer (`\uF084 n` full, `🔑 n` compact) and, on omp, in the prompt status bar (`grantStatus`, default `true`, session scope; [CF-5](docs/adjudication-rules.md#cf-5-session-scope)). With no grants nothing renders.
 
 ### Changed
 
 - The rule layer allows calls to `verdict_settings` mechanically ([RL-8](docs/adjudication-rules.md#rl-8-settings-tool), [RL-2](docs/adjudication-rules.md#rl-2-evaluation-order) step 6): no classifier call, no user-regex, `.omp` gate or `denyPaths` check (the tool has no rule target), silent per PR-3; the tool's own confirmation dialog is the human gate.
+- Block reasons of tags `classifier`, `yolo-retry` and `user-declined` now end with ` If this action is required, request a permission grant with verdict_grant (describe the exact operation and scope).` ([PR-2](docs/adjudication-rules.md#pr-2-block-reason), [GR-6](docs/adjudication-rules.md#gr-6-lifetime-revocation-and-visibility)); rule, fail-closed, protected-path and subagent blocks are unchanged because a grant cannot lift them. The classifier system prompt's user policy block (`userRulesHint`, now `classifierPolicy` + `trustedPolicyBlock`) gains the active grants after the classification rules; output without grants is byte-identical.
+- `/verdict` gains a `grantStatus` switch row (default on, session-scopable), so the settings menu has one more row and the roles row moves down by one.
+- All remaining Chinese text (code comments in `extensions/pi-verdict.ts`, test comments and fixture strings in `tests/pi-verdict.test.ts`, older `CHANGELOG.md` entries, and the `research/` notes and sims) translated to English; no runtime behavior changed. The `research/rule-engine-sim/measure.ts` end marker was updated to the translated `// Rule layer: file path sensitivity` heading.
 
 ## [0.19.0] - 2026-10-12
 
@@ -285,105 +289,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ### Changed
 
-- 定位语统一为「极简权限门禁」——README 双语标语、AGENTS.md 与 npm `description` 同步(随本发布生效于 npm registry 与 pi.dev 包目录);「几百行极简代码」要点在特性列表置顶;用户规则小节标题改用完整路径 `~/.pi/agent/config/pi-verdict.json`;「为什么没有内置白名单」段首加粗。纯文档与包元数据表述优化,无代码变更
+- Positioning unified as "minimal permission gate": the bilingual README tagline, AGENTS.md and the npm `description` are synced (takes effect on the npm registry and the pi.dev package catalog with this release); the "a few hundred lines of minimal code" point is moved to the top of the feature list; the user-rules section heading now uses the full path `~/.pi/agent/config/pi-verdict.json`; the first sentence of the "Why there is no built-in allowlist" paragraph is bolded. Documentation and package-metadata wording only, no code changes
 
 ## [0.4.0] - 2026-08-31
 
 ### Added
 
-- 主开关 toggle 快捷键(#15):默认 `ctrl+shift+a` 一键切换 Auto Mode 开/关,静默反馈(footer 始终显示为唯一确认,不弹通知)。`config/pi-verdict.json` 新增 `toggleShortcut` 字段——任意 pi 键组合可重绑,`null`/空串禁用,非法组合会话启动时一次性警告并跳过注册(对齐 `classifierModel` 的降级模式),新会话生效。与 `/automode on|off` 语义等价:运行中生效、无确认弹窗、不持久化写回(扩展运行时从不写自己的受保护配置,ADR-0001「仅用户手编」边界不变);`/automode` 状态输出 Usage 行同步显示当前键位
+- Master toggle shortcut (#15): `ctrl+shift+a` by default switches Auto Mode on/off in one keystroke, with silent feedback (the footer is always the only confirmation, no notification is shown). `config/pi-verdict.json` gains a `toggleShortcut` field: any pi key combination can be rebound, `null`/empty string disables it, and an invalid combination triggers a one-time warning at session start and skips registration (same degradation pattern as `classifierModel`); takes effect in new sessions. Semantically equivalent to `/automode on|off`: effective immediately at runtime, no confirmation dialog, not persisted back (the extension never writes its own protected config at runtime; the ADR-0001 "user hand-edit only" boundary is unchanged); the Usage line of the `/automode` status output now also shows the current key binding
 
 ## [0.3.1] - 2026-08-29
 
 ### Changed
 
-- 文档(en/zh README、本文件 0.2.0 条目):移除「第三方安全审计」表述,统一为事实性描述——规则层绕过测试 8 项发现、每项可复现载荷、0.2.0 架构性移除内置白名单
+- Docs (Chinese and English READMEs, the 0.2.0 entry of this file): removed the "third-party security audit" wording and replaced it with a factual description: the rule-layer bypass test found 8 issues, each with a reproducible payload, and 0.2.0 architecturally removed the built-in allowlist
 
 ## [0.3.0] - 2026-08-27
 
 ### Added
 
-- 自保护层(self-protection layer,ADR-0001):门禁自身文件不可被 agent 侧修改——`config/pi-verdict.json` + 扩展安装副本(运行时 `import.meta.url` 自锚定,覆盖单文件/npm 目录两种安装形态,dev checkout 除外)。write/edit 走 realpath 归一化精确比对(防 symlink 旁路);bash/powershell 命令串覆盖字面量/`~`/`$HOME`/`$PI_CODING_AGENT_DIR` 拼写;读放行;不可经任何配置豁免(`builtinDenyFloor: false` 关不掉,用户 allow 越不过)。`~/.pi/agent/` 全域(mcp.json、skills 等)显式不在保护范围——需要该层保护的用户应经用户规则 deny 正则自表达(ADR-0001 否决项)
-- 变更检测(ADR-0001):受保护文件 `session_start` 全文快照,每次裁决前复核,处置按文件差分——扩展副本被改或无 UI → 从内存快照自动还原 + 本会话 fail-closed;交互会话中仅配置文件被改 → `ctx.ui.select` 双选处置,选项文案即动作(Accept = 重建基线会话照常,Decline = 回滚 + fail-closed;关闭对话框取安全侧同 Decline);会话间隙合法手工编辑照旧新会话生效
+- Self-protection layer (ADR-0001): the gate's own files cannot be modified from the agent side: `config/pi-verdict.json` plus the installed extension copy (self-anchored at runtime via `import.meta.url`, covering both single-file and npm-directory install forms, except dev checkouts). write/edit use exact comparison after realpath normalization (prevents symlink bypass); bash/powershell command strings cover the literal, `~`, `$HOME` and `$PI_CODING_AGENT_DIR` spellings; reads are allowed; cannot be exempted by any config (`builtinDenyFloor: false` does not turn it off, and user allow rules cannot override it). The whole `~/.pi/agent/` tree (mcp.json, skills, etc.) is explicitly outside the protection scope; users who need protection for it should express it themselves via user-rule deny regexes (rejected option in ADR-0001)
+- Change detection (ADR-0001): protected files are fully snapshotted at `session_start` and re-checked before every verdict, with handling differing per file: extension copy modified or no UI -> automatically restored from the in-memory snapshot + fail-closed for this session; only the config file modified in an interactive session -> a two-choice `ctx.ui.select` prompt where the option text is the action (Accept = rebuild the baseline and carry on, Decline = roll back + fail-closed; closing the dialog takes the safe side, same as Decline); legitimate manual edits between sessions still take effect in the next session as before
 
 ### Changed
 
-- `builtinDenyFloor: false` 语义收窄:只关闭内置危险正则与路径敏感度拦截,不再能间接关闭自保护层;配置模板 `_hint` 同步说明
-- README(en/zh):管线图新增第 0 层;新增「自保护」小节;限制清单补充 bash 子串正则可被混淆、跨会话基线为二期、dev checkout 不受保护的诚实声明;测试计数 42 → 62
-- 文档清理:移除根部过时研究笔记(research-pi-auto-mode.md、research.md)
+- `builtinDenyFloor: false` semantics narrowed: it now only turns off the built-in dangerous regexes and path-sensitivity blocking, and can no longer indirectly turn off the self-protection layer; the config template `_hint` is updated accordingly
+- README (en/zh): the pipeline diagram gains layer 0; new "Self-protection" section; the limitations list now honestly states that bash substring regexes can be obfuscated, the cross-session baseline is planned for phase two, and dev checkouts are not protected; test count 42 -> 62
+- Docs cleanup: removed outdated root-level research notes (research-pi-auto-mode.md, research.md)
 ## [0.2.4] - 2026-08-27
 
 ### Changed
 
-- package.json `description` 对齐 README 一句话定位(pi.dev catalog 列表页与 npm 搜索结果显示该字段,旧值为高密度技术罗列)
-- 文档清理:移除 research/pi-observational-memory.md,README(en/zh)微调
+- package.json `description` aligned with the README one-line positioning (the pi.dev catalog listing page and npm search results show this field; the old value was a dense technical enumeration)
+- Docs cleanup: removed research/pi-observational-memory.md, minor README (en/zh) tweaks
 
 ## [0.2.3] - 2026-08-27
 
 ### Changed
 
-- 运行时 UI 提示统一英文化:bash 危险规则 reason、路径敏感度 reason、用户规则 reason、分类器失败诊断、影子缓存摘要/标注、notify/confirm 文案、配置模板 `_hint` 与 block reason 前缀;代码注释保持中文,测试断言同步(42 项全过)
-- README 开头重写(en/zh):一句话定位(pi 的 Claude Code auto mode 式权限门禁)+ 机制三要点列表;新增「问题 / 为什么是三态」小节,Quick start 上移至品类对比之前;弃用非官方术语 YOLO(pi 文档无此词,问题陈述改用 pi 官方表述并附安全文档链接)
+- Runtime UI messages unified in English: bash dangerous-rule reasons, path-sensitivity reasons, user-rule reasons, classifier failure diagnostics, shadow-cache summary/annotations, notify/confirm text, config template `_hint` and block reason prefixes; code comments stay in Chinese, test assertions synced (all 42 pass)
+- README opening rewritten (en/zh): one-line positioning (a Claude Code auto mode-style permission gate for pi) + a three-point list of the mechanism; new "Problem / why three states" section, Quick start moved above the category comparison; dropped the unofficial term YOLO (pi docs do not use it; the problem statement now uses pi's official wording with a link to the security docs)
 
 ## [0.2.2] - 2026-08-27
 
 ### Changed
 
-- package.json 元数据接入 pi 官方包目录(pi.dev/packages):keywords 新增 `pi-package`(目录收录条件,实测对比已收录/未收录包确认)与 `extension`(目录类型标签显示为 extension 而非泛化 package);新增 `pi` manifest 显式声明 `extensions/` 资源(此前依赖约定目录发现);README 安装段同步目录链接
-- keywords 新增 `auto-mode`/`automode`(对齐直接对标包 @czottmann/pi-automode 的主流写法,命中 /automode 命令名与仓库名搜索;经评估不引入 claude/claudecode —— 本包为 pi 扩展而非 Claude Code 插件,误导性关键字与诚实定位相悖,且两个直接竞品均未使用)
+- package.json metadata hooked into the official pi package catalog (pi.dev/packages): keywords gain `pi-package` (catalog inclusion requirement, confirmed by comparing listed and unlisted packages) and `extension` (so the catalog type label shows extension rather than a generic package); a new `pi` manifest explicitly declares the `extensions/` resource (previously relied on conventional directory discovery); README install section synced with the catalog link
+- keywords gain `auto-mode`/`automode` (aligned with the mainstream spelling of the direct counterpart package @czottmann/pi-automode, matching searches for the /automode command name and the repository name; after evaluation, claude/claudecode are not added: this package is a pi extension, not a Claude Code plugin, and misleading keywords conflict with honest positioning, and neither of the two direct competitors uses them)
 
 ## [0.2.1] - 2026-08-27
 
 ### Added
 
-- 配置文件支持 `classifierModel`(provider/id):分类器模型持久配置;优先级 CLI flag > env > config > 自省;无效值回退会话模型并一次性警告(与非法正则同款「不失效」处置)
-- spec 支持 pi 原生思考级别后缀 `provider/id:thinking`(对齐 pi `--model` 语法):`off`(缺省,显式关思考)/`low`/`medium`/`high`/`xhigh`/`max` 经 adaptive effort 送达,`minimal` 映射 `low`;无效后缀警告一次并忽略
-- README 基于收敛分析更新定位(#14):诚实框架 + 证据库七份
+- Config file supports `classifierModel` (provider/id): persistent classifier model configuration; precedence CLI flag > env > config > introspection; an invalid value falls back to the session model with a one-time warning (same "never fails" handling as invalid regexes)
+- The spec supports pi's native thinking-level suffix `provider/id:thinking` (aligned with pi `--model` syntax): `off` (default, explicitly disables thinking)/`low`/`medium`/`high`/`xhigh`/`max` are delivered via adaptive effort, `minimal` maps to `low`; an invalid suffix warns once and is ignored
+- README positioning updated based on the convergence analysis (#14): honest framing + seven evidence documents
 
 ## [0.2.0] - 2026-08-26
 
 ### Changed
 
-- 规则层重构:移除内置 bash 白名单,改为**用户可配置** allow/deny 正则(`<agentDir>/config/pi-verdict.json`,黑名单优先于白名单,首启生成模板);内置危险正则 + 路径敏感度保留为 deny floor(默认开启,`builtinDenyFloor: false` 可整体关闭)
-- 分类器超时 15s → 25s(本网关 CC 分类器分布 p90=19.8s,15s 会误杀约 15%,见 `research/cache-sim/`)
+- Rule layer refactor: removed the built-in bash allowlist in favor of **user-configurable** allow/deny regexes (`<agentDir>/config/pi-verdict.json`, deny takes precedence over allow, template generated on first start); the built-in dangerous regexes + path sensitivity are kept as the deny floor (on by default, `builtinDenyFloor: false` turns it off entirely)
+- Classifier timeout 15s -> 25s (this gateway's CC classifier distribution has p90=19.8s, so 15s would wrongly kill about 15%, see `research/cache-sim/`)
 
 ### Security
 
-- 规则层绕过测试 8 项发现全部修复(`research/rule-layer-security-audit.md`):V1-V7(内置白名单结构性绕过)由架构重构**结构性消除**——无内置白名单即无短路通道;V8(S0 密钥清单遗漏)扩充 `.netrc/.npmrc/.pypirc/.envrc/.vault-token/.kube/.docker config.json/.gem credentials`;全部 8 攻击载荷进回归测试(36 桩测试)
+- All 8 findings of the rule-layer bypass test fixed (`research/rule-layer-security-audit.md`): V1-V7 (structural bypasses of the built-in allowlist) are **structurally eliminated** by the architecture refactor, since with no built-in allowlist there is no short-circuit path; V8 (S0 secret list omissions) extended with `.netrc/.npmrc/.pypirc/.envrc/.vault-token/.kube/.docker config.json/.gem credentials`; all 8 attack payloads added to regression tests (36 stub tests)
 
 ### Added
 
-- `research/pi-automode-convergence.md`:与 @czottmann/pi-automode 的收敛度对照——架构已收敛(10 项趋同),残余差异分级(本质:floor 可关/极简形态/方法论;可复制:三态 ask/AST 规则/防篡改);战略建议 B 独立实验场+A 上游输送(#14)
-- `tests/auto-mode.test.ts`:21 个离线桩测试(规则层/分类器重试矩阵/影子缓存 observe-only/命令语义/debug 标注)——开发期冒烟三件套转正入库
-- `.github/workflows/ci.yml`:push/PR 上 typecheck + test(bun)
-- `.github/workflows/publish.yml`:v* tag 触发 npm 发布(OIDC trusted publishing + provenance,tag/版本一致性断言,pack 白名单检查)
-- `package.json`:npm 发布就绪(去 private、main 入口、files 白名单、peerDeps 可选声明、keywords/repository)
-- `research/pi-permission-landscape.md`:权限自动裁决品类竞品全景——7 项目一手调研(czottmann/pi-automode、gotgenes/pi-permission-system、cc-safety-net、r4vi/pi-auto-mode、flaxodev/pi-perms、zhushanwen/pi-permission、wangzexi/pi-auto-approve),定位结论与 README 措辞启示(#10)
-- :MIT 许可证(开源准备)
+- `research/pi-automode-convergence.md`: convergence comparison with @czottmann/pi-automode: architecture has converged (10 points in common), residual differences graded (essential: floor can be turned off/minimal form/methodology; replicable: three-state ask/AST rules/tamper resistance); strategic recommendation B independent testbed + A upstream contribution (#14)
+- `tests/auto-mode.test.ts`: 21 offline stub tests (rule layer/classifier retry matrix/shadow cache observe-only/command semantics/debug annotations), promoting the three development-time smoke scripts into the repo
+- `.github/workflows/ci.yml`: typecheck + test (bun) on push/PR
+- `.github/workflows/publish.yml`: v* tag triggers npm publish (OIDC trusted publishing + provenance, tag/version consistency assertion, pack allowlist check)
+- `package.json`: npm-publish ready (removed private, main entry, files allowlist, optional peerDeps declaration, keywords/repository)
+- `research/pi-permission-landscape.md`: landscape of competing permission auto-verdict packages, first-hand survey of 7 projects (czottmann/pi-automode, gotgenes/pi-permission-system, cc-safety-net, r4vi/pi-auto-mode, flaxodev/pi-perms, zhushanwen/pi-permission, wangzexi/pi-auto-approve), with positioning conclusions and implications for README wording (#10)
+- MIT license (open-source preparation)
 
-- 影子缓存遥测(observe-only):灰区裁决同步回放双键 LRU(128) 的 would-be 命中率,只记录永不生效,为 #5「是否引入生效缓存」积累实测数据;`/automode` 附带会话统计(命中率/miss 构成/命令重复/反事实分歧),`PI_AUTO_MODE_DEBUG=1` 时通知附 would-hit/miss 标注(#7)
-- `--auto-mode-debug` CLI flag:开启全量裁决通知与影子缓存标注,等价并优先于 `PI_AUTO_MODE_DEBUG=1`(pi 配置文件无通用 env 注入机制,flag 为原生开关)
+- Shadow-cache telemetry (observe-only): gray-area verdicts synchronously replay the would-be hit rate of a two-key LRU (128), recorded only and never taking effect, to accumulate measured data for #5 "whether to introduce an effective cache"; `/automode` additionally shows session statistics (hit rate/miss breakdown/command repeats/counterfactual disagreements), and with `PI_AUTO_MODE_DEBUG=1` notifications carry would-hit/miss annotations (#7)
+- `--auto-mode-debug` CLI flag: enables full verdict notifications and shadow-cache annotations, equivalent to and taking precedence over `PI_AUTO_MODE_DEBUG=1` (pi config files have no generic env injection mechanism, so the flag is the native switch)
 
 ### Fixed
 
-- 分类器灰区系统性 fail-closed(GLM 系思考模型):扩展在 API 层 `complete()` 上传的 `reasoning` 选项并非该层字段(`SimpleStreamOptions` 才有;宽类型 `Model<Api>` 的索引签名使 TS 静默放行,运行时被丢弃)→ 请求不带思考参数 → GLM 按默认 max 档思考烧尽预算/超时。改传 API 原生 `thinkingEnabled: false`(anthropic-messages 栈实测送达 `thinking:{"type":"disabled"}`,GLM 降为 effort low 轻思考+ 两档防御重试(512 → 1024,覆盖空输出/截断/超时/异常与其他 API 长尾)。根因与三层取证:`research/thinking-param-blackhole.md`
+- Classifier gray area systematically fail-closed (GLM-family thinking models): the `reasoning` option the extension passed to the API-layer `complete()` is not a field of that layer (only `SimpleStreamOptions` has it; the index signature of the wide type `Model<Api>` lets TS silently accept it, and it is dropped at runtime) -> the request carries no thinking parameter -> GLM thinks at its default max level and exhausts the budget/times out. Now passes the API-native `thinkingEnabled: false` (measured on the anthropic-messages stack to deliver `thinking:{"type":"disabled"}`, GLM drops to light thinking at effort low) + two-tier defensive retry (512 -> 1024, covering empty output/truncation/timeout/exceptions and other API long-tail cases). Root cause and three-layer forensics: `research/thinking-param-blackhole.md`
 
 ### Changed
 
-- README 重写面向 public:英文主文档 + 对等中文 README.zh-CN.md(头部互链);一句话定位(三态裁决)、品类对比轻量表、证据驱动章节(五份研究)、免责声明(非沙箱)、命名说明
+- README rewritten for the public: main English document + equivalent Chinese README.zh-CN.md (cross-linked in the headers); one-line positioning (three-state verdict), lightweight category comparison table, evidence-driven section (five studies), disclaimer (not a sandbox), naming note
 
-- statusline 状态文案明确化:off 态由隐藏改为暗色恒显,双态显示 `auto mode on`(高亮)/ `auto mode off`(暗色)
+- statusline wording clarified: the off state changes from hidden to always shown in dim color; the two states display `auto mode on` (highlighted) / `auto mode off` (dim)
 
-- `/automode` 命令语义明确化:裸调用改为**只读状态展示**(修复查看即翻转状态的副作用);`/automode on|off` 幂等设定(与现值相同不翻转);未知参数严格拒绝并列出用法,大小写归一化
+- `/automode` command semantics clarified: a bare call is now a **read-only status display** (fixes the side effect where viewing flipped the state); `/automode on|off` is an idempotent set (no flip when equal to the current value); unknown arguments are strictly rejected with usage listed, case normalized
 
-- `extensions/auto-mode.ts`:Auto Mode 扩展原型 —— 在 `tool_call` 钩子上实现「规则层前置 + 模型分类器兜灰区」的三态裁决(allow / ask / deny)(#3)
-  - 规则层:bash 无条件/条件白名单 + 危险正则(对完整命令串匹配)+ 文件路径敏感度六级(S0 密钥 ~ S5 CWD 外)
-  - 模型分类器:Claude Code 风格 `<transcript>` 精简转录 + `<verdict>` 前缀输出契约;默认"自省"(继承当前会话模型),可用 `--auto-mode-model` / `PI_AUTO_MODE_MODEL` 指定
-  - fail-closed:分类器异常/超时(15s)/输出违反契约 → 拦截;非交互模式 ask → 拦截
-  - 透明性:`/automode` 开关命令、footer `🛡️ auto` 状态、拦截通知含裁决理由、`PI_AUTO_MODE_DEBUG=1` 全量裁决通知
-- `research/claude-code-classifier-prompts.md`:从 Langfuse 还原 Claude Code 权限分类器提示词(数百条样本/24h)(#4)
-- `research/cache-sim/`:裁决缓存收益离线回放——CC 分类器历史裁决(1,2xx 条/2x 会话)双键 LRU 回放,命中率 3.2%、危险分歧 0 例;#5 决议依据与可复现脚本(fetch-io / simulate / kinds)
-- `research/rule-engine-sim/`:规则引擎收益测量——746 条真实 bash 调用双引擎交叉回放(tree-sitter AST × 本层),移植收益实测为零、真安全洞为零,真靶点=白名单广度与分类器成本(#6)
-- `research/pi-model-call-and-ref-implementations.md`:Pi 扩展模型调用/配置 API 调研与三个开源权限扩展实现提取,含规则层种子集(#2)
-- `CONTEXT.md`:领域术语表(Auto Mode / 裁决 / 规则层 / 灰区 / 分类器 / 自省 / fail-closed / 三态裁决 / ask 降级)
-- `package.json` + `tsconfig.json`:扩展类型检查(`bun run typecheck`)
+- `extensions/auto-mode.ts`: Auto Mode extension prototype: implements three-state verdicts (allow / ask / deny) on the `tool_call` hook as "rule layer first + model classifier for the gray area" (#3)
+  - Rule layer: bash unconditional/conditional allowlist + dangerous regexes (matched against the full command string) + six levels of file path sensitivity (S0 secrets ~ S5 outside CWD)
+  - Model classifier: Claude Code-style condensed `<transcript>` + `<verdict>` prefix output contract; default "introspection" (inherits the current session model), can be set via `--auto-mode-model` / `PI_AUTO_MODE_MODEL`
+  - fail-closed: classifier exception/timeout (15s)/output violating the contract -> block; non-interactive mode ask -> block
+  - Transparency: `/automode` toggle command, footer `🛡️ auto` status, block notifications include the verdict reason, `PI_AUTO_MODE_DEBUG=1` full verdict notifications
+- `research/claude-code-classifier-prompts.md`: Claude Code permission classifier prompts reconstructed from Langfuse (hundreds of samples/24h) (#4)
+- `research/cache-sim/`: offline replay of verdict-cache benefit: two-key LRU replay of historical CC classifier verdicts (1,2xx entries/2x sessions), hit rate 3.2%, 0 dangerous disagreements; basis of the #5 decision and reproducible scripts (fetch-io / simulate / kinds)
+- `research/rule-engine-sim/`: rule engine benefit measurement: 746 real bash calls cross-replayed through two engines (tree-sitter AST x this layer), measured porting benefit zero, real security holes zero, the real targets are allowlist breadth and classifier cost (#6)
+- `research/pi-model-call-and-ref-implementations.md`: survey of Pi extension model-call/config APIs and extraction of three open-source permission extension implementations, including a rule-layer seed set (#2)
+- `CONTEXT.md`: domain glossary (Auto Mode / verdict / rule layer / gray area / classifier / introspection / fail-closed / three-state verdict / ask downgrade)
+- `package.json` + `tsconfig.json`: extension type checking (`bun run typecheck`)

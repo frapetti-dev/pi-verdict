@@ -1,9 +1,9 @@
 /**
- * pi-verdict 扩展桩测试:内置 floor / 用户规则优先级 / 分类器重试 / 影子缓存 / 命令语义
- * 全部离线:mock ExtensionAPI/ExtensionContext,无网络、无真实模型。
- * 用户规则经 PI_CODING_AGENT_DIR 指向临时目录的真实 JSON 配置驱动(非注入 mock)。
- * 会话装配统一走 session(cfg, opts)(配置 → harness → 装载,顺序约束内化);
- * 临时目录夹具走 withTempDir(建 → fn → 清理)。
+ * pi-verdict extension stub tests: built-in floor / user rule priority / classifier retry / shadow cache / command semantics
+ * Fully offline: mock ExtensionAPI/ExtensionContext, no network, no real model.
+ * User rules are driven by a real JSON config via PI_CODING_AGENT_DIR pointing at a temp dir (not an injected mock).
+ * Session setup always goes through session(cfg, opts) (config -> harness -> install; the ordering constraint is internalized);
+ * the temp-dir fixture goes through withTempDir (create -> fn -> cleanup).
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
@@ -12,7 +12,7 @@ import * as path from "node:path";
 import autoMode, { adjudicate, anchorDenyPaths, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, collectProjectContext, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
 import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
 
-// ── 桩设施 ──────────────────────────────────────────────
+// ── Stub infrastructure ─────────────────────────────────
 
 const TMP_AGENT = fs.mkdtempSync(path.join(os.tmpdir(), "pi-verdict-test-"));
 let config: { allow: string[]; deny: string[] } = { allow: [], deny: [] };
@@ -184,7 +184,7 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 	if (cfg.subagentAskTimeoutMs !== undefined) raw.subagentAskTimeoutMs = cfg.subagentAskTimeoutMs;
 	// denyPaths (PP-1–PP-9): unknown[] lets negative tests mix in non-string entries
 	if (cfg.denyPaths !== undefined) raw.denyPaths = cfg.denyPaths;
-	// 非法正则测试:把 invalid 条目直接混入 allow 数组
+	// Invalid-regex test: mix the invalid entry directly into the allow array
 	if (invalid) raw.allow = [...config.allow, ...invalid];
 	fs.writeFileSync(p, JSON.stringify(raw));
 }
@@ -247,9 +247,9 @@ function driveMenu(h: Harness, keys: string[], rendered: string[] = [], after: s
 	};
 }
 
-/** 开一个会话:按 cfg 写真实配置 → 建 harness → 装载扩展。顺序约束(配置先于装载)
- *  内化于此;opts 统一收纳全部变体:cwd/ompRegistry 给 makeHarness,
- *  invalid/flag/debug/modelFlag/compatLoader 分别传给 setConfig 与 install。 */
+/** Open a session: write a real config from cfg -> build the harness -> install the extension. The ordering constraint
+ *  (config before install) is internalized here; opts collects all variants: cwd/ompRegistry go to makeHarness,
+ *  invalid/flag/debug/modelFlag/compatLoader go to setConfig and install respectively. */
 function session(cfg: Parameters<typeof setConfig>[0], opts: { cwd?: string; ompRegistry?: boolean; roles?: boolean; ompHost?: boolean; invalid?: string[]; verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> } = {}): Harness {
 	setConfig(cfg, opts.invalid);
 	const h = makeHarness(opts.cwd, { ompRegistry: opts.ompRegistry, roles: opts.roles });
@@ -257,8 +257,8 @@ function session(cfg: Parameters<typeof setConfig>[0], opts: { cwd?: string; omp
 	return h;
 }
 
-/** 临时目录夹具:建 → fn(dir) → 无条件清理;base 默认 os.tmpdir(),家目录夹具传 os.homedir()。
- *  fn 可为 async:清理等待其完成后执行。 */
+/** Temp-dir fixture: create -> fn(dir) -> unconditional cleanup; base defaults to os.tmpdir(), the home-dir fixture passes os.homedir().
+ *  fn may be async: cleanup runs after it completes. */
 async function withTempDir(prefix: string, fn: (dir: string) => void | Promise<void>, base: string = os.tmpdir()): Promise<void> {
 	const dir = fs.mkdtempSync(path.join(base, prefix));
 	try {
@@ -268,12 +268,12 @@ async function withTempDir(prefix: string, fn: (dir: string) => void | Promise<v
 	}
 }
 
-// ── 1. 内置 deny floor(不可覆盖)+ 无内置白名单 ─────────
+// ── 1. Built-in deny floor (not overridable) + no built-in allowlist ─────────
 
 describe("built-in deny floor", () => {
 	test("danger regex (rm -rf) → deny, zero model calls", async () => {
 		const h = session({});
-		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }); // 拼接防测试文件被危险正则误拦
+		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }); // concatenated so the dangerous regex does not block the test file
 		expect(r?.block).toBe(true);
 		expect(r.reason).toContain("rm-recursive");
 		expect(h.calls.length).toBe(0);
@@ -289,7 +289,7 @@ describe("built-in deny floor", () => {
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 		const r = await toolCall(h, "bash", { command: "ls -la" });
 		expect(r).toBeUndefined();
-		expect(h.calls.length).toBe(1); // 无白名单:进分类器
+		expect(h.calls.length).toBe(1); // no allowlist: goes to the classifier
 	});
 	test("write to S0 secret path → deny", async () => {
 		const h = session({});
@@ -304,7 +304,7 @@ describe("built-in deny floor", () => {
 	});
 });
 
-// ── 2. 用户规则(黑名单优先于白名单) ─────────────────────
+// ── 2. User rules (denylist takes priority over allowlist) ─────────────────────
 
 describe("user rules (deny > allow > gray)", () => {
 	test("user allow matches full command string → zero-latency allow", async () => {
@@ -335,7 +335,7 @@ describe("user rules (deny > allow > gray)", () => {
 		const h = session({ allow: ["^ls\\b"] }, ["[unclosed"]);
 		const r = await toolCall(h, "bash", { command: "ls -la" });
 		expect(r).toBeUndefined();
-		expect(h.calls.length).toBe(0); // 合法条目仍生效
+		expect(h.calls.length).toBe(0); // valid entries still take effect
 	});
 	// #25 (F6): a malformed config must not silently disarm the user's rules
 	test("malformed config JSON warns at session_start; floor unaffected", async () => {
@@ -368,33 +368,33 @@ describe("user rules (deny > allow > gray)", () => {
 	test("builtinDenyFloor: false disables the whole built-in deny floor (risk accepted by user)", async () => {
 		const h = session({ builtinDenyFloor: false });
 		h.responses = [{ text: "<verdict>deny</verdict> floor off" }];
-		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }); // 危险正则被关
-		expect(h.calls.length).toBe(1);        // 交分类器
-		expect(r?.block).toBe(true);           // 分类器裁决仍生效
+		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }); // dangerous regex disabled
+		expect(h.calls.length).toBe(1);        // handed to the classifier
+		expect(r?.block).toBe(true);           // classifier verdict still applies
 	});
 	test("builtinDenyFloor: false downgrades S0 path deny to gray (never to allow)", async () => {
 		const h = session({ builtinDenyFloor: false });
 		h.responses = [{ text: "<verdict>deny</verdict> floor off" }];
 		const r = await toolCall(h, "write", { path: "~/.ssh/authorized_keys", content: "x" });
-		expect(h.calls.length).toBe(1);        // gray 而非 deny → 分类器
+		expect(h.calls.length).toBe(1);        // gray rather than deny -> classifier
 		expect(r?.block).toBe(true);
 	});
 	test("builtinDenyFloor default true keeps the floor", async () => {
 		const h = session({ allow: ["^rm"] });
 		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" });
-		expect(r?.block).toBe(true);           // 默认开:floor 仍优先于用户 allow
+		expect(r?.block).toBe(true);           // default on: floor still takes priority over user allow
 		expect(h.calls.length).toBe(0);
 	});
 
 	test("first run generates config template", async () => {
 		fs.rmSync(path.join(TMP_AGENT, "config"), { recursive: true, force: true });
-		const h = session({}); // 触发 loadUserRules → 生成模板
+		const h = session({}); // triggers loadUserRules -> generates the template
 		const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
 		expect(fs.existsSync(p)).toBe(true);
 	});
 });
 
-// ── 3. 安全审计回归(8/8 载荷,#12) ─────────────────────
+// ── 3. Security audit regression (8/8 payloads, #12) ─────────────────────
 
 describe("security audit regression (all payloads must NOT be rule-allowed)", () => {
 	const payloads: Array<[string, string, any]> = [
@@ -411,8 +411,8 @@ describe("security audit regression (all payloads must NOT be rule-allowed)", ()
 			const h = session({});
 			h.responses = [{ text: "<verdict>deny</verdict> audit payload" }];
 			const r = await toolCall(h, tool, input);
-			expect(h.calls.length).toBe(1); // 未被规则层短路
-			expect(r?.block).toBe(true);    // 分类器裁决生效
+			expect(h.calls.length).toBe(1); // not short-circuited by the rule layer
+			expect(r?.block).toBe(true);    // classifier verdict applies
 		});
 	}
 	test("V8 read ~/.npmrc → S0 deny (list expanded)", async () => {
@@ -635,7 +635,7 @@ describe("transcript line injection (#22)", () => {
 	});
 });
 
-// ── 3.5 分类器模型解析(flag > env > config > 自省) ─────
+// ── 3.5 Classifier model resolution (flag > env > config > introspection) ─────
 
 describe("classifier model resolution", () => {
 	test("config classifierModel is used when flag/env absent", async () => {
@@ -650,9 +650,9 @@ describe("classifier model resolution", () => {
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }, { text: "<verdict>allow</verdict> ok" }];
 		await toolCall(h, "bash", { command: "cargo build" });
 		await toolCall(h, "bash", { command: "cargo build" });
-		expect(h.calls[0].model).toBe("mock/glm"); // 回退自省
+		expect(h.calls[0].model).toBe("mock/glm"); // falls back to introspection
 		const warns = h.notifies.filter(([m, l]) => l === "warning" && m.includes("nope/missing"));
-		expect(warns.length).toBe(1); // 仅一次
+		expect(warns.length).toBe(1); // only once
 	});
 	test("pi-native thinking suffix: zai/flash:low → effort low (adaptive)", async () => {
 		const h = session({ classifierModel: "zai/flash:low" });
@@ -668,18 +668,18 @@ describe("classifier model resolution", () => {
 		h.findMap = { "zai/flash": { id: "glm-4-flash" } };
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }, { text: "<verdict>allow</verdict> ok" }];
 		await toolCall(h, "bash", { command: "cargo build" });
-		expect(h.calls[0].effort).toBe("low"); // minimal → low(anthropic effort 无 minimal)
+		expect(h.calls[0].effort).toBe("low"); // minimal -> low (anthropic effort has no minimal)
 		setConfig({ classifierModel: "zai/flash" });
-		h.handlers.session_start?.({}, h.ctx); // 重载配置
+		h.handlers.session_start?.({}, h.ctx); // reload config
 		h.findMap = { "zai/flash": { id: "glm-4-flash" } };
 		await toolCall(h, "bash", { command: "cargo build" });
-		expect(h.calls[1].thinkingEnabled).toBe(false); // 无后缀 = 显式关思考
+		expect(h.calls[1].thinkingEnabled).toBe(false); // no suffix = thinking explicitly off
 		expect(h.calls[1].effort).toBeUndefined();
 	});
 	test("invalid suffix warned once and ignored", async () => {
 		const h = session({ classifierModel: "zai/flash:ultra" });
-		h.findMap = {}; // 真实注册表找不到 flash:ultra 这样的 id
-		// 后缀 ultra 非法 → 忽略后缀,specPart = zai/flash:ultra 注册表查无 → 回退自省 + 警告
+		h.findMap = {}; // the real registry cannot find an id like flash:ultra
+		// suffix ultra is invalid -> ignore the suffix, specPart = zai/flash:ultra is not in the registry -> fall back to introspection + warning
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 		await toolCall(h, "bash", { command: "cargo build" });
 		expect(h.calls[0].model).toBe("mock/glm");
@@ -695,7 +695,7 @@ describe("classifier model resolution", () => {
 	});
 });
 
-// ── 4. 分类器(重试矩阵 + 参数形态) ─────────────────────
+// ── 4. Classifier (retry matrix + parameter shapes) ─────────────────────
 
 describe("classifier", () => {
 	test("success on first try: single call, thinkingEnabled=false, maxTokens=512", async () => {
@@ -743,11 +743,11 @@ describe("classifier", () => {
 	});
 });
 
-// ── 5. 影子缓存(observe-only:行为零变化 + 统计正确) ────
+// ── 5. Shadow cache (observe-only: zero behavior change + correct stats) ────
 
 function shadowStats(h: Harness): Record<string, number> {
 	h.notifies.length = 0;
-	h.commands.automode.handler("status", h.ctx); // status = 只读状态
+	h.commands.automode.handler("status", h.ctx); // status = read-only state
 	const line = h.notifies[0]?.[0].split("\n").find((l) => l.includes("shadow cache")) ?? "";
 	const out: Record<string, number> = { gray: 0, hits: 0, rate: 0, missNoEntry: 0, missCtx: 0, cmdRepeats: 0, dangerous: 0, conservative: 0 };
 	const m = line.match(/gray (\d+).*hits (\d+) \(([\d.]+)%\).*no-entry (\d+)\/ctx-changed (\d+).*repeats (\d+).*dangerous (\d+)\/conservative (\d+)/);
@@ -759,26 +759,26 @@ function shadowStats(h: Harness): Record<string, number> {
 describe("shadow cache (observe-only)", () => {
 	test("rule verdicts never enter the shadow stats", async () => {
 		const h = session({});
-		await toolCall(h, "write", { path: "/proj/a.ts", content: "x" }); // 规则 allow(路径层)
+		await toolCall(h, "write", { path: "/proj/a.ts", content: "x" }); // rule allow (path layer)
 		expect(shadowStats(h).gray).toBe(0);
 	});
 	test("repeat gray call: would-hit counted, model still called (never short-circuits)", async () => {
-		const h = session({}); userMsg(h, "任务");
+		const h = session({}); userMsg(h, "task");
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 		const r1 = await toolCall(h, "bash", { command: "cargo build" });
 		const r2 = await toolCall(h, "bash", { command: "cargo build" });
 		const s = shadowStats(h);
 		expect(s.gray).toBe(2);
 		expect(s.hits).toBe(1);
-		expect(h.calls.length).toBe(2); // observe-only:模型两次都真实调用
+		expect(h.calls.length).toBe(2); // observe-only: the model is really called both times
 		expect(r1).toBeUndefined();
 		expect(r2).toBeUndefined();
 	});
 	test("new user message → context-changed miss and overwrite", async () => {
-		const h = session({}); userMsg(h, "任务");
+		const h = session({}); userMsg(h, "task");
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 		await toolCall(h, "bash", { command: "cargo build" });
-		userMsg(h, "新指令");
+		userMsg(h, "new instruction");
 		await toolCall(h, "bash", { command: "cargo build" });
 		expect(shadowStats(h).missCtx).toBe(1);
 	});
@@ -790,7 +790,7 @@ describe("shadow cache (observe-only)", () => {
 		expect(shadowStats(h).missNoEntry).toBe(2);
 	});
 	test("LRU(128) evicts the oldest entry", async () => {
-		const h = session({}); userMsg(h, "任务");
+		const h = session({}); userMsg(h, "task");
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 		for (let i = 0; i < 129; i++) await toolCall(h, "mcp__e__t", { i });
 		await toolCall(h, "mcp__e__t", { i: 0 });   // evicted → no-entry
@@ -801,7 +801,7 @@ describe("shadow cache (observe-only)", () => {
 	});
 });
 
-// ── 6. /automode 命令语义(模式参数 + 只读状态) ───────
+// ── 6. /automode command semantics (mode argument + read-only status) ───────
 
 describe("/automode command", () => {
 	test("status is read-only with mode, source, stats and usage", async () => {
@@ -824,7 +824,7 @@ describe("/automode command", () => {
 		const h = session({});
 		await h.commands.automode.handler("off", h.ctx);
 		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" });
-		expect(r).toBeUndefined(); // 关闭后危险命令也不再拦
+		expect(r).toBeUndefined(); // once off, dangerous commands are no longer blocked
 	});
 	test("unknown arg → warning with usage", async () => {
 		const h = session({});
@@ -834,7 +834,7 @@ describe("/automode command", () => {
 	});
 });
 
-// ── 6.5 toggle 快捷键(#15:默认 ctrl+shift+y,可配可禁用)──
+// ── 6.5 toggle shortcut (#15: default ctrl+shift+y, configurable and disableable)──
 
 describe("toggle shortcut", () => {
 	test("default installs ctrl+shift+y with description", () => {
@@ -845,7 +845,7 @@ describe("toggle shortcut", () => {
 	test("custom key from config wins; default not registered", () => {
 		const h = session({ toggleShortcut: "ctrl+shift+x" });
 		expect(Object.keys(h.shortcuts)).toEqual(["ctrl+shift+x"]);
-		const h2 = session({ toggleShortcut: "f9" }); // 裸功能键合法(不与文本输入冲突)
+		const h2 = session({ toggleShortcut: "f9" }); // bare function key is valid (does not conflict with text input)
 		expect(Object.keys(h2.shortcuts)).toEqual(["f9"]);
 	});
 	test("null / empty string disable registration entirely", () => {
@@ -859,8 +859,8 @@ describe("toggle shortcut", () => {
 		expect(Object.keys(h.shortcuts)).toEqual([]);
 		await h.handlers.session_start({}, h.ctx);
 		const warns = h.notifies.filter(([m, l]) => l === "warning" && m.includes("toggleShortcut"));
-		expect(warns.length).toBe(1); // 对齐 classifierModel:一次,不刷屏
-		const h2 = session({ toggleShortcut: "a" }); // 裸可打印字符:会劫持文本输入,拒绝
+		expect(warns.length).toBe(1); // aligned with classifierModel: once, no spam
+		const h2 = session({ toggleShortcut: "a" }); // bare printable character: would hijack text input, rejected
 		expect(Object.keys(h2.shortcuts)).toEqual([]);
 	});
 	test("handler cycles default → yolo → noAutoDeny → off → default silently", async () => {
@@ -914,17 +914,17 @@ describe("toggle shortcut", () => {
 	});
 	test("config template contains toggleShortcut with default key", () => {
 		fs.rmSync(path.join(TMP_AGENT, "config"), { recursive: true, force: true });
-		const h = makeHarness(); h.install(); // 无既有配置 → loadUserRules 生成模板
+		const h = makeHarness(); h.install(); // no existing config -> loadUserRules generates the template
 		const raw = fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8");
 		expect(raw).toContain("toggleShortcut");
 		expect(raw).toContain("ctrl+shift+y");
-		expect(raw).toContain("toggleShortcut sets the key that cycles the session approval mode"); // _hint 说明文案
+		expect(raw).toContain("toggleShortcut sets the key that cycles the session approval mode"); // _hint text
 		expect(JSON.parse(raw)).toMatchObject({ mode: "default", confidenceThreshold: null, yoloDenyPaths: "deny", yoloOmpDir: "deny" });
 		expect("autoDeny" in JSON.parse(raw)).toBe(false);
 	});
 });
 
-// ── 7. debug 通知标注 ───────────────────────────────────
+// ── 7. debug notice annotation ───────────────────────────────────
 
 describe("debug annotations", () => {
 	test("--auto-mode-debug: allows notify with shadow would-hit tag", async () => {
@@ -1314,11 +1314,12 @@ describe("denyPaths (PP-1–PP-9)", () => {
 	});
 });
 
-// ── 10.5 agent-facing block reason(#53:每个 block 站点的 canonical 形态)──
+// ── 10.5 agent-facing block reason (#53: canonical shape at every block site)──
 
 describe("agent-facing block reason form (#53)", () => {
 	const HEAD = "BLOCKED — this action did NOT run. Reason: ";
 	const TAIL = ". Report the block to the user; never claim it succeeded or completed.";
+	const GRANT_HINT = " If this action is required, request a permission grant with verdict_grant (describe the exact operation and scope).";
 	const SENS = path.join(TMP_AGENT, "sensitive-53");
 	const CFG = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
 	fs.mkdirSync(SENS, { recursive: true });
@@ -1328,21 +1329,22 @@ describe("agent-facing block reason form (#53)", () => {
 		h.responses = [{ text: "<verdict>deny</verdict>" }];
 		const r = await toolCall(h, "bash", { command: "ls -la /tmp" });
 		expect(r?.block).toBe(true);
-		expect(r.reason).toBe(`[auto-mode classifier block] ${HEAD}(no further reason given)${TAIL}`);
+		expect(r.reason).toBe(`[auto-mode classifier block] ${HEAD}(no further reason given)${TAIL}${GRANT_HINT}`);
 	});
 
 	test("classifier with terse reason stays embedded, exact canonical form", async () => {
 		const h = session({});
 		h.responses = [{ text: "<verdict>deny</verdict> classifier says no" }];
 		const r = await toolCall(h, "bash", { command: "ls -la /tmp" });
-		expect(r.reason).toBe(`[auto-mode classifier block] ${HEAD}classifier says no${TAIL}`);
+		expect(r.reason).toBe(`[auto-mode classifier block] ${HEAD}classifier says no${TAIL}${GRANT_HINT}`);
 	});
 
 	test("rule block → rule tag; UI notify text unchanged", async () => {
 		const h = session({ deny: ["push"] });
 		const r = await toolCall(h, "bash", { command: "git push origin main" });
 		expect(r.reason.startsWith(`[auto-mode rule block] ${HEAD}`)).toBe(true);
-		expect(r.reason.endsWith(TAIL)).toBe(true);
+		expect(r.reason.endsWith(TAIL)).toBe(true); // GR-1: rule blocks carry no grant hint
+		expect(r.reason).not.toContain("verdict_grant");
 		expect(r.reason).toContain("user deny rule");
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.startsWith("🛡️ Auto Mode blocked:"))).toBe(true);
 	});
@@ -1352,7 +1354,7 @@ describe("agent-facing block reason form (#53)", () => {
 		h.responses = [{ text: "", stopReason: "length" }, new Error("gateway boom")];
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(r.reason.startsWith(`[auto-mode classifier block] ${HEAD}`)).toBe(true);
-		expect(r.reason.endsWith(TAIL)).toBe(true);
+		expect(r.reason.endsWith(TAIL + GRANT_HINT)).toBe(true);
 		expect(r.reason).toContain("attempt 1 (512t)");
 		expect(r.reason).toContain("attempt 2 (1024t)");
 	});
@@ -1369,14 +1371,14 @@ describe("agent-facing block reason form (#53)", () => {
 		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
 		h.confirmAnswer = false;
 		const r = await toolCall(h, "bash", { command: "cargo build" });
-		expect(r.reason).toBe(`[auto-mode user-declined block] ${HEAD}user declined${TAIL}`);
+		expect(r.reason).toBe(`[auto-mode user-declined block] ${HEAD}user declined${TAIL}${GRANT_HINT}`);
 	});
 
 	test("protected-path declined confirm → user-declined tag with protected detail", async () => {
 		const h = session({ denyPaths: [SENS] });
 		h.confirmAnswer = false;
 		const r = await toolCall(h, "read", { path: path.join(SENS, "secret.md") });
-		expect(r.reason).toBe(`[auto-mode user-declined block] ${HEAD}user declined protected-path access${TAIL}`);
+		expect(r.reason).toBe(`[auto-mode user-declined block] ${HEAD}user declined protected-path access${TAIL}${GRANT_HINT}`);
 	});
 
 	test("protected-path headless degrade → protected-path tag, non-interactive preserved", async () => {
@@ -1981,7 +1983,7 @@ describe("notifyAllows (#60)", () => {
 	});
 });
 
-// ── 11. omp 宿主支持(#35:completion 降级 / agentDir 自锚定 / omp 形态保护)──
+// ── 11. omp host support (#35: completion downgrade / agentDir self-anchoring / omp shape protection)──
 
 describe("completion fallback (omp runtime shape, #35)", () => {
 	test("bindCompletion: registry with complete binds it directly, loader untouched", async () => {
@@ -2216,9 +2218,9 @@ describe("omp host forms: S0 floor (#35)", () => {
 
 });
 
-// ── 20. 判定管线 interface 级(adjudicate):ask 降级统一 / source × degraded / 明文零泄漏 ──
+// ── 20. Adjudication pipeline interface level (adjudicate): ask downgrade unified / source × degraded / zero plaintext leak ──
 
-/** 构造直接驱动 adjudicate 的最小环境:fake complete + 空 branch 的 host */
+/** Build the minimal environment that drives adjudicate directly: fake complete + host with an empty branch */
 function adjudicateEnv(overrides: { text?: string; hasUI?: boolean; model?: any; failModel?: boolean; fallback?: any } = {}) {
 	return {
 		cwd: "/proj",
@@ -2235,7 +2237,7 @@ function adjudicateEnv(overrides: { text?: string; hasUI?: boolean; model?: any;
 }
 
 describe("adjudicate pipeline (interface level)", () => {
-	const secret = "/proj/secret-project"; // 虚构路径:避开 /var 等 S1 系统目录 floor,且落在会话 cwd 内
+	const secret = "/proj/secret-project"; // fictitious path: avoids system-dir floors like /var (S1) and lies inside the session cwd
 
 	test("ask degradation is unified: protected-path ask degrades to deny without UI", async () => {
 		setConfig({ denyPaths: [secret] });
@@ -2285,7 +2287,7 @@ describe("adjudicate pipeline (interface level)", () => {
 
 	test("denyPaths zero-leak regression: no protected-path plaintext in any reason or notification (PP-6)", async () => {
 		const protectedPath = path.join(secret, "notes.md");
-		// Verdict 面:ask 与降级 deny 的 reason 都不得含路径明文
+		// Verdict surface: neither the ask nor the degraded deny reason may contain the plaintext path
 		setConfig({ denyPaths: [secret] });
 		const state = new SessionState();
 		const vAsk = await adjudicate(state, { toolName: "write", input: { path: protectedPath, content: "x" } }, adjudicateEnv());
@@ -2294,7 +2296,7 @@ describe("adjudicate pipeline (interface level)", () => {
 		expect(vAsk.detail).toContain(path.basename(secret)); // plaintext lives only in the UI-only channel
 		const vDegraded = await adjudicate(state, { toolName: "write", input: { path: protectedPath, content: "x" } }, adjudicateEnv({ hasUI: false }));
 		expect(vDegraded.reason).not.toContain("secret-project");
-		// Handler 面:非交互降级的 block reason 与全部 notify 文案都不得含路径明文
+		// Handler surface: the non-interactive degraded block reason and all notify messages must not contain the plaintext path
 		const h = session({ denyPaths: [secret] });
 		h.ctx.hasUI = false;
 		const r = await toolCall(h, "write", { path: protectedPath, content: "x" });
@@ -2662,7 +2664,7 @@ describe("/verdict omp custom roles", () => {
 	const TAGS = { "verdict-fallback": { name: "VERDICT FALLBACK" }, "explain-gate": { name: "EXPLAIN GATE" } };
 	const parse = (file: string): any => Bun.YAML.parse(fs.readFileSync(file, "utf8"));
 	const { DOWN, ENTER, LEFT, RIGHT, ESC } = MENU;
-	const ROLES_ROW = times(8, DOWN); // five lists, .omp gate, footer, mode in status bar, then custom roles
+	const ROLES_ROW = times(9, DOWN); // five lists, .omp gate, footer, mode in status bar, grants in status bar, then custom roles
 	async function open(h: Harness, dir: string, keys: string[], rendered: string[] = [], after: string[] = []): Promise<void> {
 		h.ompAgentDir = dir;
 		await h.handlers.session_start({}, h.ctx);
@@ -4868,5 +4870,342 @@ describe("settings tool (ST-1–ST-5)", () => {
 		const text = (await call(h, { action: "get", key: "denyPaths" })).content[0].text;
 		expect(text).not.toContain("pv-secret-x");
 		expect(text).toContain('"count": 1');
+	});
+});
+
+describe("permission grants (GR-1–GR-6)", () => {
+	const ALLOW = { text: "<verdict>allow</verdict> fine" };
+	const DENY = { text: "<verdict>deny</verdict> no" };
+	const ASK = { text: "<verdict>ask</verdict> not sure" };
+	const SENS = path.join(TMP_AGENT, "sensitive-gr");
+	fs.mkdirSync(SENS, { recursive: true });
+	const SESSION_FILE = (id = "s1") => path.join(TMP_AGENT, "config", "pi-verdict-sessions", `${id}.json`);
+	const readSession = (id = "s1") => JSON.parse(fs.readFileSync(SESSION_FILE(id), "utf8"));
+	const call = (h: Harness, params: Record<string, unknown>) => h.tools.verdict_grant.execute("t1", params, undefined, undefined, h.ctx);
+	const text = async (h: Harness, params: Record<string, unknown>): Promise<string> => (await call(h, params)).content[0].text;
+	const patchConfig = (patch: Record<string, unknown>): void => {
+		const file = path.join(TMP_AGENT, "config", "pi-verdict.json");
+		fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), ...patch }));
+	};
+	async function open(cfg: Parameters<typeof setConfig>[0] = {}, opts: Parameters<typeof session>[1] = {}): Promise<Harness> {
+		const h = session(cfg, opts);
+		await h.handlers.session_start({}, h.ctx);
+		return h;
+	}
+	/** Approve one grant through the plain select fallback (the harness has no `ui.custom`). */
+	async function approve(h: Harness, params: Record<string, unknown>): Promise<string> {
+		h.selectPicks = ["I approve"];
+		return text(h, { action: "request", ...params });
+	}
+
+	test("GR-1: mode off answers NA to every action, with no dialog and no model call", async () => {
+		const h = await open({});
+		await h.commands.automode.handler("off", h.ctx);
+		for (const params of [{ action: "request", request: "deploy" }, { action: "release", id: "G1" }, { action: "list" }]) {
+			expect((await text(h, params)).startsWith("NA:")).toBe(true);
+		}
+		expect(h.selects + h.confirms + h.calls.length).toBe(0);
+	});
+
+	test("GR-1: the tool call itself is a mechanical allow", async () => {
+		const h = await open({});
+		expect(await toolCall(h, "verdict_grant", { action: "list" })).toBeUndefined();
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("GR-2/GR-4/GR-6: approved grant is persisted and reaches the classifier prompt after the rules header", async () => {
+		const h = await open({});
+		expect((await approve(h, { request: "deploy build 42 to staging" })).startsWith("Approved by the user: permission grant G1")).toBe(true);
+		expect(readSession().grants.active[0]).toMatchObject({ id: "G1", request: "deploy build 42 to staging", grantedBy: "user" });
+		h.responses = [ALLOW];
+		expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
+		const sys: string = h.calls[0].systemPrompt;
+		expect(sys).toContain("Permission grants");
+		expect(sys.indexOf(USER_RULES_HEADER)).toBeGreaterThan(-1);
+		expect(sys.indexOf(USER_RULES_HEADER)).toBeLessThan(sys.indexOf("deploy build 42 to staging"));
+	});
+
+	test("GR-4: the fallback classifier prompt carries the grants too", async () => {
+		const h = await open({ classifierFallbackModel: "mock/fb" });
+		h.findMap = { "mock/fb": { id: "fb-model" } };
+		await approve(h, { request: "publish package 1.2.3" });
+		h.responses = [{ text: "" }, new Error("boom"), ALLOW]; // first layer fails closed → cascade to the fallback
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(h.calls).toHaveLength(3);
+		expect(h.calls[2].systemPrompt).toContain("publish package 1.2.3");
+	});
+
+	test("GR-4: protected-path text is withheld from ordinary classifier calls (count only)", async () => {
+		const h = await open({});
+		await approve(h, { request: "read the vault", paths: [{ path: SENS, access: "read" }] });
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "cargo build" });
+		const sys: string = h.calls[0].systemPrompt;
+		expect(sys).toContain("plus 1 protected-path access entry, enforced separately");
+		expect(sys).not.toContain(SENS);
+	});
+
+	test("GR-2: reject, and clarify with text, grant nothing", async () => {
+		const h = await open({});
+		h.selectPicks = ["I reject"];
+		expect((await text(h, { action: "request", request: "deploy" })).startsWith("Rejected by the user")).toBe(true);
+		h.selectPicks = ["Ask for clarification"];
+		h.inputs = ["which env?"];
+		const clarify = await text(h, { action: "request", request: "deploy" });
+		expect(clarify).toContain('"which env?"');
+		expect(clarify).toContain("Nothing was granted");
+		expect(JSON.parse(await text(h, { action: "list" })).grants).toEqual([]);
+	});
+
+	test("GR-2: clarify with empty input returns to the choices", async () => {
+		const h = await open({});
+		h.selectPicks = ["Ask for clarification", "I approve"];
+		h.inputs = [""];
+		expect((await text(h, { action: "request", request: "deploy" })).startsWith("Approved by the user")).toBe(true);
+		expect(h.selects).toBe(2);
+	});
+
+	test("GR-2: rich dialog lists the three choices; an empty clarification row keeps it open until text is typed", async () => {
+		const { DOWN, ENTER, ESC } = MENU;
+		const h = await open({});
+		const rendered: string[] = [];
+		driveDialogs(h, [[DOWN, DOWN, ENTER, ...typed("which env?"), ENTER]], rendered);
+		const r = await text(h, { action: "request", request: "deploy to staging", paths: [{ path: SENS, access: "read" }] });
+		expect(r).toContain('"which env?"');
+		expect(rendered[0]).toContain("I approve");
+		expect(rendered[0]).toContain("I reject");
+		expect(rendered[0]).toContain("Ask for clarification or revision");
+		expect(rendered[0]).toContain("deploy to staging");
+		expect(rendered[0]).toContain("Protected-path access: read");
+		expect(rendered[0].replace(/\s+/g, "")).toContain(SENS.replace(/\s+/g, ""));
+		expect(rendered[0]).not.toContain("Explain");
+		driveDialogs(h, [[ENTER]], []);
+		expect((await text(h, { action: "request", request: "deploy to staging" })).startsWith("Approved by the user")).toBe(true);
+		driveDialogs(h, [[DOWN, ENTER]], []);
+		expect((await text(h, { action: "request", request: "other" })).startsWith("Rejected by the user")).toBe(true);
+		driveDialogs(h, [[ESC]], []);
+		expect((await text(h, { action: "request", request: "another" })).startsWith("Rejected by the user")).toBe(true);
+	});
+
+	test("GR-2: no UI rejects; subagents are refused", async () => {
+		const h = await open({});
+		h.ctx.hasUI = false;
+		expect((await text(h, { action: "request", request: "deploy" })).startsWith("Rejected: no interactive UI")).toBe(true);
+		h.ctx.hasUI = true;
+		h.ctx.agent = { kind: "sub", id: "a", name: "n", depth: 1 };
+		await expect(call(h, { action: "list" })).rejects.toThrow("not available in subagents");
+	});
+
+	test("GR-2: invalid requests throw, an identical active request is not asked twice", async () => {
+		const h = await open({});
+		await expect(call(h, { action: "request", request: "  " })).rejects.toThrow("request is required");
+		await expect(call(h, { action: "request", request: "x".repeat(1001) })).rejects.toThrow("at most 1000");
+		await expect(call(h, { action: "request", request: "ok", paths: [{ path: SENS, access: "root" }] })).rejects.toThrow("access");
+		await approve(h, { request: "deploy", paths: [{ path: SENS, access: "read" }] });
+		const selects = h.selects;
+		expect((await text(h, { action: "request", request: "deploy", paths: [{ path: SENS, access: "read" }] })).startsWith("Already granted: G1")).toBe(true);
+		expect(h.selects).toBe(selects);
+	});
+
+	test("GR-3: yolo grants only when the judge allows; a configured fallback must allow as well", async () => {
+		const h = await open({ mode: "yolo" });
+		h.responses = [ALLOW];
+		expect((await text(h, { action: "request", request: "deploy build 42" })).startsWith("Approved by the classifier")).toBe(true);
+		expect(h.calls).toHaveLength(1);
+		expect(h.calls[0].systemPrompt).toContain("Grant review");
+		expect(JSON.parse(await text(h, { action: "list" })).grants[0]).toMatchObject({ id: "G1", grantedBy: "classifier" });
+		expect(h.confirms + h.selects).toBe(0);
+
+		const fb = await open({ mode: "yolo", classifierFallbackModel: "mock/fb" });
+		fb.findMap = { "mock/fb": { id: "fb-model" } };
+		fb.responses = [ALLOW, DENY];
+		expect((await text(fb, { action: "request", request: "deploy build 42" })).startsWith("Rejected (yolo mode, no human)")).toBe(true);
+		expect(fb.calls).toHaveLength(2);
+		expect(JSON.parse(await text(fb, { action: "list" })).grants).toEqual([]);
+		fb.responses = [ALLOW, ALLOW];
+		fb.calls.length = 0;
+		expect((await text(fb, { action: "request", request: "deploy build 42" })).startsWith("Approved by the classifier")).toBe(true);
+		expect(fb.calls).toHaveLength(2);
+
+		const deny = await open({ mode: "yolo" });
+		deny.responses = [DENY];
+		expect((await text(deny, { action: "request", request: "deploy" })).startsWith("Rejected (yolo mode, no human)")).toBe(true);
+		const none = await open({ mode: "yolo" });
+		none.ctx.model = null;
+		expect(await text(none, { action: "request", request: "deploy" })).toContain("no classifier model available");
+	});
+
+	test("GR-6: release removes the grant from the next prompt; an unknown id throws; ids are not reused", async () => {
+		const h = await open({});
+		await approve(h, { request: "deploy build 42 to staging" });
+		expect(await text(h, { action: "release", id: "G1" })).toBe("Released permission grant G1.");
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(h.calls[0].systemPrompt).not.toContain("deploy build 42");
+		await expect(call(h, { action: "release", id: "G1" })).rejects.toThrow('no active permission grant "G1"');
+		expect((await approve(h, { request: "again" })).startsWith("Approved by the user: permission grant G2")).toBe(true);
+	});
+
+	test("GR-6: /grants revoke removes the grant and tells the agent; /grants lists", async () => {
+		const h = await open({});
+		await h.commands.grants.handler("", { ...h.ctx, hasUI: false });
+		expect(h.notifies.some(([m]) => m.includes("No active permission grants"))).toBe(true);
+		await approve(h, { request: "deploy build 42 to staging" });
+		await h.commands.grants.handler("list", h.ctx);
+		expect(h.notifies.at(-1)![0]).toContain("G1 · deploy build 42 to staging · 0 protected paths · by user");
+		await h.commands.grants.handler("revoke G9", h.ctx);
+		expect(h.notifies.at(-1)).toEqual(['pi-verdict: no active permission grant "G9"', "warning"]);
+		await h.commands.grants.handler("revoke G1", h.ctx);
+		expect(JSON.parse(await text(h, { action: "list" })).grants).toEqual([]);
+		expect(h.sent).toHaveLength(1);
+		expect(h.sent[0].message).toMatchObject({ customType: "verdict-grant-revoked", display: true, details: { ids: ["G1"] } });
+		expect(h.sent[0].message.content).toContain("G1");
+		expect(h.sent[0].options).toEqual({ deliverAs: "nextTurn" });
+	});
+
+	test("GR-6: /grants menu revokes a picked grant after confirmation, and revoke all clears the rest", async () => {
+		const h = await open({});
+		await approve(h, { request: "first" });
+		await approve(h, { request: "second" });
+		h.selectPicks = ["G1", "Revoke all", "Close"];
+		h.confirmAnswer = true;
+		await h.commands.grants.handler("", h.ctx);
+		expect(h.confirmMsgs[0]).toContain("first");
+		expect(JSON.parse(await text(h, { action: "list" })).grants).toEqual([]);
+	});
+
+	test("GR-6: grants survive a restart of the same session id and not a different one; malformed entries are dropped with a notice", async () => {
+		const h = await open({});
+		await approve(h, { request: "deploy build 42" });
+		const same = makeHarness();
+		same.install();
+		await same.handlers.session_start({}, same.ctx);
+		expect(JSON.parse(await text(same, { action: "list" })).grants).toHaveLength(1);
+		const other = makeHarness();
+		other.ctx.sessionManager.getSessionId = () => "s2";
+		other.install();
+		await other.handlers.session_start({}, other.ctx);
+		expect(JSON.parse(await text(other, { action: "list" })).grants).toEqual([]);
+
+		fs.writeFileSync(SESSION_FILE("s3"), JSON.stringify({ grants: { next: 7, active: [{ id: "G2", request: "ok", grantedBy: "user", grantedAt: "t", paths: [] }, { id: "bad", request: "x" }, { id: "G3", request: "", grantedBy: "user", grantedAt: "t", paths: [] }] } }));
+		const bad = makeHarness();
+		bad.ctx.sessionManager.getSessionId = () => "s3";
+		bad.install();
+		await bad.handlers.session_start({}, bad.ctx);
+		expect(JSON.parse(await text(bad, { action: "list" })).grants.map((g: { id: string }) => g.id)).toEqual(["G2"]);
+		expect(bad.notifies.some(([m]) => m.includes("session grants: 2 malformed entries ignored"))).toBe(true);
+		bad.selectPicks = ["I approve"];
+		expect((await text(bad, { action: "request", request: "new" })).includes("permission grant G7")).toBe(true);
+	});
+
+	describe("protected-path coverage (GR-5)", () => {
+		const GRANT_PATHS = [{ path: SENS, access: "read" }];
+		const target = path.join(SENS, "a.txt");
+
+		test("without a covering grant a protected-path read asks the user, with no model call", async () => {
+			const h = await open({ denyPaths: [SENS] });
+			expect(await toolCall(h, "read", { path: target })).toBeUndefined();
+			expect(h.confirms).toBe(1);
+			expect(h.calls).toHaveLength(0);
+		});
+
+		test("a covering read grant lets the scope check allow the read without asking; the reason and notices carry no path", async () => {
+			const h = await open({ denyPaths: [SENS], audit: true });
+			clearAudit();
+			await approve(h, { request: "read the vault", paths: GRANT_PATHS });
+			h.responses = [ALLOW];
+			expect(await toolCall(h, "read", { path: target })).toBeUndefined();
+			expect(h.confirms).toBe(0);
+			expect(h.calls).toHaveLength(1);
+			expect(h.calls[0].systemPrompt).toContain("Coverage check");
+			expect(h.calls[0].systemPrompt).toContain(`protected-path access: read ${SENS}`);
+			expect(h.notifies.some(([m]) => m.includes(SENS))).toBe(false);
+			const rec = readAudit().at(-1);
+			expect(rec).toMatchObject({ verdict: "allow", source: "protected-path" });
+			expect(rec.reason).toContain("permission grant G1 covers this protected-path access");
+			clearAudit();
+		});
+
+		test("an access level that does not fit never reaches a model: write with a read grant asks", async () => {
+			const h = await open({ denyPaths: [SENS] });
+			await approve(h, { request: "read the vault", paths: GRANT_PATHS });
+			const before = h.calls.length;
+			await toolCall(h, "write", { path: target, content: "x" });
+			expect(h.calls).toHaveLength(before);
+			expect(h.confirms).toBe(1);
+		});
+
+		test("a command touching a denyPath and a .omp path is not coverable when only the .omp path is granted", async () => {
+			const omp = path.join(TMP_AGENT, ".omp");
+			const h = await open({ denyPaths: [SENS] });
+			await approve(h, { request: "tweak omp", paths: [{ path: omp, access: "full" }] });
+			await toolCall(h, "bash", { command: `cat ${omp}/x ${target}` });
+			expect(h.calls).toHaveLength(0);
+			expect(h.confirms).toBe(1);
+		});
+
+		test("the scope check answering ask falls back to today's ask", async () => {
+			const h = await open({ denyPaths: [SENS] });
+			await approve(h, { request: "read the vault", paths: GRANT_PATHS });
+			h.responses = [ASK];
+			expect(await toolCall(h, "read", { path: target })).toBeUndefined(); // user confirms
+			expect(h.calls).toHaveLength(1);
+			expect(h.confirms).toBe(1);
+		});
+
+		test("headless, an uncovered or refused protected-path call still denies", async () => {
+			const h = await open({ denyPaths: [SENS] });
+			await approve(h, { request: "read the vault", paths: GRANT_PATHS });
+			h.ctx.hasUI = false;
+			h.responses = [ASK];
+			const r = await toolCall(h, "read", { path: target });
+			expect(r?.block).toBe(true);
+		});
+	});
+
+	describe("status surfaces (GR-6)", () => {
+		const withBg = (h: Harness): void => {
+			h.ctx.ui.theme = {
+				fg: (_c: string, s: string) => s,
+				bold: (s: string) => s,
+				bg: (c: string, s: string) => `<${c}>${s}</${c}>`,
+				getBgAnsi: (c: string) => "\x1b[48;5;" + c.length + "m",
+			};
+		};
+		const footerOf = (h: Harness): string | undefined => h.statusSets.filter(([k]) => k === "auto-mode").at(-1)?.[1];
+
+		for (const style of ["full", "compact"] as const) {
+			test(`${style} footer shows the grant count only while grants exist and is byte-identical to the featureless render at 0`, async () => {
+				const h = await open({ footer: style });
+				withBg(h);
+				await h.handlers.session_start({}, h.ctx);
+				const baseline = footerOf(h)!;
+				expect(baseline).not.toContain("\uF084");
+				expect(baseline).not.toContain("🔑");
+				await approve(h, { request: "deploy" });
+				expect(footerOf(h)).toContain(style === "full" ? "\uF084 1" : "🔑 1");
+				await h.commands.grants.handler("revoke G1", h.ctx);
+				expect(footerOf(h)).toBe(baseline);
+			});
+		}
+
+		test("prompt status bar (omp): 🔑 N while grants exist; grantStatus:false, mode off and zero grants clear it", async () => {
+			const key = (h: Harness) => h.statusSets.filter(([k]) => k === "verdict-grants").at(-1)?.[1];
+			const h = await open({}, { ompHost: true });
+			await approve(h, { request: "deploy" });
+			expect(key(h)).toBe("🔑 1");
+			await h.commands.automode.handler("off", h.ctx);
+			expect(key(h)).toBeUndefined();
+			await h.commands.automode.handler("default", h.ctx);
+			expect(key(h)).toBe("🔑 1");
+			await h.commands.grants.handler("revoke all", h.ctx);
+			expect(key(h)).toBeUndefined();
+
+			const quiet = session({}, { ompHost: true });
+			patchConfig({ grantStatus: false });
+			await quiet.handlers.session_start({}, quiet.ctx);
+			await approve(quiet, { request: "deploy" });
+			expect(key(quiet)).toBeUndefined();
+		});
 	});
 });

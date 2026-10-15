@@ -323,6 +323,25 @@ Rules: [CL-2](docs/adjudication-rules.md#cl-2-classifier-model-resolution), [CS-
 The `/rule` command that drafts a rule from a description and checks it against recent history.
 Rules: [RG-1](docs/adjudication-rules.md#rg-1-transcript-only), [RG-2](docs/adjudication-rules.md#rg-2-attempts-and-feedback), [RG-3](docs/adjudication-rules.md#rg-3-history-replay-and-critic)
 
+### Permission grants
+
+**Permission grant**:
+A session-long, natural-language authorization the agent requests through `verdict_grant` and the user approves (in `yolo`, the judge and fallback classifiers both allow); classifiers treat it as authoritative within its literal scope, and it is revocable at any time.
+_Avoid_: approval (that is a human answer to an ask), permission, allowlist entry
+Rules: [GR-1](docs/adjudication-rules.md#gr-1-request-tool), [GR-2](docs/adjudication-rules.md#gr-2-human-approval), [GR-4](docs/adjudication-rules.md#gr-4-authority-in-classifier-prompts), [GR-6](docs/adjudication-rules.md#gr-6-lifetime-revocation-and-visibility)
+
+**Protected-path access entry**:
+A path plus an access level (`read`, `write` or `full`) listed in a permission grant, used only by the grant coverage check.
+Rules: [GR-5](docs/adjudication-rules.md#gr-5-protected-path-coverage-check)
+
+**Grant coverage check**:
+The step before a protected-path or `.omp` gate ask that allows the call without a human when every touched protected path lies under an access entry of an active grant and both the judge and fallback classifiers confirm the call is within it.
+Rules: [GR-5](docs/adjudication-rules.md#gr-5-protected-path-coverage-check), [PP-6](docs/adjudication-rules.md#pp-6-plaintext-confinement)
+
+**Grant review**:
+The yolo-mode consensus in which the judge and a configured fallback classifier both must allow a grant request before it is created.
+Rules: [GR-3](docs/adjudication-rules.md#gr-3-yolo-consensus)
+
 ### Subagents
 
 **Subagent gate**:
