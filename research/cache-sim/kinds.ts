@@ -26,10 +26,10 @@ for (const l of ndjson) {
   if (seen.has(a)) kindRepeat[kk] = (kindRepeat[kk] ?? 0) + 1;
   else seen.add(a);
 }
-console.log("灰区构成(按动作首词) 与 重复出现次数:");
+console.log("Gray-zone composition (by action first word) and repeat counts:");
 for (const [k, v] of Object.entries(kind).sort((a, b) => b[1] - a[1]).slice(0, 14)) {
-  console.log(`  ${v}\t重复 ${kindRepeat[k] ?? 0}\t${k}`);
+  console.log(`  ${v}\trepeats ${kindRepeat[k] ?? 0}\t${k}`);
 }
 const tot = Object.values(kind).reduce((a, b) => a + b, 0);
 const rep = Object.values(kindRepeat).reduce((a, b) => a + b, 0);
-console.log(`合计 ${tot},重复 ${rep}`);
+console.log(`total ${tot}, repeats ${rep}`);
