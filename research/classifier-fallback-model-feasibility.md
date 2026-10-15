@@ -82,7 +82,7 @@ Pipeline (`adjudicate`, `extensions/pi-verdict.ts:1536-1600`):
   shared deadline.
 - Precedent inside this repo: `research/typesafe-jev-classifiermodel.md` already noted
   (2026-09-18) that the boundary case `rm -rf /tmp/build` → deny p=0.64 / **conf=0.29**
-  "恰好支持 confidence-gated ask 策略" — the confidence-gated idea predates this report;
+  "happens to support a confidence-gated ask policy" — the confidence-gated idea predates this report;
   the audit corpus below turns that hypothesis into measurements.
 
 ## 2. Empirical analysis of the audit corpus

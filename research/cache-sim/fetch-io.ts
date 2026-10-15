@@ -1,4 +1,4 @@
-/** 按 id 并行拉取分类器观测的 io 字段,落盘 NDJSON */
+/** Fetch the io fields of classifier observations in parallel by id and write them to NDJSON */
 const cands = JSON.parse(await Bun.file("cand-ids.json").text());
 const auth = "Basic " + btoa(`${process.env.LANGFUSE_PUBLIC_KEY}:${process.env.LANGFUSE_SECRET_KEY}`);
 const base = process.env.LANGFUSE_BASE_URL;
