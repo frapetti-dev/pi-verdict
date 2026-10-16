@@ -7,10 +7,10 @@
  * Normative rules: docs/adjudication-rules.md (IDs like PP-6 below refer to it).
  *
  * Pipeline (tool_call hook):
- *   1. Rule layer (built-in deny floor + user declarations):
- *      - built-in floor: bash danger regexes + path sensitivity S0-S3 → hard deny
- *        (on by default; builtinDenyFloor:false turns the whole floor off, at your
- *        own risk)
+ *   1. Rule layer (user deny, built-in rules + user declarations):
+ *      - built-in rules: bash danger rules + path tiers S0-S3, each with a
+ *        configurable action (deny | ask | allow = gray; dangerRules / pathRules;
+ *        builtinDenyFloor:false makes them all act as allow, at your own risk)
  *      - user rules: allow/deny regexes in config/pi-verdict.json (deny wins over
  *        allow); no built-in command allowlist (every "always allow" claim is the user's,
  *        #12/audit response)
@@ -92,8 +92,31 @@ import { activeTransport, type JevReason, parseJevConfidence, parseJevReason, PR
 // Rules layer: bash
 // ============================================================================
 
-/** Dangerous patterns: matched against the full command string (covers pipes/compound commands); a hit means deny (from research report §4.3) */
-const BASH_DANGER_RULES: Array<{ id: string; pattern: RegExp; reason: string }> = [
+export const RULE_ACTIONS = ["deny", "ask", "allow"] as const;
+/** Configured outcome of a built-in rule match: deny, ask, or allow (= the rule passes no judgment; the call goes to the classifier). */
+export type RuleAction = (typeof RULE_ACTIONS)[number];
+export const PATH_TIER_IDS = ["s0-secret", "s1-system-read", "s1-system-write", "s2-user-rc-write", "s3-git-meta-write"] as const;
+export type PathTierId = (typeof PATH_TIER_IDS)[number];
+export const PATH_TIER_DEFAULTS: Readonly<Record<PathTierId, RuleAction>> = {
+	"s0-secret": "deny",
+	"s1-system-read": "allow",
+	"s1-system-write": "deny",
+	"s2-user-rc-write": "allow",
+	"s3-git-meta-write": "deny",
+};
+const isRuleAction = (v: unknown): v is RuleAction => typeof v === "string" && (RULE_ACTIONS as readonly string[]).includes(v);
+const isPathTierId = (v: unknown): v is PathTierId => typeof v === "string" && (PATH_TIER_IDS as readonly string[]).includes(v);
+export interface DangerRule {
+	id: string;
+	pattern: RegExp;
+	reason: string;
+	action: RuleAction;
+	/** true = shipped rule (possibly with a user-replaced pattern/action); false = user-added custom rule */
+	builtin: boolean;
+}
+
+/** Built-in danger rules (defaults; read-only): matched against the full command string (covers pipes/compound commands); the default action is deny (from research report §4.3). The effective list is `UserRules.dangerRules`. */
+const BASH_DANGER_RULES: ReadonlyArray<{ id: string; pattern: RegExp; reason: string }> = [
 	{ id: "rm-recursive", pattern: /\brm\b[^;|&]*(\s-(?:[a-zA-Z]*r[a-zA-Z]*f?|[a-zA-Z]*f[a-zA-Z]*r)\b|--recursive)/i, reason: "recursive delete (rm -r)" },
 	{ id: "rm-root", pattern: /\brm\s+(-[a-zA-Z]*\s+)*(--recursive\s+)?(\/|\/etc|\/usr|\/var|~|\$HOME)(?:\s|$)/i, reason: "delete root/system/home directory" },
 	{ id: "sudo", pattern: /\bsudo\b/i, reason: "privilege escalation (sudo)" },
@@ -110,7 +133,13 @@ const BASH_DANGER_RULES: Array<{ id: string; pattern: RegExp; reason: string }> 
 	{ id: "fork-bomb", pattern: /:\(\)\s*\{/, reason: "fork bomb" },
 ];
 
+const DEFAULT_DANGER_RULES = (): DangerRule[] => BASH_DANGER_RULES.map((r) => ({ ...r, action: "deny", builtin: true }));
+
 type RuleVerdict = "allow" | "deny" | "gray" | "ask";
+/** A built-in rule hit that produced a deny/ask: what a permission grant must cover to lift it (GR-5). */
+export type BuiltinHit =
+	| { kind: "danger"; id: string; action: "deny" | "ask" }
+	| { kind: "path"; tier: PathTierId; action: "deny" | "ask"; forms: string[] };
 interface RuleResult {
 	verdict: RuleVerdict;
 	reason?: string;
@@ -120,6 +149,10 @@ interface RuleResult {
 	detail?: string;
 	/** Which forced gate produced an ask: the `.omp` directory gate or a denyPaths hit (yolo picks its action per gate). */
 	gate?: "omp-dir" | "deny-paths";
+	/** Built-in rule hits behind a deny/ask (also attached to a gate ask when the built-in rules would have asked or denied too). */
+	builtin?: BuiltinHit[];
+	/** Reason of the built-in hit that `builtin` describes, kept when a gate ask replaces `reason`. */
+	builtinReason?: string;
 }
 
 /** Cap the danger-regex matching input (#25): the prefix-consuming character
@@ -128,12 +161,18 @@ interface RuleResult {
  *  falls to the classifier (fail-closed direction). */
 export const BASH_MAX_MATCH_LEN = 8192;
 
-function classifyBash(command: string, floorOn: boolean): RuleResult {
-	if (floorOn) {
-		const capped = command.length > BASH_MAX_MATCH_LEN ? command.slice(0, BASH_MAX_MATCH_LEN) : command;
-		for (const rule of BASH_DANGER_RULES) {
-			if (rule.pattern.test(capped)) return { verdict: "deny", reason: `rule ${rule.id}: ${rule.reason}` };
-		}
+/** Rules whose action is `allow` are skipped (no judgment). Any deny hit wins over ask hits; the reason lists every hit of the winning action. */
+function classifyBash(command: string, rules: readonly DangerRule[]): RuleResult {
+	const capped = command.length > BASH_MAX_MATCH_LEN ? command.slice(0, BASH_MAX_MATCH_LEN) : command;
+	const hits = rules.filter((r) => r.action !== "allow" && r.pattern.test(capped));
+	if (hits.length) {
+		const action: "deny" | "ask" = hits.some((r) => r.action === "deny") ? "deny" : "ask";
+		const won = hits.filter((r) => r.action === action);
+		return {
+			verdict: action,
+			reason: won.map((r) => `rule ${r.id}: ${r.reason}`).join("; "),
+			builtin: hits.map((r) => ({ kind: "danger", id: r.id, action: r.action as "deny" | "ask" })),
+		};
 	}
 	if (!command.trim()) return { verdict: "allow", reason: "empty command" };
 	// No built-in allowlist (#12): every non-dangerous command goes to user rules and the classifier
@@ -201,8 +240,8 @@ const pathStartsWith = (child: string, base: string): boolean => fold(child).sta
 // Match target: bash/powershell = full command string; read/write/edit/grep/find/ls = resolved absolute path;
 // other tools (MCP/custom, e.g. ask/propose_commit/propose_changelog/todo) always go to the classifier by default -
 // tools is the exact-tool-name exception declaration for this family: a hit allows directly, bypassing the classifier (does not pass through
-// the built-in floor / denyPaths, which never covered this family anyway).
-// Priority: built-in deny floor -> user deny -> user allow -> gray; the floor is on by default and can be turned off via builtinDenyFloor:false.
+// the built-in rules / denyPaths, which never covered this family anyway).
+// Priority: user deny -> built-in rules -> gates -> user allow -> gray; builtin rules are on by default (deny) and can be reconfigured via dangerRules / pathRules or turned off via builtinDenyFloor:false.
 // Invalid regexes are skipped and reported (a config error does not disable the extension); takes effect in a new session.
 // ============================================================================
 
@@ -272,6 +311,10 @@ export type SettingSource = "session" | "local" | "global" | "default";
 export const SESSION_KEYS = [...APPROVAL_KEYS, "gateOmpDir", "footer", "modeStatus", "grantStatus"] as const;
 export type SessionKey = (typeof SESSION_KEYS)[number];
 const isSessionKey = (k: string): k is SessionKey => (SESSION_KEYS as readonly string[]).includes(k);
+/** Per-id map keys (built-in rule actions) a session override may carry; kept apart from SESSION_KEYS, whose Record maps hold scalar meanings. */
+export const SESSION_MAP_KEYS = ["dangerRules", "pathRules"] as const;
+export type SessionMapKey = (typeof SESSION_MAP_KEYS)[number];
+const isSessionMapKey = (k: string): k is SessionMapKey => (SESSION_MAP_KEYS as readonly string[]).includes(k);
 export const ROOT_RULE_STRICTNESS = ["relaxed", "balanced", "strict"] as const;
 export type RootRuleStrictness = (typeof ROOT_RULE_STRICTNESS)[number];
 /** Root rule (RR-1): one free-text baseline policy for the classifier plus the generator inputs `/automode-setup` persists. */
@@ -304,8 +347,12 @@ interface UserRules {
 	denyPaths: string[];
 	/** [tools allowlist] exact tool-name allowlist for the MCP/custom family (toolKind() === null, e.g. "ask", "propose_commit", "propose_changelog") — a case-sensitive exact match on the tool's registered name bypasses the classifier and returns allow directly. Does not touch the built-in floor or denyPaths (none of those cover this family either). Empty = unchanged default (always classifier). Config key: "tools". */
 	tools: string[];
-	/** Built-in deny floor switch (dangerous regexes + path-sensitivity deny), default true; when off, relies on user rules and the classifier */
+	/** Built-in rules master switch (danger rules + path tiers), default true; false sets every built-in rule's action to allow (the classifier decides), custom danger rules stay active */
 	builtinDenyFloor: boolean;
+	/** Effective ordered danger rules (built-ins with their configured action, minus removed ones, plus custom ones). Config key: "dangerRules" (per-id map, merged global → project → session). */
+	dangerRules: DangerRule[];
+	/** Effective action per path tier. Config key: "pathRules". */
+	pathRules: Record<PathTierId, RuleAction>;
 	/** Forced gate on `.omp` directories: any file-tool path or bash token that resolves into a `.omp` path segment (lexical or realpath form) is a terminal ask (non-interactive → deny). Default true; checked after the built-in floor and user deny, before denyPaths/user allow. Config key: "gateOmpDir". */
 	gateOmpDir: boolean;
 	/** Approval mode: "default" = deny/ask/allow; "yolo" = deny/allow, never prompts (uncertain calls are blocked with an explain-or-rewrite request); "noAutoDeny" = ask/allow (every auto-review deny becomes an ask); "off" = ungated (session-only, never read from a config file). */
@@ -357,7 +404,7 @@ interface UserRules {
 	rootRule: RootRuleConfig | null;
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", modeStatus: true, grantStatus: true, confidenceThreshold: null, defaultDenyThreshold: null, defaultAllowThreshold: null, yoloDenyThreshold: null, noAutoDenyAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierRules: [], rootRule: null };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, dangerRules: DEFAULT_DANGER_RULES(), pathRules: { ...PATH_TIER_DEFAULTS }, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", modeStatus: true, grantStatus: true, confidenceThreshold: null, defaultDenyThreshold: null, defaultAllowThreshold: null, yoloDenyThreshold: null, noAutoDenyAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierRules: [], rootRule: null };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -592,7 +639,7 @@ function pruneSessionOverrides(): void {
 const DEFAULT_ALLOWED_TOOLS = ["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"];
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. builtinDenyFloor=false disables the built-in danger floor at your own risk. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: default (deny/ask/allow) | yolo (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | noAutoDeny (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. defaultDenyThreshold/defaultAllowThreshold, yoloDenyThreshold, noAutoDenyAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). yoloDenyPaths/yoloOmpDir (deny|allow): what yolo does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status). modeStatus (default true): approval-mode chip (🛡 AUTO/YOLO/…) in the prompt status bar — on omp it appears in the status line's \"status\" segment; hidden on pi while the footer is on (the footer already shows the mode). grantStatus (default true): active permission-grant count (🔑 N) in the prompt status bar; hidden when there are none, and on pi while the footer is on. rootRule: the root rule — one baseline policy for the classifier, drafted with /automode-setup ({text, strictness: relaxed|balanced|strict, history, codebase, clarifications}); the highest scope that sets it wins as a whole; classification rules apply on top of it.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. dangerRules: per-id action for built-in danger rules (\"deny\" | \"ask\" | \"allow\" = classifier decides), false removes a rule, {\"pattern\",\"action\",\"reason\",\"flags\"} adds a custom rule; pathRules: action per path tier (s0-secret, s1-system-read, s1-system-write, s2-user-rc-write, s3-git-meta-write); entries merge per id across global, project and session. builtinDenyFloor=false sets every built-in rule to allow (classifier decides) at your own risk; custom rules stay active. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: default (deny/ask/allow) | yolo (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | noAutoDeny (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. defaultDenyThreshold/defaultAllowThreshold, yoloDenyThreshold, noAutoDenyAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). yoloDenyPaths/yoloOmpDir (deny|allow): what yolo does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status). modeStatus (default true): approval-mode chip (🛡 AUTO/YOLO/…) in the prompt status bar — on omp it appears in the status line's \"status\" segment; hidden on pi while the footer is on (the footer already shows the mode). grantStatus (default true): active permission-grant count (🔑 N) in the prompt status bar; hidden when there are none, and on pi while the footer is on. rootRule: the root rule — one baseline policy for the classifier, drafted with /automode-setup ({text, strictness: relaxed|balanced|strict, history, codebase, clarifications}); the highest scope that sets it wins as a whole; classification rules apply on top of it.",
 	allow: ["^ls\\b"],
 	deny: [],
 	tools: DEFAULT_ALLOWED_TOOLS,
@@ -605,6 +652,8 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 		"~/.bashrc",
 	],
 	builtinDenyFloor: true,
+	dangerRules: {},
+	pathRules: {},
 	gateOmpDir: true,
 	mode: "default",
 	classifierModel: null,
@@ -706,11 +755,113 @@ function parseApprovalKeys(raw: Record<string, unknown>, skipped: string[]): Pic
 	};
 }
 
-/** Session overrides restricted to the session keys plus `ruleAdditions`; anything else is reported and dropped. */
+// ---- built-in rule config: per-id maps `dangerRules` / `pathRules` (CF-4–CF-6) ----
+
+const DANGER_RULE_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const CUSTOM_RULE_REASON = "custom danger rule";
+
+export type DangerRuleEntry =
+	| { kind: "remove" }
+	| { kind: "action"; action: RuleAction }
+	| { kind: "rule"; pattern: RegExp; action: RuleAction; reason: string | undefined };
+
+/**
+ * Validate one `dangerRules` entry (config loader and settings tool share it). `false` removes a rule; an action string
+ * re-actions an existing rule (`knownIds`: built-ins and customs visible at lower scopes); an object adds a custom rule or
+ * replaces a built-in's pattern/reason. Patterns are case-insensitive unless `flags` says otherwise; `g`/`y` are rejected (stateful `.test`).
+ */
+export function parseDangerRuleEntry(id: string, v: unknown, knownIds: ReadonlySet<string>): { ok: DangerRuleEntry } | { error: string } {
+	if (!DANGER_RULE_ID_RE.test(id)) return { error: `dangerRules.${id}: invalid rule id (lowercase letters, digits and "-", at most 64 characters)` };
+	if (v === false) return { ok: { kind: "remove" } };
+	if (isRuleAction(v)) {
+		if (!knownIds.has(id)) return { error: `dangerRules.${id}: unknown rule id (a custom rule needs {"pattern": …})` };
+		return { ok: { kind: "action", action: v } };
+	}
+	if (typeof v === "object" && v !== null && !Array.isArray(v)) {
+		const o = v as Record<string, unknown>;
+		if (typeof o.pattern !== "string" || !o.pattern) return { error: `dangerRules.${id}.pattern: must be a non-empty string` };
+		if (o.flags !== undefined && (typeof o.flags !== "string" || !/^[imsu]*$/.test(o.flags))) return { error: `dangerRules.${id}.flags: ${JSON.stringify(o.flags)} (allowed: i, m, s, u)` };
+		if (o.action !== undefined && !isRuleAction(o.action)) return { error: `dangerRules.${id}.action: ${JSON.stringify(o.action)} (deny | ask | allow)` };
+		if (o.reason !== undefined && typeof o.reason !== "string") return { error: `dangerRules.${id}.reason: must be a string` };
+		let pattern: RegExp;
+		try {
+			pattern = new RegExp(o.pattern, typeof o.flags === "string" ? o.flags : "i");
+		} catch (err) {
+			return { error: `dangerRules.${id}.pattern: ${err instanceof Error ? err.message : String(err)}` };
+		}
+		return { ok: { kind: "rule", pattern, action: o.action ?? "deny", reason: o.reason?.trim() || undefined } };
+	}
+	return { error: `dangerRules.${id}: ${JSON.stringify(v)} (expected false, "deny" | "ask" | "allow", or {"pattern": …})` };
+}
+
+/** Effective danger rules from the merged `dangerRules` map. Invalid entries are reported and leave the rule as it was; `floorOn:false` sets every built-in to `allow` (custom rules stay active). */
+function parseDangerRules(merged: Record<string, unknown>, floorOn: boolean, skipped: string[]): DangerRule[] {
+	let list = DEFAULT_DANGER_RULES();
+	for (const [id, v] of Object.entries(merged)) {
+		const r = parseDangerRuleEntry(id, v, new Set(list.map((x) => x.id)));
+		if ("error" in r) {
+			skipped.push(r.error);
+			continue;
+		}
+		const e = r.ok;
+		const i = list.findIndex((x) => x.id === id);
+		if (e.kind === "remove") {
+			if (i >= 0) list.splice(i, 1);
+		} else if (e.kind === "action") {
+			if (i >= 0) list[i] = { ...list[i], action: e.action };
+		} else if (i >= 0) {
+			list[i] = { ...list[i], pattern: e.pattern, action: e.action, reason: e.reason ?? list[i].reason };
+		} else {
+			list.push({ id, pattern: e.pattern, action: e.action, reason: e.reason ?? CUSTOM_RULE_REASON, builtin: false });
+		}
+	}
+	if (!floorOn) list = list.map((r) => (r.builtin ? { ...r, action: "allow" } : r));
+	return list;
+}
+
+/** Effective path-tier actions from the merged `pathRules` map; `floorOn:false` sets every tier to `allow`. */
+function parsePathRules(merged: Record<string, unknown>, floorOn: boolean, skipped: string[]): Record<PathTierId, RuleAction> {
+	const out: Record<PathTierId, RuleAction> = { ...PATH_TIER_DEFAULTS };
+	for (const [id, v] of Object.entries(merged)) {
+		if (!isPathTierId(id)) skipped.push(`pathRules.${id}: unknown path tier (${PATH_TIER_IDS.join(", ")})`);
+		else if (!isRuleAction(v)) skipped.push(`pathRules.${id}: ${JSON.stringify(v)} (deny | ask | allow)`);
+		else out[id] = v;
+	}
+	if (!floorOn) for (const id of PATH_TIER_IDS) out[id] = "allow";
+	return out;
+}
+
+/**
+ * Merge the per-id map `key` across layers (global, project, session; `undefined` = layer absent). A layer that is not a plain
+ * object is reported and ignored; within a layer each id's value replaces the lower one, except an action string over a
+ * lower object entry, which only re-actions it (a custom rule keeps its pattern). `null` values are reported and ignored.
+ */
+function mergeRuleMaps(key: SessionMapKey, layers: unknown[], skipped: string[]): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const layer of layers) {
+		if (layer === undefined) continue;
+		if (typeof layer !== "object" || layer === null || Array.isArray(layer)) {
+			skipped.push(`${key}: must be an object — ignored`);
+			continue;
+		}
+		for (const [id, v] of Object.entries(layer)) {
+			if (v === null) {
+				skipped.push(`${key}.${id}: null — ignored`);
+				continue;
+			}
+			const lower = out[id];
+			if (key === "dangerRules" && isRuleAction(v) && typeof lower === "object" && lower !== null && !Array.isArray(lower)) out[id] = { ...(lower as Record<string, unknown>), action: v };
+			else out[id] = v;
+		}
+	}
+	return out;
+}
+
+/** Session overrides restricted to the session keys, the per-id rule maps, `rootRule` and `ruleAdditions`; anything else is reported and dropped. */
 function sanitizeSessionRaw(sessionRaw: Record<string, unknown>, skipped: string[]): Record<string, unknown> {
 	const out: Record<string, unknown> = {};
 	for (const [k, v] of Object.entries(sessionRaw)) {
-		if (isSessionKey(k)) out[k] = v;
+		if (isSessionKey(k) || isSessionMapKey(k)) out[k] = v;
 		else if (k === "rootRule") out[k] = v;
 		else if (k === "grants") continue; // permission grants (GR-6): not a rules key, read by SessionState.reset
 		else if (k === "ruleAdditions") {
@@ -764,7 +915,17 @@ function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[])
 	if (typeof session.grantStatus === "boolean") grantStatus = session.grantStatus;
 	else if (session.grantStatus !== undefined) skipped.push(`grantStatus: ${JSON.stringify(session.grantStatus)}`);
 	return {
-		rules: { ...EMPTY_RULES, ...parseApprovalKeys(session, skipped), classifierFallbackMode: fbMode === "enforce" ? "enforce" : "shadow", gateOmpDir, modeStatus, grantStatus, footer: footerOk ? footer : EMPTY_RULES.footer },
+		rules: {
+			...EMPTY_RULES,
+			...parseApprovalKeys(session, skipped),
+			classifierFallbackMode: fbMode === "enforce" ? "enforce" : "shadow",
+			gateOmpDir,
+			modeStatus,
+			grantStatus,
+			footer: footerOk ? footer : EMPTY_RULES.footer,
+			dangerRules: parseDangerRules(mergeRuleMaps("dangerRules", [session.dangerRules], skipped), true, skipped),
+			pathRules: parsePathRules(mergeRuleMaps("pathRules", [session.pathRules], skipped), true, skipped),
+		},
 		skipped,
 		shortcutWarning: null,
 		project: null,
@@ -803,6 +964,8 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 			delete raw.mode;
 		}
 		const userKeys = Object.keys(raw);
+		const dangerLayers: unknown[] = [raw.dangerRules];
+		const pathLayers: unknown[] = [raw.pathRules];
 		let projectKeys: string[] = [];
 		// [pi-verdict local patch: project overrides] shallow-merge the nearest trusted project's config over the global raw object
 		const agentDir = agentDirPath();
@@ -839,12 +1002,19 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 					}
 					projectKeys = Object.keys(over);
 					raw = { ...raw, ...over } as typeof raw;
+					dangerLayers.push(over.dangerRules);
+					pathLayers.push(over.pathRules);
 					project = { path: pp, trusted: true, applied: true };
 				}
 			}
 		}
 		const session = sanitizeSessionRaw(sessionRaw, skipped);
 		raw = { ...raw, ...session };
+		dangerLayers.push(session.dangerRules);
+		pathLayers.push(session.pathRules);
+		const floorOn = raw.builtinDenyFloor !== false;
+		const dangerRules = parseDangerRules(mergeRuleMaps("dangerRules", dangerLayers, skipped), floorOn, skipped);
+		const pathRules = parsePathRules(mergeRuleMaps("pathRules", pathLayers, skipped), floorOn, skipped);
 		applyRuleAdditions(raw, skipped);
 		if (raw.autoDeny !== undefined) skipped.push('autoDeny: replaced by mode ("noAutoDeny") — key ignored');
 		if (raw.classifierMinConfidence !== undefined) skipped.push("classifierMinConfidence: renamed to confidenceThreshold — key ignored");
@@ -906,7 +1076,9 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 				deny: compile(raw.deny),
 				denyPaths,
 				tools,
-				builtinDenyFloor: raw.builtinDenyFloor !== false,
+				builtinDenyFloor: floorOn,
+				dangerRules,
+				pathRules,
 				gateOmpDir: raw.gateOmpDir !== false,
 				modeStatus: raw.modeStatus !== false,
 				grantStatus: raw.grantStatus !== false,
@@ -967,8 +1139,8 @@ const S1_SYSTEM = [/^\/etc(\/|$)/i, /^\/private\/(etc|var)(\/|$)/i, /^\/usr(\/|$
 const S2_USER_RC = [/\.(bashrc|zshrc|profile|bash_profile|gitconfig)$/i, /crontab/i, /Library\/LaunchAgents(\/|$)/i, /\.config\/systemd(\/|$)/i];
 const S3_GIT_META = [/(^|\/)\.git\/(hooks|config|modules)(\/|$)/i, /(^|\/)\.gitmodules$/i];
 
-/** read-class tools: S0 read is high risk (deny), other reads are allowed. isWrite: write/edit use the full tiering */
-function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: boolean, floorOn: boolean): RuleResult {
+/** read-class tools: S0 read is high risk, other reads are allowed. isWrite: write/edit use the full tiering. Each tier hit applies its configured action (deny/ask carry the hit for grant coverage; allow = no judgment → gray, first tier hit still wins). */
+function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: boolean, tiers: Readonly<Record<PathTierId, RuleAction>>): RuleResult {
 	const abs = path.resolve(cwd, expandHome(rawPath));
 	// Dual-form matching (#20): rules test every canonical form of the target —
 	// a project-local symlink aliasing ~/.ssh or a .git/hooks dir must not pass
@@ -976,19 +1148,20 @@ function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: b
 	const forms = rebuiltForms(abs);
 	const ruleForms = forms.map(toRuleForm);
 	const hit = (rules: RegExp[]) => ruleForms.some((f) => rules.some((r) => r.test(f)));
-	// When floor is off: built-in deny always degrades to gray (never promoted to allow); non-deny branches (allow/gray) stay as-is
-	const D = floorOn
-		? (reason: string): RuleResult => ({ verdict: "deny", reason })
-		: (reason: string): RuleResult => ({ verdict: "gray", reason });
+	const tier = (id: PathTierId, text: string): RuleResult => {
+		const action = tiers[id];
+		if (action === "allow") return { verdict: "gray", reason: text };
+		return { verdict: action, reason: `tier ${id}: ${text}`, builtin: [{ kind: "path", tier: id, action, forms }] };
+	};
 
-	if (hit(S0_SECRET)) return D(`S0 secrets/credential path: ${rawPath}`);
+	if (hit(S0_SECRET)) return tier("s0-secret", `S0 secrets/credential path: ${rawPath}`);
 	if (!isWrite) {
-		if (hit(S1_SYSTEM)) return { verdict: "gray", reason: `read system config path: ${rawPath}` };
+		if (hit(S1_SYSTEM)) return tier("s1-system-read", `read system config path: ${rawPath}`);
 		return { verdict: "allow" };
 	}
-	if (hit(S1_SYSTEM)) return D(`write to system directory: ${rawPath}`);
-	if (hit(S3_GIT_META)) return D(`write to .git metadata (executable code entry point): ${rawPath}` );
-	if (hit(S2_USER_RC)) return { verdict: "gray", reason: `write to user config/persistence entry point: ${rawPath}` };
+	if (hit(S1_SYSTEM)) return tier("s1-system-write", `write to system directory: ${rawPath}`);
+	if (hit(S3_GIT_META)) return tier("s3-git-meta-write", `write to .git metadata (executable code entry point): ${rawPath}`);
+	if (hit(S2_USER_RC)) return tier("s2-user-rc-write", `write to user config/persistence entry point: ${rawPath}`);
 	// In-cwd write allowance (#20): every canonical form must sit inside the cwd
 	// (in either its lexical or real form) — a lexical prefix hit whose real
 	// form escapes the project (symlink alias) grades as an outside-cwd write.
@@ -1159,31 +1332,30 @@ function ompTouches(toolName: string, input: Record<string, unknown>, cwd: strin
 
 /**
  * Tool call → rule-layer verdict. Order (#12; RL-2, with denyPaths per PP-5):
- *   1. built-in base (bash danger regex floor / path sensitivity grading) — deny is terminal
- *      (the floor can be turned off via builtinDenyFloor)
- *   2. user deny → deny (beats allow)
- *      2a. gateOmpDir (default on): path/command touching a `.omp` directory → terminal ask
- *   3. denyPaths hit → terminal ask (PP-5: the declaring user adjudicates; before user allow)
- *   4. user allow → allow
- *   5. custom-tool exact match (user.tools) → allow (bypasses classifier for that tool)
- *   6. base (path tools' default allow/gray; everything else gray) → classifier
+ *   1. user deny → deny (before the built-in rules; beats every allow)
+ *   2. built-in rules (danger rules / path tiers at their configured action) — a deny is terminal
+ *   3. gateOmpDir (default on): path/command touching a `.omp` directory → terminal ask
+ *   4. denyPaths hit → terminal ask (PP-5: the declaring user adjudicates; before user allow)
+ *   5. user allow → allow (beats a built-in ask, never a built-in deny)
+ *   6. custom-tool exact match (user.tools) → allow (bypasses classifier for that tool)
+ *   7. base (built-in ask; path tools' default allow/gray; everything else gray) → classifier
  */
 function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: string, user: UserRules, denyPathBases: string[]): RuleResult {
 	let base: RuleResult;
 	const kind = toolKind(toolName);
 	if (kind === "command") {
-		base = classifyBash(String(input.command ?? ""), user.builtinDenyFloor);
+		base = classifyBash(String(input.command ?? ""), user.dangerRules);
 	} else if (toolName === "write" || toolName === "edit") {
 		// isWrite grading nuance stays per-tool (not part of the family map)
-		base = classifyPath(toolName, String(input.path ?? ""), cwd, true, user.builtinDenyFloor);
+		base = classifyPath(toolName, String(input.path ?? ""), cwd, true, user.pathRules);
 	} else if (toolName === "read") {
 		// read keeps classifyPath even with an empty path: resolved to cwd, it still
 		// carries the system-directory gray grading (bit-for-bit with the old switch)
-		base = classifyPath(toolName, String(input.path ?? ""), cwd, false, user.builtinDenyFloor);
+		base = classifyPath(toolName, String(input.path ?? ""), cwd, false, user.pathRules);
 	} else if (kind === "file") { // grep/find/ls: optional path; absent → cwd is the
 		// effective target, so user rules and denyPaths compare against it (#48)
 		const p = typeof input.path === "string" ? input.path : undefined;
-		base = p ? classifyPath(toolName, p, cwd, false, user.builtinDenyFloor) : { verdict: "allow" };
+		base = p ? classifyPath(toolName, p, cwd, false, user.pathRules) : { verdict: "allow" };
 	} else if (toolName === SETTINGS_TOOL_NAME) {
 		// RL-8: the tool confirms every change with the user itself; no target, so user rules/denyPaths never apply
 		base = { verdict: "allow", reason: "pi-verdict settings tool (confirms every change with the user)" };
@@ -1195,25 +1367,30 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 	} else {
 		base = { verdict: "gray", reason: `tool not covered by built-in rules: ${toolName}` };
 	}
-	if (base.verdict === "deny") return base; // built-in floor: deny takes priority over all user rules
 
 	const target = userRuleTarget(toolName, input, cwd);
 	if (target !== null) {
 		for (const re of user.deny) {
 			if (re.test(target)) return { verdict: "deny", reason: `user deny rule: ${re.source}` };
 		}
-		// Forced .omp gate: terminal ask, after user deny, before denyPaths/user allow.
+	}
+	if (base.verdict === "deny") return base; // built-in deny: terminal; no user allow, gate or grant-free path overrides it
+
+	if (target !== null) {
+		// A built-in ask the gate ask supersedes stays attached, so a grant can still cover it and yolo can still refuse it
+		const underneath: Pick<RuleResult, "builtin" | "builtinReason"> = base.verdict === "ask" && base.builtin ? { builtin: base.builtin, builtinReason: base.reason } : {};
+		// Forced .omp gate: terminal ask, after user deny and built-in deny, before denyPaths/user allow.
 		// Reason carries no path (it travels back into agent context); the path is UI-only detail.
 		if (user.gateOmpDir) {
 			const omp = hitOmpDir(toolName, input, cwd);
-			if (omp) return { verdict: "ask", reason: "forced gate: access to a .omp directory (gateOmpDir)", detail: omp, gate: "omp-dir" };
+			if (omp) return { verdict: "ask", reason: "forced gate: access to a .omp directory (gateOmpDir)", detail: omp, gate: "omp-dir", ...underneath };
 		}
 		// denyPaths hit → terminal ask (RL-2, PP-5): after user deny, before user allow —
 		// a protected path is the user's exception to their own allow rules.
 		// The matched path goes to `detail` (confirm dialog only): reasons travel back
 		// into the agent context, so plaintext there would leak the declaration.
 		const hit = hitDenyPaths(toolName, input, cwd, denyPathBases);
-		if (hit) return { verdict: "ask", reason: "user-declared protected path (denyPaths) [path withheld; see pi-verdict.json]", detail: hit, gate: "deny-paths" };
+		if (hit) return { verdict: "ask", reason: "user-declared protected path (denyPaths) [path withheld; see pi-verdict.json]", detail: hit, gate: "deny-paths", ...underneath };
 		for (const re of user.allow) {
 			if (re.test(target)) return { verdict: "allow", reason: "user allow rule" };
 		}
@@ -1291,6 +1468,7 @@ function trustedPolicyBlock(policy: ClassifierPolicy): string {
 		const lines = grants.map((g) => {
 			const n = g.paths.length;
 			let line = `- ${g.id}: ${transcriptSafe(g.request)}`;
+			if (g.rules.length > 0) line += ` (danger rules: ${g.rules.map(transcriptSafe).join(", ")})`;
 			if (n > 0 && !policy.grantPaths) line += ` (plus ${n} protected-path access ${n === 1 ? "entry" : "entries"}, enforced separately)`;
 			if (n > 0 && policy.grantPaths) for (const p of g.paths) line += `\n  protected-path access: ${p.access} ${transcriptSafe(p.path)}`;
 			return line;
@@ -1757,6 +1935,14 @@ function shadowCommandKey(toolName: string, input: Record<string, unknown>, cwd:
 	return fnv1a(`${toolName}\u0000${JSON.stringify(input)}\u0000${cwd}`);
 }
 
+/** PR-9: which rule-layer outcome a remembered approval answered; part of the key so a later deny rule, denyPaths entry or built-in ask is never bypassed by an approval given for a different origin. */
+export type AskOrigin = "rule-deny" | "builtin-ask" | "gate" | "gray";
+
+/** PR-9: exact-call key of a remembered approval. Plain string, never a hash: a collision would allow a call the user never approved. Holds path plaintext for gate asks — memory only, never in reasons/notifications (PP-6). */
+export function approvalKey(origin: AskOrigin, toolName: string, input: Record<string, unknown>, cwd: string): string {
+	return `${origin}\u0000${toolName}\u0000${JSON.stringify(input)}\u0000${cwd}`;
+}
+
 function shadowContextKey(host: PipelineHost): string {
 	const { userLines } = collectTranscriptParts(host);
 	return fnv1a(userLines.slice(-MAX_USER_MESSAGES).join("\u0000"));
@@ -1949,11 +2135,13 @@ export const GRANT_ACCESS = ["read", "write", "full"] as const;
 export type GrantAccess = (typeof GRANT_ACCESS)[number];
 /** A protected-path access entry. `forms` = denyPathForms(path, cwd) at grant time (anchored once, like PP-1). */
 export interface GrantPath { path: string; access: GrantAccess; forms: string[] }
-export interface PermissionGrant { id: string; request: string; paths: GrantPath[]; grantedBy: "user" | "classifier"; grantedAt: string }
+/** `rules`: ids of built-in danger rules the grant covers (GR-5); `[]` for a path-only grant. */
+export interface PermissionGrant { id: string; request: string; paths: GrantPath[]; rules: string[]; grantedBy: "user" | "classifier"; grantedAt: string }
 const MAX_ACTIVE_GRANTS = 20;
 const MAX_GRANT_REQUEST_CHARS = 1000;
 const MAX_GRANT_PATHS = 10;
 const MAX_GRANT_PATH_CHARS = 500;
+const MAX_GRANT_RULES = 20;
 
 /** Parse the persisted `{ next, active }` grants record; malformed entries are dropped and counted. */
 export function parseGrants(raw: unknown): { next: number; active: PermissionGrant[]; dropped: number } {
@@ -1971,6 +2159,7 @@ export function parseGrants(raw: unknown): { next: number; active: PermissionGra
 			&& (g.grantedBy === "user" || g.grantedBy === "classifier")
 			&& typeof g.grantedAt === "string"
 			&& Array.isArray(g.paths)
+			&& (g.rules === undefined || (Array.isArray(g.rules) && g.rules.every((r) => typeof r === "string")))
 			&& g.paths.every((p) => {
 				const q = p as Record<string, unknown> | null;
 				return typeof q === "object" && q !== null && typeof q.path === "string"
@@ -1989,6 +2178,7 @@ export function parseGrants(raw: unknown): { next: number; active: PermissionGra
 			grantedBy: grant.grantedBy,
 			grantedAt: grant.grantedAt,
 			paths: grant.paths.map((p) => ({ path: p.path, access: p.access, forms: [...p.forms] })),
+			rules: Array.isArray(g.rules) ? [...(g.rules as string[])] : [],
 		});
 	}
 	const n = rec.next;
@@ -2019,6 +2209,8 @@ export class SessionState {
 	verdictCounts = { allow: 0, ask: 0, deny: 0 };
 	/** Verdict label per allowed tool call, consumed once by `tool_result`. */
 	private readonly labels = new Map<string, VerdictLabel>();
+	/** Remembered approvals (PR-9): `approvalKey`s the user answered "Yes, and don't ask again this session"; memory only, cleared by `reset`. */
+	private readonly approvals = new Set<string>();
 
 	constructor(userRules: UserRules = loadUserRules().rules, agentDir: string | null = null) {
 		this.userRules = userRules;
@@ -2076,7 +2268,27 @@ export class SessionState {
 		this.fallback.reset();
 		this.verdictCounts = { allow: 0, ask: 0, deny: 0 };
 		this.labels.clear();
+		this.approvals.clear();
 		return report;
+	}
+
+	rememberApproval(key: string): void {
+		this.approvals.add(key);
+	}
+
+	isApprovalRemembered(key: string): boolean {
+		return this.approvals.has(key);
+	}
+
+	get rememberedApprovals(): number {
+		return this.approvals.size;
+	}
+
+	/** Drops every remembered approval; returns how many there were. */
+	forgetApprovals(): number {
+		const n = this.approvals.size;
+		this.approvals.clear();
+		return n;
 	}
 
 	/** denyPaths base: already anchored by session_start; this lazy fallback only guards an out-of-order first tool_call
@@ -2115,6 +2327,14 @@ export interface Verdict {
 	autoResolve?: "consult" | "allow" | "deny";
 	/** yolo only: this block stands in for an ask — the agent is told to explain or rewrite and retry. */
 	retry?: true;
+	/** The verdict stems from a built-in rule hit: the block reason names the rule/tier id and points at the permission-grant channel (GR-5). */
+	grantable?: true;
+	/** A built-in path-tier ask: the reason embeds the path, so the confirm dialog must not offer Explain (PP-9). */
+	noExplain?: true;
+	/** PR-9: set on every ask — the key a "Yes, and don't ask again this session" answer is stored under; absent = the dialog offers no remember row. */
+	approvalKey?: string;
+	/** PR-9: this allow is a remembered approval (no classifier call, no dialog). */
+	remembered?: true;
 }
 
 /** Per-call environment: presentation-agnostic host capabilities. model is lazily evaluated via getModel - preserving the "resolve only
@@ -2276,9 +2496,9 @@ export async function resolveAskWithoutHuman(
 
 /** Task paragraphs appended (after the grants) to the classifier prompt by the two grant mechanisms (GR-3, GR-5). */
 const GRANT_COVERAGE_TASK =
-	"Coverage check: the action under review touches a user-protected path or a .omp directory that is gated. The grants listed above cover these paths. Answer allow only if the action stays within the literal scope of one of those grants, including its access level — read: reading, listing or searching only; write: creating, modifying or deleting (reading only as needed to edit in place); full: any access, including copying or moving the contents elsewhere. Otherwise answer ask.";
+	"Coverage check: the action under review is gated by a user-protected path, a .omp directory, a built-in protected path tier, or a built-in danger rule. The grants listed above cover these. Answer allow only if the action stays within the literal scope of one of those grants — the specific operation it describes and, for path access, its access level (read: reading, listing or searching only; write: creating, modifying or deleting, reading only as needed to edit in place; full: any access, including copying or moving the contents elsewhere). Otherwise answer ask.";
 const GRANT_REVIEW_TASK =
-	"Grant review: the action under review is the agent's request for a session-long permission grant (tool verdict_grant), not an operation that runs now. No human is available. Answer allow only if the user's messages in the transcript clearly ask for or sanction the requested operation and its full scope, including any protected-path access listed; otherwise answer deny.";
+	"Grant review: the action under review is the agent's request for a session-long permission grant (tool verdict_grant), not an operation that runs now. No human is available. Answer allow only if the user's messages in the transcript clearly ask for or sanction the requested operation and its full scope, including any protected-path access and danger rules listed; otherwise answer deny.";
 
 /** Result of the two-model grant check; `raw` is the judge's audit material (null when no model ran). */
 interface GrantConsensus { allowed: boolean; reason: string; raw: ClassifierOutcome["auditRaw"] | null }
@@ -2316,12 +2536,14 @@ async function grantConsensus(
 }
 
 /**
- * GR-5: the grants that deterministically cover every protected-path touch of a gated call, or null when the call is not fully
- * coverable (a `.omp` bare word, no touches, or any touch outside every grant path / access level). Both gates are considered —
- * `classifyByRules` reports only the first — so approving a `.omp` touch can never wave through a denyPaths touch. Command tools
- * pass at any access level here; the scope check by the models enforces the level.
+ * GR-5: the grants that deterministically cover everything that gates a call, or null when the call is not fully coverable
+ * (a `.omp` bare word, nothing to cover, or any part outside every grant). Covered: each built-in danger-rule hit (its id is in
+ * some grant's `rules`), each built-in path-tier hit (every form sits under a grant path of a fitting access level), and each
+ * protected-path touch (`.omp` directory, denyPaths). Both user gates are considered — `classifyByRules` reports only the
+ * first — so approving a `.omp` touch can never wave through a denyPaths touch. Command tools pass at any access level
+ * here; the scope check by the models enforces the level.
  */
-function coveringGrants(state: SessionState, call: { toolName: string; input: Record<string, unknown> }, cwd: string): PermissionGrant[] | null {
+function coveringGrants(state: SessionState, call: { toolName: string; input: Record<string, unknown> }, cwd: string, builtin: readonly BuiltinHit[]): PermissionGrant[] | null {
 	const touches: string[] = [];
 	if (state.userRules.gateOmpDir) {
 		const omp = ompTouches(call.toolName, call.input, cwd);
@@ -2329,9 +2551,16 @@ function coveringGrants(state: SessionState, call: { toolName: string; input: Re
 		touches.push(...omp.forms);
 	}
 	touches.push(...denyPathHits(call.toolName, call.input, cwd, state.anchoredDenyPathBases(cwd)).map((h) => h.touch));
-	if (touches.length === 0) return null;
+	for (const b of builtin) if (b.kind === "path") touches.push(...b.forms);
+	const dangerIds = builtin.flatMap((b) => (b.kind === "danger" ? [b.id] : []));
+	if (touches.length === 0 && dangerIds.length === 0) return null;
 	const needs: readonly GrantAccess[] = toolKind(call.toolName) === "command" ? GRANT_ACCESS : call.toolName === "write" || call.toolName === "edit" ? ["write", "full"] : ["read", "full"];
 	const used = new Set<PermissionGrant>();
+	for (const id of dangerIds) {
+		const owners = state.grants.filter((g) => g.rules.includes(id));
+		if (owners.length === 0) return null;
+		for (const g of owners) used.add(g);
+	}
 	for (const t of touches) {
 		let covered = false;
 		for (const g of state.grants) {
@@ -2358,17 +2587,14 @@ const NO_AUTO_DENY_SUFFIX = " (noAutoDeny: this would have been denied — your 
 /** yolo: reason suffix on the block that stands in for an ask (no human can confirm) */
 const YOLO_RETRY_SUFFIX = " (yolo: no human can confirm this — explain why the action is needed or rewrite it as a narrower, safer command, then retry)";
 
-export async function adjudicate(
+async function adjudicateRuled(
 	state: SessionState,
 	call: { toolName: string; input: Record<string, unknown> },
 	env: AdjudicateEnv,
+	rule: RuleResult,
 ): Promise<Verdict> {
-	const rule = classifyByRules(call.toolName, call.input, env.cwd, state.userRules, state.anchoredDenyPathBases(env.cwd));
 	if (rule.verdict === "allow") return { verdict: "allow", reason: rule.reason ?? "", source: "rule", degraded: false };
-	if (rule.verdict === "deny") {
-		if (state.userRules.mode === "noAutoDeny" && env.hasUI) return { verdict: "ask", reason: (rule.reason ?? "") + NO_AUTO_DENY_SUFFIX, source: "rule", degraded: false, autoResolve: "deny" };
-		return { verdict: "deny", reason: rule.reason ?? "", source: "rule", degraded: false };
-	}
+	const builtin = rule.builtin ?? [];
 
 	// #62: the audit surface widens to protected-path asks (their user answers grade the
 	// denyPaths rules); rule allow/deny stay unaudited (no corpus value, #54). Record
@@ -2393,23 +2619,41 @@ export async function adjudicate(
 		...v,
 	});
 
-	if (rule.verdict === "ask") {
-		// GR-5: a grant with protected-path access entries may cover the gated touches — both models' scope check decides. The deliberate PP-6 exception:
-		// the action line and the grants' paths reach the models here; the verdict reason stays fixed-form (no model text, no path).
-		if (state.grants.some((g) => g.paths.length > 0)) {
-			const covering = coveringGrants(state, call, env.cwd);
-			if (covering) {
-				const ids = covering.map((g) => g.id).join(", ");
-				const check = await grantConsensus(state, env, actionLine, { ...classifierPolicy(state), grants: covering, grantPaths: true, task: GRANT_COVERAGE_TASK }, ["allow", "ask"]);
-				if (check.allowed) {
-					state.audit?.append({ ...buildRecord({ verdict: "allow", reason: `permission grant ${ids} covers this protected-path access: ${check.reason}`, source: "protected-path", degraded: false }, check.raw, "-"), detail: rule.detail });
-					return { verdict: "allow", reason: `permission grant ${ids} covers this protected-path access`, source: "protected-path", degraded: false };
-				}
+	// GR-5: a grant with protected-path access entries or danger-rule ids may cover a gated call (a built-in deny or ask, a gate ask) — both models' scope
+	// check decides. The deliberate PP-6 exception: the action line and the grants' paths reach the models here; the verdict reason stays fixed-form (no model text, no path).
+	const gated = rule.verdict === "ask" || (rule.verdict === "deny" && builtin.length > 0);
+	if (gated && state.grants.some((g) => g.paths.length > 0 || g.rules.length > 0)) {
+		const covering = coveringGrants(state, call, env.cwd, builtin);
+		if (covering) {
+			const ids = covering.map((g) => g.id).join(", ");
+			const check = await grantConsensus(state, env, actionLine, { ...classifierPolicy(state), grants: covering, grantPaths: true, task: GRANT_COVERAGE_TASK }, ["allow", "ask"]);
+			if (check.allowed) {
+				const source = rule.gate ? "protected-path" : "rule";
+				state.audit?.append({ ...buildRecord({ verdict: "allow", reason: `permission grant ${ids} covers this gated access: ${check.reason}`, source: "protected-path", degraded: false }, check.raw, "-"), detail: rule.detail });
+				return { verdict: "allow", reason: `permission grant ${ids} covers this gated access`, source, degraded: false };
 			}
 		}
-		// yolo never prompts: the gate's action setting decides (default deny; "allow" passes silently)
+	}
+
+	if (rule.verdict === "deny") {
+		const grantable = builtin.length > 0;
+		if (state.userRules.mode === "noAutoDeny" && env.hasUI) return { verdict: "ask", reason: (rule.reason ?? "") + NO_AUTO_DENY_SUFFIX, source: "rule", degraded: false, autoResolve: "deny", ...(grantable ? { grantable } : {}) };
+		return { verdict: "deny", reason: rule.reason ?? "", source: "rule", degraded: false, ...(grantable ? { grantable } : {}) };
+	}
+
+	if (rule.verdict === "ask" && !rule.gate) {
+		// Built-in ask (a danger rule or path tier set to "ask"): like a denyPaths ask — dialog with a UI, deny headless or in yolo (no yolo key of its own)
+		const reason = rule.reason ?? "";
+		if (state.userRules.mode === "yolo") return { verdict: "deny", reason, source: "rule", degraded: false, grantable: true };
+		if (env.hasUI) return { verdict: "ask", reason, source: "rule", degraded: false, autoResolve: "deny", ...(builtin.some((b) => b.kind === "path") ? { noExplain: true as const } : {}) };
+		return { verdict: "deny", reason, source: "rule", degraded: true, grantable: true };
+	}
+
+	if (rule.verdict === "ask") {
+		// yolo never prompts: the gate's action setting decides (default deny; "allow" passes silently, except over a built-in ask/deny underneath, which yolo refuses)
 		if (state.userRules.mode === "yolo") {
 			const action = rule.gate === "omp-dir" ? state.userRules.yoloOmpDir : state.userRules.yoloDenyPaths;
+			if (action === "allow" && builtin.length > 0) return { verdict: "deny", reason: rule.builtinReason ?? "", source: "rule", degraded: false, grantable: true };
 			const ppRecord: AuditRecord = { ...buildRecord({ verdict: action, reason: rule.reason ?? "", source: "protected-path", degraded: false }, null, "-"), detail: rule.detail };
 			state.audit?.append(ppRecord);
 			return { verdict: action, reason: rule.reason ?? "", source: "protected-path", degraded: false };
@@ -2532,6 +2776,32 @@ export async function adjudicate(
 	if (effVerdict === "deny") return { verdict: "deny", reason: effReason, source: effSource, degraded: false, shadow };
 	// ask: no UI downgrades to deny (ask downgrade, CONTEXT.md entry)
 	return { verdict: "deny", reason: effReason, source: effSource, degraded: true, shadow };
+}
+
+const REMEMBERED_APPROVAL_REASON = "remembered approval (this session)";
+
+/**
+ * Adjudication pipeline (implementation of the "adjudication pipeline" entry in CONTEXT.md): built-in floor -> user deny ->
+ * denyPaths ask -> user allow -> gray-area classifier; ask downgrade (no UI -> deny) and fail-closed
+ * are built in here, the two duplicated downgrade implementations are now unique. Zero UI: presentation (notify/confirm) is rendered by the extension
+ * handler via the source x degraded template. Exported only for tests (test surface of the internal seam, existing pattern from #35).
+ * PR-9: a remembered approval for the exact call returns before GR-5 coverage, the gates and the classifier; a rule-layer deny is overridden only in noAutoDeny.
+ */
+export async function adjudicate(
+	state: SessionState,
+	call: { toolName: string; input: Record<string, unknown> },
+	env: AdjudicateEnv,
+): Promise<Verdict> {
+	const rule = classifyByRules(call.toolName, call.input, env.cwd, state.userRules, state.anchoredDenyPathBases(env.cwd));
+	if (rule.verdict === "allow") return adjudicateRuled(state, call, env, rule);
+	const origin: AskOrigin = rule.verdict === "deny" ? "rule-deny" : rule.verdict === "ask" ? (rule.gate ? "gate" : "builtin-ask") : "gray";
+	const key = approvalKey(origin, call.toolName, call.input, env.cwd);
+	const applies = origin !== "rule-deny" || (state.userRules.mode === "noAutoDeny" && env.hasUI);
+	if (applies && state.isApprovalRemembered(key)) {
+		return { verdict: "allow", reason: REMEMBERED_APPROVAL_REASON, source: origin === "gate" ? "protected-path" : "rule", degraded: false, remembered: true };
+	}
+	const v = await adjudicateRuled(state, call, env, rule);
+	return v.verdict === "ask" ? { ...v, approvalKey: key } : v;
 }
 
 // ============================================================================
@@ -2856,6 +3126,7 @@ export function buildSettingsMenu(
 	const hintFor = (row: MenuRow | undefined, rs: MenuRow[]): string => {
 		if (editing) return "enter save · esc cancel";
 		if (page !== null) {
+			if (row?.kind === "choice") return "←→ change · enter next value · esc back · tab scope";
 			const first = row?.kind === "entry" ? "enter edit · d remove" : row?.kind === "add" ? "enter add" : "enter select";
 			return `${first} · ← / esc back · tab scope`;
 		}
@@ -2962,7 +3233,7 @@ export function buildSettingsMenu(
 				}
 			} else if (kb.matches(data, "tui.select.up") || data === "k") move(-1);
 			else if (kb.matches(data, "tui.select.down") || data === "j") move(1);
-			else if (left && page !== null) back();
+			else if (left && page !== null && row?.kind !== "choice") back();
 			else if ((left || right) && row?.kind === "choice" && row.locked === undefined) stepChoice(row, right ? 1 : -1, false, prevPending?.id === row.id ? prevPending.value : row.value);
 			else if ((left || right || data === "-" || data === "+" || data === "=") && row?.kind === "percent") {
 				const delta = left ? -5 : right ? 5 : data === "-" ? -1 : 1;
@@ -3080,7 +3351,7 @@ const RULE_GEN_MAX_TOKENS = 1024;
 const RULE_GEN_MAX_TOOL_CALLS = 20;
 
 /** Layer precedence shared by the generator and critic prompts: an allow/tools rule is useless when an earlier layer already decides the call. */
-const RULE_LAYERS_DOC = String.raw`Rule-layer order for every tool call: 1) built-in deny floor (dangerous commands, sensitive system/credential paths) — terminal deny; 2) user deny regexes; 3) the forced .omp gate: any call touching a .omp directory always asks the human — only the gateOmpDir setting disables it, no rule can; 4) protected paths (denyPaths) — ask; 5) user allow regexes; 6) tools allowlist; 7) everything else goes to the classifier, which also reads the free-text rules. An allow or tools rule therefore can never auto-allow a call stopped by layers 1–4. If the request can only be met by changing a setting (e.g. gateOmpDir, builtinDenyFloor), still output the closest useful rule and name the setting in your explanation.`;
+const RULE_LAYERS_DOC = String.raw`Rule-layer order for every tool call: 1) user deny regexes; 2) built-in rules (dangerous commands, sensitive system/credential paths) — each with a configured action, deny by default; a built-in deny is terminal for rules, only a permission grant can lift it; 3) the forced .omp gate: any call touching a .omp directory always asks the human — only the gateOmpDir setting disables it, no rule can; 4) protected paths (denyPaths) — ask; 5) user allow regexes (they beat a built-in ask, never a built-in deny); 6) tools allowlist; 7) everything else goes to the classifier, which also reads the free-text rules. An allow or tools rule therefore can never auto-allow a call stopped by layers 1–4, except that an allow regex does pre-answer a built-in ask not covered by layers 3–4. If the request can only be met by changing a setting (e.g. gateOmpDir, builtinDenyFloor, dangerRules, pathRules), still output the closest useful rule and name the setting in your explanation.`;
 
 const RULE_KINDS_DOC = String.raw`Rule kinds:
 - allow: JavaScript regex. Tested against the full command string of bash/powershell calls, and against the resolved absolute path of read/write/edit/grep/find/ls calls (forward slashes, no drive letter, e.g. /Users/me/proj/src/a.ts). A match auto-allows the call without the classifier. deny beats allow.
@@ -3153,6 +3424,7 @@ export function validateRule(kind: EditableListKey, value: string): { value: str
 
 export const SETTINGS_TOOL_NAME = "verdict_settings";
 export const SETTINGS_TOOL_KEYS = [
+	"dangerRules", "pathRules",
 	"allow", "deny", "denyPaths", "tools", "rules",
 	"builtinDenyFloor", "gateOmpDir", "mode", "yoloDenyPaths", "yoloOmpDir",
 	"confidenceThreshold", "defaultDenyThreshold", "defaultAllowThreshold", "yoloDenyThreshold", "noAutoDenyAllowThreshold",
@@ -3174,9 +3446,29 @@ const SETTINGS_ENUMS: Record<string, readonly string[]> = {
 };
 const SETTINGS_STRING_KEYS: readonly string[] = ["classifierModel", "classifierFallbackModel", "explainGateModel", "explainGatePrompt"];
 
-/** Validate a `set` value for the settings tool; returns the canonical value to store. Errors read `<key>: <why>`. */
-export function validateSettingValue(key: SettingsToolKey, value: unknown): { value: unknown } | { error: string } {
+/** Validate a `set` value for the settings tool; returns the canonical value to store. Errors read `<key>: <why>`.
+ *  `knownDangerIds`: rule ids an action string may name (effective rules at call time; defaults to the built-ins). */
+export function validateSettingValue(key: SettingsToolKey, value: unknown, knownDangerIds: ReadonlySet<string> = new Set(BASH_DANGER_RULES.map((r) => r.id))): { value: unknown } | { error: string } {
 	const bad = (why: string) => ({ error: `${key}: ${why}` });
+	if (key === "dangerRules" || key === "pathRules") {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return bad("must be an object (id → entry; null drops an id at this scope)");
+		const entries = Object.entries(value as Record<string, unknown>);
+		if (key === "pathRules") {
+			for (const [id, v] of entries) {
+				if (v === null) continue;
+				if (!isPathTierId(id)) return bad(`${id}: unknown path tier (${PATH_TIER_IDS.join(", ")})`);
+				if (!isRuleAction(v)) return bad(`${id}: must be one of ${RULE_ACTIONS.join(", ")}`);
+			}
+			return { value };
+		}
+		const known = new Set([...knownDangerIds, ...entries.filter(([, v]) => typeof v === "object" && v !== null).map(([id]) => id)]);
+		for (const [id, v] of entries) {
+			if (v === null) continue;
+			const r = parseDangerRuleEntry(id, v, known);
+			if ("error" in r) return { error: r.error };
+		}
+		return { value };
+	}
 	if (isListKey(key)) {
 		if (!Array.isArray(value)) return bad("must be an array of strings");
 		const out: string[] = [];
@@ -3220,7 +3512,7 @@ export function validateSettingValue(key: SettingsToolKey, value: unknown): { va
 /** Scope rules of the settings tool; returns the first violated one, or null. */
 export function settingScopeError(action: string, key: SettingsToolKey, scope: MenuScope, value: unknown): string | null {
 	if ((action === "add" || action === "remove") && !isListKey(key)) return "add/remove apply only to list keys (allow, deny, denyPaths, tools, rules)";
-	if (scope === "session" && !isSessionKey(key) && !isListKey(key) && key !== "rootRule") return `${key} cannot be set per session — use scope local or global`;
+	if (scope === "session" && !isSessionKey(key) && !isSessionMapKey(key) && !isListKey(key) && key !== "rootRule") return `${key} cannot be set per session — use scope local or global`;
 	if (scope === "local" && key === "toggleShortcut") return "toggleShortcut is not overridable per project — use scope global";
 	if (action === "set" && key === "mode" && value === "off" && scope !== "session") return 'mode "off" is session-only';
 	return null;
@@ -3462,7 +3754,7 @@ export function collectProjectContext(cwd: string, denyPathBases: string[]): Pro
 	const parts: string[] = [];
 	let skippedProtected = 0;
 	let total = 0;
-	const isProtected = (abs: string): boolean => classifyPath("read", abs, cwd, false, true).verdict === "deny" || hitDenyPaths("read", { path: abs }, cwd, denyPathBases) !== null;
+	const isProtected = (abs: string): boolean => classifyPath("read", abs, cwd, false, PATH_TIER_DEFAULTS).verdict === "deny" || hitDenyPaths("read", { path: abs }, cwd, denyPathBases) !== null;
 
 	let entries: fs.Dirent[] = [];
 	try {
@@ -3891,13 +4183,13 @@ export const VERDICT_LABEL_TYPE = "pi-verdict-label";
 /** Status row after an allowed call's block. Carries no reason text and no path (PP-6): tool name, how it passed, jev numbers only. */
 export interface VerdictLabel {
 	tool: string;
-	how: "rule" | "classifier" | "user" | "second-model";
+	how: "rule" | "classifier" | "user" | "second-model" | "remembered";
 	jev: { choice: "allow" | "ask" | "deny"; probabilities: Record<"allow" | "ask" | "deny", number>; confidence: number } | null;
 }
 
-const LABEL_HOWS: readonly VerdictLabel["how"][] = ["rule", "classifier", "user", "second-model"];
-const LABEL_OUTCOME: Record<VerdictLabel["how"], string> = { rule: "allowed: rule", classifier: "allowed: classifier", user: "approved by user", "second-model": "allowed: second model (no human)" };
-const LABEL_SHORT: Record<VerdictLabel["how"], string> = { rule: "rule", classifier: "classifier", user: "approved", "second-model": "2nd model" };
+const LABEL_HOWS: readonly VerdictLabel["how"][] = ["rule", "classifier", "user", "second-model", "remembered"];
+const LABEL_OUTCOME: Record<VerdictLabel["how"], string> = { rule: "allowed: rule", classifier: "allowed: classifier", user: "approved by user", "second-model": "allowed: second model (no human)", remembered: "allowed: remembered approval" };
+const LABEL_SHORT: Record<VerdictLabel["how"], string> = { rule: "rule", classifier: "classifier", user: "approved", "second-model": "2nd model", remembered: "remembered" };
 const LABEL_BAR_CELLS = 10;
 
 function verdictLabelFor(tool: string, how: VerdictLabel["how"], reason: string): VerdictLabel {
@@ -3932,7 +4224,7 @@ function asVerdictLabel(x: unknown): VerdictLabel | null {
 /** One compact row: shield, tool, how it passed (icon + short text), and for jev verdicts a 10-cell probability bar plus the chosen verdict's %. Drops the jev part, then everything, when `width` is too small. */
 export function renderVerdictLabel(l: VerdictLabel, theme: Pick<Theme, "fg" | "bold">, nerdFont: boolean, width: number): string[] {
 	const shield = nerdFont ? NF_SHIELD : "🛡️";
-	const icon = nerdFont ? { rule: NF_GAVEL, classifier: NF_CHIP, "second-model": NF_CHIP, user: NF_USER }[l.how] : { rule: "📜", classifier: "🤖", "second-model": "🤖", user: "👤" }[l.how];
+	const icon = nerdFont ? { rule: NF_GAVEL, classifier: NF_CHIP, "second-model": NF_CHIP, user: NF_USER, remembered: NF_USER }[l.how] : { rule: "📜", classifier: "🤖", "second-model": "🤖", user: "👤", remembered: "👤" }[l.how];
 	const iconW = nerdFont ? 1 : 2;
 	const short = LABEL_SHORT[l.how];
 	const tool = displaySafe(l.tool);
@@ -3989,19 +4281,22 @@ interface ApproveDialogSpec {
 	variant?: "ask" | "grant";
 	/** extra plain lines rendered after the reason line (protected-path access entries of a grant) */
 	extraLines?: string[];
+	/** offer "Yes, and don't ask again this session" (PR-9); never in the grant variant */
+	remember?: boolean;
 }
 
 /** The options the dialog lists. */
-type AskOption = "yes" | "no" | "explain" | "reject";
+type AskOption = "yes" | "always" | "no" | "explain" | "reject";
 
-/** Interactive ask outcome. `reason` is the user's own explanation of a decline (forwarded to the agent). */
-export type AskDecision = { allow: true } | { allow: false; reason?: string };
+/** Interactive ask outcome. `reason` is the user's own explanation of a decline (forwarded to the agent). `remember`: the user chose the PR-9 row. */
+export type AskDecision = { allow: true; remember?: true } | { allow: false; reason?: string };
 
 /** What the dialog resolves with: a final decision (No carries the inline text as `reason`) or a request for the EXPLAIN-GATE follow-up. */
 export type AskPick = AskDecision | "explain";
 
 const ASK_LABELS: Record<AskOption, string> = {
 	yes: "Yes",
+	always: "Yes, and don't ask again this session",
 	no: "No",
 	explain: "Explain… (optional question)",
 	reject: "Reject",
@@ -4021,7 +4316,7 @@ const GRANT_CLARIFY_PLACEHOLDER = "ask the agent for details or a narrower scope
 function isAskPick(x: unknown): x is AskPick {
 	if (x === "explain") return true;
 	if (typeof x !== "object" || x === null || !("allow" in x)) return false;
-	if (x.allow === true) return true;
+	if (x.allow === true) return !("remember" in x) || x.remember === undefined || x.remember === true;
 	return x.allow === false && (!("reason" in x) || x.reason === undefined || typeof x.reason === "string");
 }
 
@@ -4123,7 +4418,7 @@ export function buildApproveDialog(
 		root.addChild(new Spacer(1));
 		root.addChild(new Text(theme.fg("text", spec.question), 1, 0));
 		const grant = spec.variant === "grant";
-		const choices: AskOption[] = grant ? ["yes", "reject", "no"] : spec.explain ? ["yes", "no", "explain"] : ["yes", "no"];
+		const choices: AskOption[] = grant ? ["yes", "reject", "no"] : ["yes", ...(spec.remember ? ["always" as const] : []), "no", ...(spec.explain ? ["explain" as const] : [])];
 		const labelOf = (c: AskOption): string => (grant ? GRANT_LABELS[c] : undefined) ?? ASK_LABELS[c];
 		const rowLabel = grant ? GRANT_LABELS.no! : "No";
 		const rowPrefix = grant ? `${GRANT_LABELS.no}: ` : "No, ";
@@ -4134,6 +4429,7 @@ export function buildApproveDialog(
 		const noReason = (): string | undefined => noInput.getValue().trim() || undefined;
 		const resolve = (c: AskOption): void => {
 			if (c === "yes") done({ allow: true });
+			else if (c === "always") done({ allow: true, remember: true });
 			else if (c === "reject") done({ allow: false });
 			else if (c === "no") {
 				const reason = noReason();
@@ -4309,7 +4605,7 @@ async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSig
  *  non-empty text is forwarded to the agent as the decline reason, Escape declines without text) and,
  *  when `explain` is given, "Explain…" (optional free-text question to the EXPLAIN-GATE role; the
  *  answer is shown in the re-opened dialog). Escape in the Explain question input returns to the
- *  dialog. Hosts without the rich dialog get the plain yes/no `confirm`.
+ *  dialog. Hosts without the rich dialog get the plain yes/no `confirm`, which cannot remember (PR-9: returns `{ allow: true }`).
  *  Dialogs are serialized process-wide (omp queues `confirm`/`select` but not `custom`), and
  *  `signal` cancels a pending or shown dialog → "aborted". */
 async function confirmAsk(ui: UiContext, spec: ApproveDialogSpec, opts: { signal?: AbortSignal; explain?: (question: string | null) => Promise<ExplainGateResult> } = {}): Promise<AskDecision | "aborted"> {
@@ -4509,9 +4805,9 @@ function serializeDialog<T>(fn: () => Promise<T>): Promise<T> {
 /** Agent-facing block reason (#53): the text must be self-sufficient — structural
  * error signaling does not reach several provider lanes, and verbatim rule/classifier
  * reasons can be empty or too terse for the acting model to recognize as a block. */
-function blockedReason(tag: string, detail: string): string {
+function blockedReason(tag: string, detail: string, grantable = false): string {
 	const clean = detail.trim().replace(/\.+$/, "");
-	const grantHint = tag === "classifier" || tag === "yolo-retry" || tag === "user-declined" ? ` ${GRANT_BLOCK_HINT}` : "";
+	const grantHint = grantable || tag === "classifier" || tag === "yolo-retry" || tag === "user-declined" ? ` ${GRANT_BLOCK_HINT}` : "";
 	return `[auto-mode ${tag} block] BLOCKED — this action did NOT run. Reason: ${clean || "(no further reason given)"}. Report the block to the user; never claim it succeeded or completed.${grantHint}`;
 }
 
@@ -4551,6 +4847,8 @@ export interface FooterInfo {
 	subagentGate: "off" | "normal" | "auto";
 	/** active permission grants (GR-6); the footer segment shows only when > 0 */
 	grants: number;
+	/** remembered approvals (PR-9); the footer segment shows only when > 0 */
+	remembered: number;
 }
 
 type ThemeBg = Parameters<Theme["bg"]>[0];
@@ -4646,6 +4944,7 @@ export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full"
 				`${count("success", NF_CHECK, info.counts.allow)} ${count("warning", NF_ASK, info.counts.ask)} ${count("error", NF_BAN, info.counts.deny)}`,
 			];
 			if (info.grants > 0) items.push(theme.fg("accent", `${NF_KEY} ${info.grants}`));
+			if (info.remembered > 0) items.push(theme.fg("accent", `${NF_USER} ${info.remembered}`));
 			if (infoItems.length > 0) items.push(`${theme.fg("muted", NF_INFO)} ${infoItems.map((i) => theme.fg("muted", i)).join(" ")}`);
 			blocks.push({ bg: barBg, body: ` ${items.join(` ${thinSep} `)} ` });
 		}
@@ -4663,6 +4962,7 @@ export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full"
 	for (const r of risks) parts.push(theme.fg(r.color, `⚠ ${r.text}`));
 	parts.push(`${theme.fg(modelColor, modelLabel)}${fallbackText ? ` ${theme.fg(fallbackColor, fallbackText)}` : ""}`);
 	if (info.grants > 0) parts.push(theme.fg("accent", `🔑 ${info.grants}`));
+	if (info.remembered > 0) parts.push(theme.fg("accent", `👤 ${info.remembered}`));
 	for (const i of infoItems) parts.push(theme.fg("muted", i));
 	return parts.join(theme.fg("dim", " · "));
 }
@@ -4784,6 +5084,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	// Session state: reset list is owned by SessionState.reset
 	const state = new SessionState(undefined, agentDirPath());
 
+	/** PR-9: store a remembered approval; tool name only in the notification (PP-6). */
+	function rememberApproval(key: string, toolName: string, ctx: ExtensionContext, note: (m: string, l: "info") => void): void {
+		state.rememberApproval(key);
+		note(`🛡️ approval remembered: identical ${toolName} calls run without asking for the rest of this session (/automode forget)`, "info");
+		if (!subagentIdentity(ctx)) refreshStatus(ctx);
+	}
+
 	/** Verdict -> UI (this extension's single verdict presentation point): look up the template by source x degraded, text is
 	 *  byte-identical to before the refactor. Notifications on the protected-path branch never carry path plaintext or the action line
 	 *  (PP-6: notifications and block reason flow back into the agent context). */
@@ -4791,6 +5098,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const note = (msg: string, level: "info" | "warning" | "error"): void => ui.notify(opts.label ? msg.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : msg, level);
 		const titled = (t: string): string => (opts.label ? t.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : t);
 		if (v.verdict === "allow") {
+			if (v.remembered) {
+				// PR-9: silent like mechanical allows (PR-3); no action line for gate hits (PP-6)
+				if (debug) note(v.source === "protected-path" ? "🛡️ allow (remembered approval)" : `🛡️ allow (remembered approval): ${action}`, "info");
+				return undefined;
+			}
 			// #60 (CONTEXT.md notifications entry): classifier allows surface via notifyAllows OR
 			// debug — exactly one notification either way; the shadow suffix stays
 			// debug-only; mechanical passes (rule echo, protected-path confirm) stay
@@ -4825,7 +5137,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 			if (v.source === "rule") {
 				note(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}`, "warning");
-				return { block: true, reason: blockedReason("rule", v.reason) };
+				return { block: true, reason: blockedReason("rule", v.degraded ? `ask degraded to block in non-interactive mode: ${v.reason}` : v.reason, v.grantable === true) };
 			}
 			note(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}${debug && v.shadow ? " " + v.shadow : ""}`, "warning");
 			return { block: true, reason: blockedReason("classifier", v.reason) };
@@ -4841,12 +5153,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				reasonLine: v.reason,
 				detail: v.detail ?? "(see pi-verdict.json)",
 				question: "Allow this access?",
+				remember: v.approvalKey !== undefined,
 				jev: null,
 				minConfidence: null,
 				nerdFont: state.userRules.footer === "full",
 				fallbackMessage: `${action}\n\n${v.reason}\n\nProtected path: ${v.detail ?? "(see pi-verdict.json)"}\n\nAllow this access?`,
 			}, { signal: opts.signal });
 			if (d === "aborted") return "aborted";
+			if (d.allow && d.remember && v.approvalKey) rememberApproval(v.approvalKey, call.toolName, opts.ctx, note);
 			if (d.allow) {
 				// debug notify carries no action line: same as above, notifications must not carry protected-path plaintext
 				if (debug) note("🛡️ allow (protected-path confirm)", "info");
@@ -4863,12 +5177,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			action,
 			reasonLine,
 			question: "Allow execution?",
+			remember: v.approvalKey !== undefined,
 			jev: v.source === "classifier" ? parseJevReason(v.reason) : null,
 			minConfidence: state.userRules.confidenceThreshold,
 			nerdFont: state.userRules.footer === "full",
 			fallbackMessage: `${action}\n\n${label}: ${v.reason}\n\nAllow execution?`,
-		}, { signal: opts.signal, explain: (question) => explainAsk(opts.ctx, call, action, reasonLine, question) });
+		}, { signal: opts.signal, ...(v.noExplain ? {} : { explain: (question: string | null) => explainAsk(opts.ctx, call, action, reasonLine, question) }) });
 		if (d === "aborted") return "aborted";
+		if (d.allow && d.remember && v.approvalKey) rememberApproval(v.approvalKey, call.toolName, opts.ctx, note);
 		return d.allow ? undefined : { block: true, reason: blockedReason("user-declined", declineDetail("user declined", d.reason)) };
 	}
 
@@ -4910,6 +5226,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			yoloOmpDirAllow: rules.yoloOmpDir === "allow",
 			subagentGate: rules.subagentGate,
 			grants: rules.mode === "off" ? 0 : state.grants.length,
+			remembered: rules.mode === "off" ? 0 : state.rememberedApprovals,
 		};
 	}
 
@@ -4951,7 +5268,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 
 	/** Set (or with `undefined` drop) one session-scopable key at session scope: persisted per session id, rules reloaded, status refreshed. */
-	function setSessionSetting(key: SessionKey, value: unknown, ctx: ExtensionContext): void {
+	function setSessionSetting(key: SessionKey | SessionMapKey, value: unknown, ctx: ExtensionContext): void {
 		if (value === undefined) delete state.sessionOverrides[key];
 		else state.sessionOverrides[key] = value;
 		const err = writeSessionOverrides(ctx.sessionManager.getSessionId(), state.sessionOverrides);
@@ -5093,7 +5410,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Persist `value` (`undefined` drops the key) for a session-scopable setting or a list key at a file scope; session scope takes settings only. null = ok, else an error message. */
 	const writeScoped = (scope: MenuScope, key: string, value: unknown, localFile: string | null, ctx: ExtensionContext): string | null => {
 		if (scope === "session") {
-			setSessionSetting(key as SessionKey, value, ctx);
+			setSessionSetting(key as SessionKey | SessionMapKey, value, ctx);
 			return null;
 		}
 		const target = scope === "global" ? { file: userConfigPath(), kind: "user" as const } : localFile === null ? null : { file: localFile, kind: "local" as const };
@@ -5152,7 +5469,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	async function openQuickPanel(ctx: ExtensionContext): Promise<void> {
 		const mods = typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
 		if (!mods) {
-			ctx.ui.notify("pi-verdict: the settings panel needs an interactive TUI — use /automode status|default|yolo|noautodeny|off", "warning");
+			ctx.ui.notify("pi-verdict: the settings panel needs an interactive TUI — use /automode status|default|yolo|noautodeny|off|forget", "warning");
 			return;
 		}
 		const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
@@ -5217,12 +5534,20 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						key: "r",
 						info: () => [{ tone: "muted", text: "Draft the classifier's baseline policy (/automode-setup)." }],
 					},
+					{
+						kind: "action",
+						id: "forget-approvals",
+						label: `▸ forget remembered approvals (${state.rememberedApprovals})`,
+						key: "f",
+						info: () => [{ tone: "muted", text: "Clear this session's remembered approvals: identical calls ask again." }],
+					},
 				);
 				return rows;
 			},
 			change: (scope, id, value) => applySetting(ctx, scope, id as SessionKey, value, localFile),
 			action: (_scope, id) => {
 				if (id === "show-all") showAll = !showAll;
+				else if (id === "forget-approvals") forgetApprovals(ctx);
 				else if (id === "root-rule") {
 					openRoot = true;
 					closeMenu?.();
@@ -5230,8 +5555,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			},
 			submit: () => true,
 			remove: () => {},
-			hotkeys: { a: "show-all", r: "root-rule" },
-			hotkeyHint: "a all modes · r root rule",
+			hotkeys: { a: "show-all", r: "root-rule", f: "forget-approvals" },
+			hotkeyHint: "a all modes · r root rule · f forget approvals",
 		};
 		await ctx.ui.custom<"closed" | undefined>((tui, theme, _kb, done) => {
 			closeMenu = () => done("closed");
@@ -5624,12 +5949,92 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			};
 		};
 
+		const BUILTIN_PAGE = "builtin";
+		const PATH_TIER_DESC: Record<PathTierId, string> = {
+			"s0-secret": "credential and secret files, read or write",
+			"s1-system-read": "reads under system prefixes (/etc, /usr, /var, /System, authorized_keys)",
+			"s1-system-write": "writes under those system prefixes",
+			"s2-user-rc-write": "writes to shell rc, .gitconfig, crontab, LaunchAgents, systemd user units",
+			"s3-git-meta-write": "writes to .git/hooks, .git/config, .git/modules, .gitmodules",
+		};
+		const plainObject = (v: unknown): Record<string, unknown> | null => (typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+		/** One choice row per built-in/custom danger rule and per path tier at `scope`: the stored entry (or inherit) as the value. */
+		const builtinRows = (scope: MenuScope): MenuRow[] => {
+			const stored = storedAt(scope, localFile);
+			const dr = plainObject(stored.dangerRules) ?? {};
+			const pr = plainObject(stored.pathRules) ?? {};
+			const eff = state.userRules.dangerRules;
+			const ids = [...eff.map((r) => r.id), ...Object.keys(dr).filter((id) => !eff.some((r) => r.id === id))];
+			const rows: MenuRow[] = [{ kind: "section", label: "danger rules" }];
+			for (const id of ids) {
+				const e = dr[id];
+				const live = eff.find((r) => r.id === id);
+				const obj = plainObject(e);
+				let value: string;
+				if (e === undefined) value = scope === "global" ? (live && !live.builtin ? live.action : "deny") : "inherit";
+				else if (e === false) value = "off";
+				else if (isRuleAction(e)) value = e;
+				else if (obj !== null) value = isRuleAction(obj.action) ? obj.action : "deny";
+				else value = "invalid";
+				const base = ["deny", "ask", "allow", "off"];
+				rows.push({
+					kind: "choice",
+					id: `danger:${id}`,
+					label: id,
+					values: value === "invalid" ? ["invalid"] : scope === "global" ? base : ["inherit", ...base],
+					value,
+					...(value === "invalid" ? { locked: "fix by hand" } : {}),
+					info: () => [
+						{ tone: "text", text: live ? live.reason : "(removed at this or a lower scope)" },
+						...(live ? [{ tone: "muted" as const, text: `pattern: /${live.pattern.source}/${live.pattern.flags}` }] : []),
+						{ tone: "muted", text: `Effective: ${live ? live.action : "off"}${live && !live.builtin ? " (custom rule)" : ""}. allow = no judgment, the classifier decides.` },
+						...untrustedWarn(scope),
+					],
+				});
+			}
+			rows.push({ kind: "section", label: "path tiers" });
+			for (const tier of PATH_TIER_IDS) {
+				const e = pr[tier];
+				const value = e === undefined ? (scope === "global" ? PATH_TIER_DEFAULTS[tier] : "inherit") : isRuleAction(e) ? e : "invalid";
+				rows.push({
+					kind: "choice",
+					id: `path:${tier}`,
+					label: tier,
+					values: value === "invalid" ? ["invalid"] : scope === "global" ? [...RULE_ACTIONS] : ["inherit", ...RULE_ACTIONS],
+					value,
+					...(value === "invalid" ? { locked: "fix by hand" } : {}),
+					info: () => [
+						{ tone: "text", text: PATH_TIER_DESC[tier] },
+						{ tone: "muted", text: `Effective: ${state.userRules.pathRules[tier]} (default ${PATH_TIER_DEFAULTS[tier]}). allow = no judgment, the classifier decides.` },
+						...untrustedWarn(scope),
+					],
+				});
+			}
+			return rows;
+		};
+		/** Cycle one built-in rule entry at a scope: `inherit` drops it, `off` stores false, an action keeps a custom rule's pattern. */
+		const changeBuiltin = (scope: MenuScope, id: string, value: string): void => {
+			const isDanger = id.startsWith("danger:");
+			const ruleId = id.slice(isDanger ? "danger:".length : "path:".length);
+			const key = isDanger ? "dangerRules" : "pathRules";
+			const map: Record<string, unknown> = { ...(plainObject(storedAt(scope, localFile)[key]) ?? {}) };
+			if (value === "inherit") delete map[ruleId];
+			else if (isDanger && value === "off") map[ruleId] = false;
+			else if (isRuleAction(value)) {
+				const prev = plainObject(map[ruleId]);
+				map[ruleId] = isDanger && prev !== null ? { ...prev, action: value } : value;
+			} else return;
+			const err = writeScoped(scope, key, Object.keys(map).length > 0 ? map : undefined, localFile, ctx);
+			if (err) ctx.ui.notify(`pi-verdict: could not save ${key} (${scope}): ${err}`, "error");
+			else ctx.ui.notify(`pi-verdict: ${key}.${ruleId} → ${value} (${scope}) — rules reloaded`, "info");
+		};
+
 		const ctl: MenuController = {
 			title: "rules",
 			scopes: localFile === null ? ["global", "session"] : ["global", "local", "session"],
 			scope: initial,
 			badge: (scope) => (scope === "local" && untrusted ? { label: "local · untrusted", warn: true } : { label: scope, warn: false }),
-			pageTitle: (page) => LIST_LABEL(page as EditableListKey),
+			pageTitle: (page) => (page === BUILTIN_PAGE ? "built-in rules" : LIST_LABEL(page as EditableListKey)),
 			rows: (scope, page) => {
 				if (page === null) {
 					const rows: MenuRow[] = [{ kind: "section", label: "rules" }];
@@ -5644,7 +6049,24 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 							info: () => [{ tone: "text", text: `${LIST_KEY_DESC[key][0]!.toUpperCase()}${LIST_KEY_DESC[key].slice(1)}` }, { tone: "muted", text: LIST_SCOPE_LINE[scope] }, ...untrustedWarn(scope)],
 						});
 					}
-					rows.push({ kind: "section", label: "switches" }, switchRow(scope, "gateOmpDir", ".omp gate"), switchRow(scope, "footer", "footer"), switchRow(scope, "modeStatus", "mode in status bar"), switchRow(scope, "grantStatus", "grants in status bar"));
+					rows.push(
+						{ kind: "section", label: "switches" },
+						switchRow(scope, "gateOmpDir", ".omp gate"),
+						switchRow(scope, "footer", "footer"),
+						switchRow(scope, "modeStatus", "mode in status bar"),
+						switchRow(scope, "grantStatus", "grants in status bar"),
+						{ kind: "section", label: "built-in rules" },
+						{
+							kind: "page",
+							id: BUILTIN_PAGE,
+							label: "danger rules & path tiers",
+							info: () => [
+								{ tone: "text", text: "Action per built-in rule: deny, ask, or allow (the classifier decides). Custom danger rules are added in the config file or via verdict_settings." },
+								{ tone: "muted", text: "Entries merge per id: session over local over global." },
+								...untrustedWarn(scope),
+							],
+						},
+					);
 					if (rolesTarget) {
 						const rc = readOmpConfig(rolesTarget.file, rolesTarget.yaml);
 						const readError = "error" in rc ? rc.error : null;
@@ -5676,6 +6098,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					}
 					return rows;
 				}
+				if (page === BUILTIN_PAGE) return builtinRows(scope);
 				const key = page as EditableListKey;
 				const own = ownList(scope, key);
 				const rows: MenuRow[] = [{ kind: "add", id: "add", placeholder: LIST_KEY_PLACEHOLDER[key], info: () => listInfo(scope) }];
@@ -5701,6 +6124,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			change: (scope, id, value) => {
 				if (id === "roles") {
 					if (rolesTarget && (value === "on" || value === "off")) pendingOps.push(applyRoleTags(ctx, rolesTarget, value === "on"));
+					return;
+				}
+				if (id.startsWith("danger:") || id.startsWith("path:")) {
+					changeBuiltin(scope, id, value);
 					return;
 				}
 				if (id === "gateOmpDir" || id === "footer" || id === "modeStatus" || id === "grantStatus") applySetting(ctx, scope, id, value, localFile);
@@ -5737,6 +6164,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		await Promise.all(pendingOps);
 	}
 
+	/** PR-9: `/automode forget` and the panel's forget row. */
+	function forgetApprovals(ctx: ExtensionContext): void {
+		const n = state.forgetApprovals();
+		refreshStatus(ctx);
+		ctx.ui.notify(n === 0 ? "🛡️ no remembered approvals" : `🛡️ forgot ${n} remembered approval${n === 1 ? "" : "s"} — identical calls ask again`, "info");
+	}
+
 	/** `/automode status` body: effective mode + source, thresholds, yolo protected actions, then the shadow/denyPaths/audit/fallback hints. */
 	const statusText = (): string => {
 		const r = state.userRules;
@@ -5750,13 +6184,18 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			lines.push(`protected paths: denyPaths ${r.yoloDenyPaths} (${src.yoloDenyPaths}), .omp ${r.yoloOmpDir} (${src.yoloOmpDir})`);
 		}
 		if (r.mode === "noAutoDeny") lines.push(`thresholds: allow ${pct(r.noAutoDenyAllowThreshold)} (${src.noAutoDenyAllowThreshold})`);
-		return `${lines.join("\n")}\n${state.shadow.summary()}${denyPathsHint()}${auditHint()}${fallbackHint()}\nUsage: /automode [status|default|yolo|noautodeny|off]${toggleHint()}`;
+		const remembered = state.rememberedApprovals > 0 ? `\nremembered approvals: ${state.rememberedApprovals} (this session)` : "";
+		return `${lines.join("\n")}\n${state.shadow.summary()}${denyPathsHint()}${auditHint()}${fallbackHint()}${remembered}\nUsage: /automode [status|default|yolo|noautodeny|off|forget]${toggleHint()}`;
 	};
 
 	pi.registerCommand("automode", {
-		description: "Approval mode: open the quick settings panel, or /automode status|default|yolo|noautodeny|off",
+		description: "Approval mode: open the quick settings panel, or /automode status|default|yolo|noautodeny|off|forget",
 		handler: async (args, ctx) => {
 			const arg = args.trim().toLowerCase();
+			if (arg === "forget") {
+				forgetApprovals(ctx);
+				return;
+			}
 			// bare call: settings panel with a UI, read-only status without
 			if (arg === "" || arg === "status") {
 				if (arg === "" && ctx.hasUI) await openQuickPanel(ctx);
@@ -5772,7 +6211,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				return;
 			}
 			// unknown argument: reject strictly and list the usage (case already normalized)
-			ctx.ui.notify(`unknown argument: ${arg}\nUsage: /automode [status|default|yolo|noautodeny|off]${toggleHint()}`, "warning");
+			ctx.ui.notify(`unknown argument: ${arg}\nUsage: /automode [status|default|yolo|noautodeny|off|forget]${toggleHint()}`, "warning");
 		},
 	});
 
@@ -5992,7 +6431,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	const settingsToolDescription =
 		"Read pi-verdict (permission gate) settings or propose a change. Actions: get (read effective and per-scope values; no approval), set (replace a key's whole value), unset (drop a key at one scope), add/remove (one entry of a list key: allow, deny, denyPaths, tools, rules). " +
 		"Scopes: global = the user config; local = the project config (applied only when the project is trusted); session = this session only, highest precedence. " +
-		"Session scope takes only the approval keys (mode, thresholds, yoloDenyPaths, yoloOmpDir, classifierFallbackMode), gateOmpDir, footer, modeStatus, grantStatus and rootRule; on list keys it appends to the effective list. " +
+		"Session scope takes only the approval keys (mode, thresholds, yoloDenyPaths, yoloOmpDir, classifierFallbackMode), gateOmpDir, footer, modeStatus, grantStatus, rootRule, dangerRules and pathRules; on list keys it appends to the effective list. " +
+		"dangerRules (per-id map: action \"deny\"|\"ask\"|\"allow\" for a built-in or custom danger rule, false removes a rule, {pattern, action?, reason?, flags?} adds a custom rule) and pathRules (path tier → action) merge per id with the entries already stored at the scope on set: a null id is dropped at that scope, and unset drops the whole map. " +
 		"Every change opens a confirmation dialog for the user, so always give a clear `reason`; nothing is saved unless the user approves. denyPaths values are never returned (only a count). Not available in subagents.";
 
 	pi.registerTool({
@@ -6017,6 +6457,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					let effective: unknown;
 					if (key === "allow" || key === "deny") effective = state.userRules[key].map((r) => r.source);
 					else if (key === "rules") effective = state.userRules.classifierRules;
+					else if (key === "dangerRules") effective = Object.fromEntries(state.userRules.dangerRules.map((r) => [r.id, { action: r.action, reason: r.reason, pattern: r.pattern.source, flags: r.pattern.flags, builtin: r.builtin }]));
 					else effective = rules[key];
 					const g = redact(globalStored[key]);
 					const l = redact(localStored[key]);
@@ -6058,9 +6499,15 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			let noChange = false;
 
 			if (action === "set") {
-				const v = validateSettingValue(key, params.value);
+				const knownIds = new Set(state.userRules.dangerRules.map((r) => r.id));
+				const v = validateSettingValue(key, params.value, knownIds);
 				if ("error" in v) throw new Error(v.error);
-				after = v.value;
+				if (key === "dangerRules" || key === "pathRules") {
+					// per-id merge into what this scope already stores; a null id drops it
+					const next: Record<string, unknown> = { ...(typeof stored[key] === "object" && stored[key] !== null ? (stored[key] as Record<string, unknown>) : {}), ...(v.value as Record<string, unknown>) };
+					for (const id of Object.keys(next)) if (next[id] === null) delete next[id];
+					after = Object.keys(next).length > 0 ? next : undefined;
+				} else after = v.value;
 			} else if (action === "unset") {
 				if (before === undefined) throw new Error(`${key} is not set at ${scope} scope`);
 				after = undefined;
@@ -6128,7 +6575,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			paths: {
 				type: "array",
 				maxItems: MAX_GRANT_PATHS,
-				description: "request only: the protected paths (denyPaths, .omp directories) the operation must access, each with the access level needed; omit when the operation touches none",
+				description: "request only: the protected paths (denyPaths, .omp directories, built-in path tiers shown as `tier <id>:` in a block reason) the operation must access, each with the access level needed; omit when the operation touches none",
 				items: {
 					type: "object",
 					additionalProperties: false,
@@ -6139,6 +6586,12 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					},
 				},
 			},
+			rules: {
+				type: "array",
+				maxItems: MAX_GRANT_RULES,
+				items: { type: "string" },
+				description: "request only: ids of the built-in danger rules the operation must pass (the id after `rule ` in a block reason, e.g. gh-release); omit when none",
+			},
 			id: { type: "string", description: "release only: the grant id (e.g. G1)" },
 		},
 	};
@@ -6147,7 +6600,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		"Use action \"request\" (1) when an operation needs the user's explicit authorization by its nature — e.g. deploying, publishing, pushing to a shared remote, deleting data, contacting external systems — or (2) when a tool call you must run was blocked by the user or by the pi-verdict classifier. " +
 		"Describe the exact operation and its scope narrowly (what, where, which environment or resources); the user sees it verbatim and approves, rejects, or asks you for clarification or a revised scope. " +
 		"An approved grant lasts until the session ends, you release it, or the user revokes it, and the permission classifier treats it as authoritative for actions within its literal scope. " +
-		"Protected paths (denyPaths, .omp directories) stay gated unless you list them in `paths` with the access you need (read, write, full). " +
+		"Protected paths (denyPaths, .omp directories, built-in path tiers shown as `tier <id>:` in a block reason) stay gated unless you list them in `paths` with the access you need (read, write, full); built-in danger rules (shown as `rule <id>:`) stay blocked unless you list their ids in `rules`. " +
 		"Release a grant (action \"release\" with its id) as soon as you no longer need it. Not available in subagents.";
 
 	pi.registerTool({
@@ -6164,7 +6617,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const action = params.action;
 
 			if (action === "list") {
-				const grants = state.grants.map(({ id, request, paths, grantedBy, grantedAt }) => ({ id, request, paths: paths.map(({ path: p, access }) => ({ path: p, access })), grantedBy, grantedAt }));
+				const grants = state.grants.map(({ id, request, paths, rules: ruleIds, grantedBy, grantedAt }) => ({ id, request, paths: paths.map(({ path: p, access }) => ({ path: p, access })), rules: ruleIds, grantedBy, grantedAt }));
 				return settingsToolText(JSON.stringify({ grants }, null, 2));
 			}
 
@@ -6190,22 +6643,31 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				if (!(GRANT_ACCESS as readonly unknown[]).includes(e.access)) throw new Error(`each paths entry needs access ${GRANT_ACCESS.join(" | ")}`);
 				return { path: p, access: e.access as GrantAccess, forms: denyPathForms(p, ctx.cwd) };
 			});
+			const rawRules = params.rules === undefined ? [] : params.rules;
+			if (!Array.isArray(rawRules)) throw new Error("rules must be an array of danger rule ids");
+			if (rawRules.length > MAX_GRANT_RULES) throw new Error(`rules must have at most ${MAX_GRANT_RULES} entries`);
+			const knownRules = state.userRules.dangerRules;
+			const ruleIds = [...new Set(rawRules.map((r: unknown) => (typeof r === "string" ? r.trim() : "")))].sort();
+			for (const id of ruleIds) {
+				if (!knownRules.some((r) => r.id === id)) throw new Error(`unknown danger rule "${id}" — known ids: ${knownRules.map((r) => r.id).join(", ")}`);
+			}
 			if (state.grants.length >= MAX_ACTIVE_GRANTS) throw new Error(`too many active permission grants (${MAX_ACTIVE_GRANTS}) — release the ones you no longer need first`);
 			const pathKey = (list: readonly { path: string; access: GrantAccess }[]): string => list.map((p) => `${p.access}\0${p.path}`).sort().join("\n");
-			const duplicate = state.grants.find((g) => g.request === request && pathKey(g.paths) === pathKey(paths));
+			const duplicate = state.grants.find((g) => g.request === request && pathKey(g.paths) === pathKey(paths) && [...g.rules].sort().join("\n") === ruleIds.join("\n"));
 			if (duplicate) return settingsToolText(`Already granted: ${duplicate.id} covers this exact request.`);
 
-			const pathLines = paths.map((p) => `protected-path access: ${p.access} ${p.path}`);
+			const ruleReason = (id: string): string => knownRules.find((r) => r.id === id)?.reason ?? "";
+			const pathLines = [...paths.map((p) => `protected-path access: ${p.access} ${p.path}`), ...ruleIds.map((id) => `danger rule: ${id} — ${ruleReason(id)}`)];
 			const grantedText = (id: string, by: string): string =>
 				[`Approved by ${by}: permission grant ${id} is active until the session ends, until you release it (action "release", id "${id}"), or until the user revokes it. Scope: ${request}`, ...pathLines].join("\n");
 			const addGrant = (grantedBy: PermissionGrant["grantedBy"]): string => {
 				const id = `G${state.grantSeq++}`;
-				setGrants([...state.grants, { id, request, paths, grantedBy, grantedAt: new Date().toISOString() }], ctx);
+				setGrants([...state.grants, { id, request, paths, rules: ruleIds, grantedBy, grantedAt: new Date().toISOString() }], ctx);
 				return id;
 			};
 
 			if (rules.mode === "yolo") {
-				const actionLine = toolCallLine(GRANT_TOOL_NAME, { request, paths: paths.map(({ path: p, access }) => ({ path: p, access })) });
+				const actionLine = toolCallLine(GRANT_TOOL_NAME, { request, paths: paths.map(({ path: p, access }) => ({ path: p, access })), ...(ruleIds.length ? { rules: ruleIds } : {}) });
 				const widgetUi = ctx.hasUI && typeof ctx.ui.setWidget === "function" ? ctx.ui : null;
 				widgetUi?.setWidget(STATUS_WIDGET_KEY, ["🛡️ verdict: reviewing permission grant…"]);
 				let review: GrantConsensus;
@@ -6224,7 +6686,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 
 			if (!ctx.hasUI) return settingsToolText("Rejected: no interactive UI to ask the user, so the grant cannot be approved. Nothing was granted.");
-			const accessLines = paths.map((p) => `Protected-path access: ${p.access} ${p.path}`);
+			const accessLines = [...paths.map((p) => `Protected-path access: ${p.access} ${p.path}`), ...ruleIds.map((id) => `Danger rule: ${id} — ${ruleReason(id)}`)];
 			let decision: GrantDecision | "aborted";
 			try {
 				decision = await confirmGrant(
@@ -6289,7 +6751,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		handler: async (args, ctx) => {
 			const grantLine = (g: PermissionGrant): string => {
 				const n = g.paths.length;
-				return `${g.id} · ${displaySafe(g.request).replace(/\s+/g, " ").slice(0, 80)} · ${n} protected path${n === 1 ? "" : "s"} · by ${g.grantedBy}`;
+				const ruleText = g.rules.length ? ` · danger rules: ${g.rules.join(", ")}` : "";
+				return `${g.id} · ${displaySafe(g.request).replace(/\s+/g, " ").slice(0, 80)} · ${n} protected path${n === 1 ? "" : "s"}${ruleText} · by ${g.grantedBy}`;
 			};
 			const words = (typeof args === "string" ? args : "").trim().split(/\s+/).filter(Boolean);
 			const none = (): void => ctx.ui.notify("🛡️ No active permission grants.", "info");
@@ -6311,7 +6774,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					}
 					const g = grants[lines.indexOf(choice)];
 					if (!g) continue;
-					const detail = [g.request, ...g.paths.map((p) => `protected-path access: ${p.access} ${p.path}`)].join("\n");
+					const detail = [g.request, ...g.paths.map((p) => `protected-path access: ${p.access} ${p.path}`), ...g.rules.map((id) => `danger rule: ${id}`)].join("\n");
 					if (await ctx.ui.confirm(`Revoke ${g.id}?`, displaySafe(detail))) revokeGrants([g.id], ctx);
 				}
 			}
@@ -6597,7 +7060,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const noteAllowed = (label: VerdictLabel): void => {
 			if (callId !== undefined) state.noteLabel(callId, label);
 		};
-		const allowedHow = (v: Verdict): VerdictLabel["how"] => (v.verdict === "ask" ? "user" : v.source === "classifier" ? "classifier" : "rule");
+		const allowedHow = (v: Verdict): VerdictLabel["how"] => (v.remembered ? "remembered" : v.verdict === "ask" ? "user" : v.source === "classifier" ? "classifier" : "rule");
 
 		// Live status (root session + UI only): one widget row above the editor while a model call runs.
 		// Text is phase + tool name + model id only; never command or path text (PP-6).

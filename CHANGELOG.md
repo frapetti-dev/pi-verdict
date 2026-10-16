@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable built-in rules** ([RL-5](docs/adjudication-rules.md#rl-5-danger-rules), [RL-6](docs/adjudication-rules.md#rl-6-builtindenyfloor), [PG-3](docs/adjudication-rules.md#pg-3-s0-secrets) to [PG-5](docs/adjudication-rules.md#pg-5-writes), [CF-4](docs/adjudication-rules.md#cf-4-merge-semantics) to [CF-6](docs/adjudication-rules.md#cf-6-invalid-values)): the built-in deny floor is now called *built-in rules* and every one of them carries a rule action — `deny`, `ask` or `allow` (`allow` passes no judgment: the call goes to the classifier, never a mechanical allow). New config key `dangerRules` (object keyed by danger-rule id: an action string changes a built-in, `false` removes it, `{pattern, action?, reason?, flags?}` adds a custom rule; defaults `deny`, reason `custom danger rule`, case-insensitive) and `pathRules` (path tier id → action; tiers `s0-secret`, `s1-system-read`, `s1-system-write`, `s2-user-rc-write`, `s3-git-meta-write` keep their old defaults). Both merge per id across global, trusted project and session scope, are settable through `verdict_settings` (`null` drops an id at a scope) and editable in `/verdict` on a new `danger rules & path tiers` page (←/→ cycles the action). A built-in `ask` opens the ask dialog with a UI (no Explain for path tiers, PP-9), is a grantable deny headless and in `yolo`, and is beaten by a user `allow` regex; when several danger rules match the strongest action wins and the reason lists every hit. Invalid entries are skipped with a warning. `builtinDenyFloor: false` now means every built-in rule acts as `allow`; custom danger rules stay active.
+- **Grants can lift built-in rules** ([GR-1](docs/adjudication-rules.md#gr-1-request-tool), [GR-5](docs/adjudication-rules.md#gr-5-coverage-check)): `verdict_grant` `request` takes `rules` (at most 20 danger-rule ids, unknown ids rejected); a path grant's access entry also covers the built-in path-tier hits at that path. The coverage check now runs for built-in denies and asks too, and a block caused by a built-in rule carries the grant hint. Stored grants without `rules` still load. The classifier prompt lists a grant's rule ids and the grant dialog, `list` and `/grants` show them.
+
+### Changed
+
+- **BREAKING**: a user `deny` regex is now evaluated before the built-in rules ([RL-2](docs/adjudication-rules.md#rl-2-evaluation-order) step 1), so a call matching both reports the user-deny reason.
+- **BREAKING**: path-tier block reasons are prefixed `tier <id>: ` (e.g. `tier s0-secret: S0 secrets/credential path: …`) so the agent can name the tier in a permission grant; block text from built-in rules ends with the grant hint, and in `yolo` a gate whose action is `allow` (`yoloDenyPaths`/`yoloOmpDir`) still refuses a call with built-in rule hits underneath.
+- **BREAKING**: a permission grant can now lift a built-in rule deny (previously "a grant never overrides the built-in floor"); the audit record of such an allow has source `protected-path` and reason `permission grant <ids> covers this gated access` (was `… covers this protected-path access`).
+
 ## [0.20.0] - 2026-10-16
 
 ### Added

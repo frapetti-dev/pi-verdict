@@ -18,7 +18,7 @@ Enforced by: [PR-1](adjudication-rules.md#pr-1-ask-degradation), [CL-7](adjudica
 
 ### 2. Deterministic floors come before AI
 
-Some security properties must never depend on an LLM. The built-in deny floor (command danger rules plus path sensitivity grades S0–S3) adjudicates before the classifier is ever consulted. The classifier may interpret ambiguity; it must not override a hard deny — and neither can user allow rules.
+Some security properties must never depend on an LLM. The built-in rules (command danger rules plus path tiers S0–S3, each at a configured action, `deny` by default) adjudicate before the classifier is ever consulted. The classifier may interpret ambiguity; it must not override a hard deny — and neither can user allow rules. Only the user, through an approved permission grant that the judge and fallback classifiers confirm covers the exact call, lifts one.
 
 Precisely: no built-in rule allows a non-empty `bash` or `powershell` command — commands are denied by a danger rule, allowed only by a user `allow` regex, or left to the classifier. Path grading, by contrast, does mechanically allow what it can vouch for: reads outside the S0 and S1 grades, and writes whose every canonical form lies inside the working directory and outside S0–S3.
 
@@ -92,8 +92,8 @@ Enforced by: none — a stated non-goal; the documented limits of path analysis 
                               ▼
         ┌─────────────────────────────────────────────┐
         │            Deterministic rule layer          │  (no LLM)
-        │  built-in floor: danger rules, S0–S3 grades  │
         │  user deny                                   │
+        │  built-in rules: danger rules, S0–S3 tiers   │
         │  .omp gate ─────────────► ask                │
         │  protected path ────────► ask                │
         │  user allow                                  │

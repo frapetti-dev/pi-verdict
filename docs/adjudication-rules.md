@@ -18,11 +18,11 @@ Pinned by: denyPaths (PP-1–PP-9) › omitted path hits in both directions for 
 
 #### RL-2: Evaluation order
 
-The rule layer MUST evaluate a tool call in this order and stop at the first terminal result: (1) the built-in base (RL-5 danger rules for command tools, PG path grading for file tools); a deny here is terminal and nothing below can override it; (2) user `deny` regexes → deny; (3) the forced `.omp` gate (PP-8) → ask; (4) `denyPaths` (PP-5) → ask; (5) user `allow` regexes → allow; (6) the base result: a path-grading allow, a `tools` allowlist allow (RL-7), the settings-tool allow (RL-8), or gray (the call goes to the classifier, CL-1). Steps 2–5 run only when the call has a rule target (RL-3). Deny beats allow.
+The rule layer MUST evaluate a tool call in this order and stop at the first terminal result: (1) user `deny` regexes → deny (before the built-in rules); (2) the built-in rules at their configured action — RL-5 danger rules for command tools, PG path tiers for file tools; a built-in deny is terminal: neither a user `allow` nor a gate overrides it, only a permission grant can lift it (GR-5); (3) the forced `.omp` gate (PP-8) → ask; (4) `denyPaths` (PP-5) → ask; (5) user `allow` regexes → allow (this beats a built-in ask, never a built-in deny); (6) the base result: a built-in ask (no gate: dialog with a UI, deny without, MD-4 in yolo), a path-grading allow, a `tools` allowlist allow (RL-7), the settings-tool allow (RL-8), or gray (the call goes to the classifier, CL-1). When the `.omp` gate or `denyPaths` replaces a built-in ask, the built-in hits stay attached so a grant can still cover them (GR-5) and yolo can still refuse them (MD-4). Steps 1 and 3–5 run only when the call has a rule target (RL-3).
 
-Why: a protected path is the user's exception to their own allow rules ("not even my allow list may touch these"), and a hard deny must not depend on user configuration; deny-beats-allow follows the rule-layer audit ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md)).
+Why: a protected path is the user's exception to their own allow rules ("not even my allow list may touch these"), and a built-in deny must not depend on user allow rules; a user deny states the user's own policy and is cheaper to explain than a built-in reason, so it is evaluated first; deny-beats-allow follows the rule-layer audit ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md)). A built-in ask is a prompt, which the user's explicit allow regex may pre-answer.
 Code: `classifyByRules`
-Pinned by: built-in deny floor › floor NOT overridable by user allow; user rules (deny > allow > gray) › user deny beats user allow; denyPaths (PP-1–PP-9) › priority: user deny beats denyPaths (deny reason, zero confirms); denyPaths (PP-1–PP-9) › priority: denyPaths hit overrides user allow (^ls\\b + ls over denyPath → confirm)
+Pinned by: built-in rules (RL-5, RL-6, PG) › floor NOT overridable by user allow; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › user deny precedes the built-in rules; user allow beats a built-in ask but never a built-in deny; user rules (deny > allow > gray) › user deny beats user allow; denyPaths (PP-1–PP-9) › priority: user deny beats denyPaths (deny reason, zero confirms); denyPaths (PP-1–PP-9) › priority: denyPaths hit overrides user allow (^ls\\b + ls over denyPath → confirm); permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › yolo: a gate whose yolo action is allow still refuses a built-in ask underneath
 
 #### RL-3: Rule target
 
@@ -42,7 +42,7 @@ Pinned by: user rules (deny > allow > gray) › invalid regexes are skipped, val
 
 #### RL-5: Danger rules
 
-With the floor on (RL-6), a command tool call whose first 8192 characters match any danger rule is denied with reason `rule <id>: <reason>`; characters beyond the cap are not examined. An empty or whitespace-only command is allowed with reason `empty command`. Every other command is gray: there is no built-in command allowlist.
+Every danger rule has an id, a pattern, a reason and an action (`deny`, `ask` or `allow`); the built-in rules below default to `deny`. The effective list is the built-ins with their configured action (`dangerRules`, CF-4), minus removed ones, plus user-added custom rules (a custom rule is an entry `{"pattern", "action"?, "reason"?, "flags"?}`; the action defaults to `deny`, the reason to `custom danger rule`, the pattern is compiled case-insensitively unless `flags` says otherwise, and `g`/`y` flags are rejected). A command tool call is matched on its first 8192 characters (characters beyond the cap are not examined) against every rule whose action is not `allow`; a rule set to `allow` passes no judgment and is skipped (the call goes on, to the classifier if nothing else decides). If any hit is `deny` the call is denied, otherwise if any hit exists it asks (built-in ask: RL-2 step 6); the reason lists every hit of the winning action as `rule <id>: <reason>`, joined by `; `. An empty or whitespace-only command is allowed with reason `empty command`. Every other command is gray: there is no built-in command allowlist.
 
 | id | matches |
 |---|---|
@@ -61,17 +61,17 @@ With the floor on (RL-6), a command tool call whose first 8192 characters match 
 | `gh-release` | `gh release create`, `delete`, `edit` |
 | `fork-bomb` | `:(){` |
 
-Why: command-string regex allowlists were bypassed in all audited payloads ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md)), so only a deny floor ships and everything else is judged by meaning (CL-1); the cap bounds regex backtracking on long separator-free strings (#25).
-Code: `BASH_DANGER_RULES`, `classifyBash`, `BASH_MAX_MATCH_LEN`
-Pinned by: built-in deny floor › danger regex (rm -rf) → deny, zero model calls; built-in deny floor › no built-in whitelist: ls → gray → classifier; user rules (deny > allow > gray) › bash commands longer than the match cap are truncated before rule matching
+Why: command-string regex allowlists were bypassed in all audited payloads ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md)), so only deny-by-default rules ship and everything else is judged by meaning (CL-1); each rule's action is configurable because what is dangerous depends on the user's workflow, and `allow` means "no judgment" rather than "allowed" so a configuration can never make the rule layer auto-approve a command; the cap bounds regex backtracking on long separator-free strings (#25).
+Code: `BASH_DANGER_RULES`, `DangerRule`, `parseDangerRules`, `parseDangerRuleEntry`, `classifyBash`, `BASH_MAX_MATCH_LEN`
+Pinned by: built-in rules (RL-5, RL-6, PG) › danger regex (rm -rf) → deny, zero model calls; built-in rules (RL-5, RL-6, PG) › no built-in whitelist: ls → gray → classifier; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › danger rule set to ask: dialog with a UI, block with the grant hint headless, block in yolo without a dialog; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › action allow (or removal with false) passes no judgment: the call goes to the classifier; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › custom rule: case-insensitive by default, flags override, reason defaults; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › all hits count: a deny beats an ask and the reason names every hit of the winning action; user rules (deny > allow > gray) › bash commands longer than the match cap are truncated before rule matching
 
 #### RL-6: builtinDenyFloor
 
-`builtinDenyFloor: false` disables the danger rules (RL-5) and turns every path-grading deny (PG-3, PG-5) into gray; it NEVER turns a deny into an allow, and it does not change the allows of path grading (PG-4, PG-5). It has no effect on user rules, the forced `.omp` gate (PP-8) or `denyPaths` (PP-5).
+`builtinDenyFloor: false` is the master switch of the built-in rules: it sets the action of every built-in danger rule and every path tier to `allow` (no judgment, so the call goes to the classifier); it NEVER turns a deny into an allow, and it does not change the allows of path grading (PG-4, PG-5). Custom danger rules (RL-5) stay active. It has no effect on user rules, the forced `.omp` gate (PP-8) or `denyPaths` (PP-5).
 
 Why: the switch turns off the built-in claims, not the user's own declarations (documented risk acceptance by the user).
-Code: `classifyBash`, `classifyPath`, `UserRules.builtinDenyFloor`
-Pinned by: user rules (deny > allow > gray) › builtinDenyFloor: false disables the whole built-in deny floor (risk accepted by user); user rules (deny > allow > gray) › builtinDenyFloor: false downgrades S0 path deny to gray (never to allow); denyPaths (PP-1–PP-9) › builtinDenyFloor:false does not disable denyPaths
+Code: `parseDangerRules`, `parsePathRules`, `classifyBash`, `classifyPath`, `UserRules.builtinDenyFloor`
+Pinned by: user rules (deny > allow > gray) › builtinDenyFloor: false disables the whole built-in deny floor (risk accepted by user); user rules (deny > allow > gray) › builtinDenyFloor: false downgrades S0 path deny to gray (never to allow); built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › builtinDenyFloor:false sets built-in rules to allow; custom rules stay active; denyPaths (PP-1–PP-9) › builtinDenyFloor:false does not disable denyPaths
 
 #### RL-7: tools allowlist
 
@@ -118,27 +118,27 @@ Pinned by: path floor dual-form matching (#20) › write of a new key file via t
 
 #### PG-3: S0 secrets
 
-A path matching any S0 pattern is denied for every file tool, read or write (grep/find/ls with a path included). With the floor off it is gray (RL-6). S0 patterns, in plain words: `.ssh`, `.aws` or `.gnupg` followed by a separator or the end; `.env` or `.env.*` as a file name; `credential`/`credentials` followed by `.`, a separator or the end; file names starting `id_rsa`; names ending `.pem` or `_history`; `.config/gh`; `.pi/agent/auth.json` and `.omp/agent/auth.json`; the files `.netrc`, `.npmrc`, `.pypirc`, `.envrc` and `.vault-token`; `.kube`; `.docker/config.json`; `.gem/credentials`.
+A path matching any S0 pattern is graded by the path tier `s0-secret` (default action `deny`) for every file tool, read or write (grep/find/ls with a path included). A tier set to `ask` or `deny` carries the reason `tier s0-secret: S0 secrets/credential path: <path>`; set to `allow` it is gray (the call goes to the classifier). Every path tier works this way (PG-4, PG-5): the tier ids are `s0-secret`, `s1-system-read`, `s1-system-write`, `s2-user-rc-write` and `s3-git-meta-write`, with default actions `deny`, `allow`, `deny`, `allow` and `deny`, configurable per id (`pathRules`, CF-4); the first matching tier wins. A path-tier ask is a built-in ask (RL-2 step 6) and never offers Explain (PP-9) because its reason embeds the path. S0 patterns, in plain words: `.ssh`, `.aws` or `.gnupg` followed by a separator or the end; `.env` or `.env.*` as a file name; `credential`/`credentials` followed by `.`, a separator or the end; file names starting `id_rsa`; names ending `.pem` or `_history`; `.config/gh`; `.pi/agent/auth.json` and `.omp/agent/auth.json`; the files `.netrc`, `.npmrc`, `.pypirc`, `.envrc` and `.vault-token`; `.kube`; `.docker/config.json`; `.gem/credentials`.
 
-Why: credential files are the exfiltration route the audit expanded the list for ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md), V8); S0 is an author-vetted, false-positive-tuned set, which is why it denies while user-declared protected paths ask (PP-5).
-Code: `S0_SECRET`, `classifyPath`
-Pinned by: built-in deny floor › write to S0 secret path → deny; security audit regression (all payloads must NOT be rule-allowed) › V8 read ~/.npmrc → S0 deny (list expanded)
+Why: credential files are the exfiltration route the audit expanded the list for ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md), V8); S0 is an author-vetted, false-positive-tuned set, which is why it denies by default while user-declared protected paths ask (PP-5); the `tier <id>:` prefix tells the agent what to name in a permission grant (GR-1).
+Code: `S0_SECRET`, `classifyPath`, `PATH_TIER_IDS`, `PATH_TIER_DEFAULTS`
+Pinned by: built-in rules (RL-5, RL-6, PG) › write to S0 secret path → deny; security audit regression (all payloads must NOT be rule-allowed) › V8 read ~/.npmrc → S0 deny (list expanded); built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › path tiers: ask opens the dialog, deny blocks with the tier id in the reason; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › invalid pathRules entries are skipped with a warning
 
 #### PG-4: Reads
 
-For read grading, after S0 (PG-3): a path under an S1 system prefix (`/etc`, `/private/etc`, `/private/var`, `/usr`, `/var`, `/System`, or a file named `authorized_keys`) is gray; every other path is allowed without the classifier. Reads outside S0 and S1 are therefore mechanically allowed, including paths outside the cwd.
+For read grading, after S0 (PG-3): a path under an S1 system prefix (`/etc`, `/private/etc`, `/private/var`, `/usr`, `/var`, `/System`, or a file named `authorized_keys`) is graded by the path tier `s1-system-read` (default `allow` = gray, reason prefix `tier s1-system-read:` when it is set to `ask` or `deny`); every other path is allowed without the classifier. Reads outside S0 and S1 are therefore mechanically allowed, including paths outside the cwd.
 
 Why: reads change nothing on disk; only credential reads (S0) and system configuration reads (S1) carry the risk the grading targets (code comment on `classifyPath`).
 Code: `classifyPath`, `S1_SYSTEM`
-Pinned by: S-rule case folding + firmlink prefixes (#21) › read /private/etc/sudoers grades gray like /etc/sudoers (firmlink prefix); path floor dual-form matching (#20) › ordinary direct-path behavior unchanged
+Pinned by: S-rule case folding + firmlink prefixes (#21) › read /private/etc/sudoers grades gray like /etc/sudoers (firmlink prefix); path floor dual-form matching (#20) › ordinary direct-path behavior unchanged; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › path tiers: ask opens the dialog, deny blocks with the tier id in the reason
 
 #### PG-5: Writes
 
-For write grading, after S0 (PG-3), in this order: an S1 path (PG-4) → deny; an S3 git-metadata path (`.git/hooks`, `.git/config`, `.git/modules`, `.gitmodules`) → deny; an S2 user-persistence path (names ending `.bashrc`, `.zshrc`, `.profile`, `.bash_profile`, `.gitconfig`; any path containing `crontab`; `Library/LaunchAgents`; `.config/systemd`) → gray; otherwise, if every form of the path lies inside the cwd (lexical or realpath base form) → allow; otherwise gray. With the floor off the denies are gray (RL-6).
+For write grading, after S0 (PG-3), in this order: an S1 path (PG-4) → tier `s1-system-write` (default `deny`); an S3 git-metadata path (`.git/hooks`, `.git/config`, `.git/modules`, `.gitmodules`) → tier `s3-git-meta-write` (default `deny`); an S2 user-persistence path (names ending `.bashrc`, `.zshrc`, `.profile`, `.bash_profile`, `.gitconfig`; any path containing `crontab`; `Library/LaunchAgents`; `.config/systemd`) → tier `s2-user-rc-write` (default `allow` = gray); otherwise, if every form of the path lies inside the cwd (lexical or realpath base form) → allow; otherwise gray. A tier set to `allow` is gray and ends the grading (the first matching tier wins); `ask`/`deny` carry the `tier <id>:` reason prefix.
 
 Why: `.git` hooks and config are executable entry points (code comment on `classifyPath`); a lexical prefix hit whose real form escapes the project grades as an outside-cwd write (#20).
 Code: `classifyPath`, `S1_SYSTEM`, `S2_USER_RC`, `S3_GIT_META`
-Pinned by: built-in deny floor › write inside CWD → rule allow, zero model calls; path floor dual-form matching (#20) › write via symlink into .git/hooks denies (S3 via real form); path floor dual-form matching (#20) › write via symlink to a plain outside dir is no longer rule-allowed (gray → classifier); S-rule case folding + firmlink prefixes (#21) › write to a case-variant user rc path inside cwd grades gray (S2 /i flips in-cwd allow to gray)
+Pinned by: built-in rules (RL-5, RL-6, PG) › write inside CWD → rule allow, zero model calls; path floor dual-form matching (#20) › write via symlink into .git/hooks denies (S3 via real form); path floor dual-form matching (#20) › write via symlink to a plain outside dir is no longer rule-allowed (gray → classifier); S-rule case folding + firmlink prefixes (#21) › write to a case-variant user rc path inside cwd grades gray (S2 /i flips in-cwd allow to gray)
 
 #### PG-6: Commands are not path-graded
 
@@ -230,7 +230,7 @@ The gray zone is every call the rule layer leaves undecided (RL-2 step 6): comma
 
 Why: deterministic rules establish the floor; the classifier handles only the remaining semantic ambiguity ([docs/security-principles.md](security-principles.md)).
 Code: `adjudicate`, `classifyByRules`
-Pinned by: built-in deny floor › no built-in whitelist: ls → gray → classifier; user rules (deny > allow > gray) › user rules do not apply to uncovered tools (MCP stays gray)
+Pinned by: built-in rules (RL-5, RL-6, PG) › no built-in whitelist: ls → gray → classifier; user rules (deny > allow > gray) › user rules do not apply to uncovered tools (MCP stays gray)
 
 #### CL-2: Classifier model resolution
 
@@ -439,7 +439,7 @@ Pinned by: approval modes › yolo › default mode keeps the terminal ask for p
 
 #### MD-4: yolo
 
-`yolo` NEVER prompts. A rule deny stays a deny. A `.omp` gate hit follows `yoloOmpDir` and a protected-path hit follows `yoloDenyPaths` (each `deny` by default; `allow` passes silently), with source `protected-path` and no path plaintext. Every other ask-shaped effective outcome — a classifier ask, a demotion without enforce authority, a failed enforce fallback, a yolo-ask slip — becomes a deny block tagged `yolo-retry` that tells the agent to explain why the action is needed or rewrite it narrower; this also applies headless. A classifier deny stays a deny.
+`yolo` NEVER prompts. A rule deny stays a deny, and so does a built-in ask (RL-2 step 6): the block names the rule or tier and carries the grant hint, because there is no one to ask. A `.omp` gate hit follows `yoloOmpDir` and a protected-path hit follows `yoloDenyPaths` (each `deny` by default; `allow` passes silently), with source `protected-path` and no path plaintext — except that a gate hit with built-in rule hits underneath is never passed silently: with the gate's action `allow` it is still a deny with the built-in reason (and the grant hint), because `allow` on the gate cannot waive a built-in rule. Every other ask-shaped effective outcome — a classifier ask, a demotion without enforce authority, a failed enforce fallback, a yolo-ask slip — becomes a deny block tagged `yolo-retry` that tells the agent to explain why the action is needed or rewrite it narrower; this also applies headless. A classifier deny stays a deny.
 
 Why: long unattended runs still want the deterministic floor and a classifier, without uncertain calls collapsing into a bare deny the agent cannot learn from.
 Code: `adjudicate`, `YOLO_RETRY_SUFFIX`, `presentVerdict`
@@ -447,7 +447,7 @@ Pinned by: approval modes › yolo › an ask from the classifier becomes an exp
 
 #### MD-5: noAutoDeny
 
-With a UI, `noAutoDeny` turns every effective deny — floor, user deny, classifier deny, fail-closed, no-model — into an ask whose reason ends ` (noAutoDeny: this would have been denied — your call)`; such an ask resolves to deny for a subagent (SG-5). Without a UI the deny stands. Gate asks stay asks.
+With a UI, `noAutoDeny` turns every effective deny — built-in rule, user deny, classifier deny, fail-closed, no-model — into an ask whose reason ends ` (noAutoDeny: this would have been denied — your call)`; such an ask resolves to deny for a subagent (SG-5). Without a UI the deny stands. Gate asks and built-in asks stay asks.
 
 Why: it keeps the earlier `autoDeny: false` behavior (every automatic deny is reviewable by the human) under the single mode switch.
 Code: `adjudicate`, `NO_AUTO_DENY_SUFFIX`
@@ -477,7 +477,7 @@ A blocked call returns `[auto-mode <tag> block] BLOCKED — this action did NOT 
 
 | tag | meaning |
 |---|---|
-| `rule` | built-in floor or user `deny` |
+| `rule` | built-in rule (deny, or ask resolved to deny headless or by yolo) or user `deny` |
 | `classifier` | classifier verdict, including a classifier failure (CL-7) |
 | `fail-closed` | no classifier model, or an unavailable enforce fallback with nobody to ask |
 | `protected-path` | gate ask denied headless or by yolo (MD-4) |
@@ -602,7 +602,7 @@ Pinned by: agentDir self-anchoring (#35) › dual install: a ~/.omp tree existin
 
 #### CF-2: User file
 
-The user file is `<agentDir>/config/pi-verdict.json`. When missing it is written from the first-run template (a read-only filesystem is skipped silently) and empty rules load. When unreadable or not valid JSON, empty rules load with the floor ON, the project file is not loaded, and a warning is notified. In both cases session keys (CF-5) still apply. The gate is NEVER disabled by configuration errors.
+The user file is `<agentDir>/config/pi-verdict.json`. When missing it is written from the first-run template (a read-only filesystem is skipped silently) and empty rules load. When unreadable or not valid JSON, empty rules load with the built-in rules at their default actions, the project file is not loaded, and a warning is notified. In both cases session keys (CF-5) still apply. The gate is NEVER disabled by configuration errors.
 
 Why: invalid configuration must never silently disable the gate (#25).
 Code: `loadUserRules`, `sessionOnlyLoad`, `USER_CONFIG_TEMPLATE`
@@ -618,7 +618,7 @@ Pinned by: project trust prompt › Trust: applies, persists the root, and is no
 
 #### CF-4: Merge semantics
 
-A trusted project file is shallow-merged over the global file key by key, so a project list REPLACES the global list instead of extending it. `toggleShortcut` and `_hint` are dropped from a project file (`toggleShortcut` with a warning), and a project `mode: "off"` is ignored with a warning (MD-2).
+A trusted project file is shallow-merged over the global file key by key, so a project list REPLACES the global list instead of extending it. The two rule maps `dangerRules` and `pathRules` merge per id instead: an id set in the project file replaces the global entry for that id only, other ids keep their global entry; an action string over a lower object entry keeps its `pattern`, `reason` and `flags` (`{...lower, action}`), an object entry on a built-in without `reason` keeps the built-in reason, `false` removes a danger rule and `null` entries are skipped with a warning. `toggleShortcut` and `_hint` are dropped from a project file (`toggleShortcut` with a warning), and a project `mode: "off"` is ignored with a warning (MD-2).
 
 Why: replacing is predictable and lets a project narrow as well as widen; `toggleShortcut` binds at extension load and cannot differ per project.
 Code: `loadUserRules`
@@ -626,7 +626,7 @@ Pinned by: /verdict config editor › local: first add copies the global list, n
 
 #### CF-5: Session scope
 
-Session overrides live in `<agentDir>/config/pi-verdict-sessions/<sessionId>.json` (a session id outside `[A-Za-z0-9._-]` is kept in memory only). A session file may set only `SESSION_KEYS` — `mode`, `confidenceThreshold`, the four jev thresholds, `yoloDenyPaths`, `yoloOmpDir`, `classifierFallbackMode`, `gateOmpDir`, `footer`, `modeStatus`, `grantStatus` — and `ruleAdditions`, whose `allow`, `deny`, `denyPaths`, `tools` and `rules` lists APPEND to the merged lists, and `grants`, the active permission grants (GR-6). Any other key is skipped with a warning. Precedence for every session key is session > local > global > default. The 50 newest session files are kept; new and forked sessions start without overrides.
+Session overrides live in `<agentDir>/config/pi-verdict-sessions/<sessionId>.json` (a session id outside `[A-Za-z0-9._-]` is kept in memory only). A session file may set only `SESSION_KEYS` — `mode`, `confidenceThreshold`, the four jev thresholds, `yoloDenyPaths`, `yoloOmpDir`, `classifierFallbackMode`, `gateOmpDir`, `footer`, `modeStatus`, `grantStatus` — the rule maps `dangerRules` and `pathRules` (merged per id over local and global, CF-4), and `ruleAdditions`, whose `allow`, `deny`, `denyPaths`, `tools` and `rules` lists APPEND to the merged lists, and `grants`, the active permission grants (GR-6). Any other key is skipped with a warning. Precedence for every session key is session > local > global > default. The 50 newest session files are kept; new and forked sessions start without overrides.
 
 Why: the right value differs per project and per session; the session file is kept apart from the audit directory and the trust store.
 Code: `SESSION_KEYS`, `sanitizeSessionRaw`, `applyRuleAdditions`, `writeSessionOverrides`, `pruneSessionOverrides`, `settingSourcesOf`
@@ -634,7 +634,7 @@ Pinned by: approval modes › scopes › session beats user config, persists per
 
 #### CF-6: Invalid values
 
-An invalid value is skipped with a warning (one notification per load listing every skipped value) and its default applies: an enum outside its set; a percent that is not a finite number in 0–100; a `subagentAskTimeoutMs` that is not a positive integer; a non-boolean switch; a non-string, empty or non-compiling list entry.
+An invalid value is skipped with a warning (one notification per load listing every skipped value) and its default applies: an enum outside its set; a percent that is not a finite number in 0–100; a `subagentAskTimeoutMs` that is not a positive integer; a non-boolean switch; a non-string, empty or non-compiling list entry; a `dangerRules` entry whose id is not lowercase `[a-z0-9-]`, whose action string is not `deny`/`ask`/`allow`, whose action string or `false` names an unknown id, whose `pattern` is missing, non-string or non-compiling, whose `flags` are not a string of `i`/`m`/`s`/`u`, or whose `action`/`reason` have the wrong type; a `pathRules` id outside `PATH_TIER_IDS` or an action outside `deny`/`ask`/`allow`.
 
 Why: configuration errors never disable the gate or crash the load (#25).
 Code: `loadUserRules`, `parseApprovalKeys`
@@ -762,11 +762,11 @@ Pinned by: root rule (RR-1–RR-4) › critic revise feeds the next attempt; ove
 
 #### ST-1: Actions and keys
 
-The tool `verdict_settings` takes `action` = `get`, `set`, `unset`, `add` or `remove`; `key` from `SETTINGS_TOOL_KEYS` (every config key except `_hint`); `scope` = `global`, `local` or `session`; `value`; and `reason`. `set` replaces a key's whole value and validates it like the config loader (lists via `validateRule`, booleans, enums, percent keys 0–100 or `null`, model and prompt strings, `toggleShortcut`, `subagentAskTimeoutMs` integer ≥ 1, `rootRule` object with no skipped fields); `unset` drops a key at one scope; `add`/`remove` take one entry of a list key (`allow`, `deny`, `denyPaths`, `tools`, `rules`). Scope rules, first violated one wins: `add`/`remove` apply only to list keys; `session` takes only `SESSION_KEYS`, list keys (entries are appended to the effective list) and `rootRule`; `toggleShortcut` is not overridable at `local`; `mode` `off` is session-only. `reason` is required for changes (at most 500 characters). Invalid input is rejected before any dialog.
+The tool `verdict_settings` takes `action` = `get`, `set`, `unset`, `add` or `remove`; `key` from `SETTINGS_TOOL_KEYS` (every config key except `_hint`); `scope` = `global`, `local` or `session`; `value`; and `reason`. `set` replaces a key's whole value and validates it like the config loader (lists via `validateRule`, booleans, enums, percent keys 0–100 or `null`, model and prompt strings, `toggleShortcut`, `subagentAskTimeoutMs` integer ≥ 1, `rootRule` object with no skipped fields); the rule maps `dangerRules` and `pathRules` take an object and `set` merges it per id into that scope's stored map (an id with value `null` is dropped from the scope, restoring the lower scope's or default entry; an empty result is removed; entries are validated by `parseDangerRuleEntry` / the path-tier parser, unknown ids rejected); `unset` drops a key at one scope; `add`/`remove` take one entry of a list key (`allow`, `deny`, `denyPaths`, `tools`, `rules`). `get` returns the effective `dangerRules` as `{id: {action, reason, pattern, flags, builtin}}`. Scope rules, first violated one wins: `add`/`remove` apply only to list keys; `session` takes only `SESSION_KEYS`, `dangerRules`, `pathRules`, list keys (entries are appended to the effective list) and `rootRule`; `toggleShortcut` is not overridable at `local`; `mode` `off` is session-only. `reason` is required for changes (at most 500 characters). Invalid input is rejected before any dialog.
 
 Why: one validation path means an approved change is always one the loader accepts; the per-scope limits mirror what the menus offer.
 Code: `SETTINGS_TOOL_KEYS`, `validateSettingValue`, `settingScopeError`
-Pinned by: settings tool (ST-1–ST-5) › invalid value is rejected before the dialog; settings tool (ST-1–ST-5) › mode off only at session scope
+Pinned by: settings tool (ST-1–ST-5) › invalid value is rejected before the dialog; settings tool (ST-1–ST-5) › mode off only at session scope; settings tool (ST-1–ST-5) › dangerRules set at session scope applies to the next call; a null id restores the default; settings tool (ST-1–ST-5) › an invalid rule entry is rejected before the dialog
 
 #### ST-2: Confirmation
 
@@ -804,11 +804,11 @@ Pinned by: settings tool (ST-1–ST-5) › local add starts from a copy of the g
 
 #### GR-1: Request tool
 
-The tool `verdict_grant` takes `action` = `request`, `release` or `list`. `request` carries `request` (natural language, at most 1000 characters, the exact operation and scope) and optional `paths` (at most 10 entries of `{path, access}`, `access` = `read`, `write` or `full`, path at most 500 characters). At most 20 grants are active; an identical active request (same text and paths) answers `Already granted` without asking. `release` drops one of the agent's own grants by id; `list` returns the active grants. In approval mode `off` every action answers `NA: …` and nothing else happens (MD-2); the tool is refused in subagents. A grant is a session-long, natural-language authorization; it is never written to a config file.
+The tool `verdict_grant` takes `action` = `request`, `release` or `list`. `request` carries `request` (natural language, at most 1000 characters, the exact operation and scope), optional `paths` (at most 10 entries of `{path, access}`, `access` = `read`, `write` or `full`, path at most 500 characters) and optional `rules` (at most 20 danger-rule ids, each of them in the effective danger-rule list — RL-5; an unknown id is rejected with the list of known ids before any dialog). At most 20 grants are active; an identical active request (same text, paths and rules) answers `Already granted` without asking. `release` drops one of the agent's own grants by id; `list` returns the active grants with their `rules`. In approval mode `off` every action answers `NA: …` and nothing else happens (MD-2); the tool is refused in subagents. A grant is a session-long, natural-language authorization; it is never written to a config file. A stored grant without a `rules` field loads with an empty list.
 
 Why: the agent needs a sanctioned way to ask for an authorization a block told it about, and a human-approved scope the classifiers can read is narrower than a regex the user must write.
 Code: `verdict_grant` (registered in `autoMode`), `GRANT_TOOL_NAME`, `parseGrants`
-Pinned by: permission grants (GR-1–GR-6) › GR-1: mode off answers NA to every action, with no dialog and no model call; permission grants (GR-1–GR-6) › GR-2: invalid requests throw, an identical active request is not asked twice; permission grants (GR-1–GR-6) › GR-2: no UI rejects; subagents are refused
+Pinned by: permission grants (GR-1–GR-6) › GR-1: mode off answers NA to every action, with no dialog and no model call; permission grants (GR-1–GR-6) › GR-2: invalid requests throw, an identical active request is not asked twice; permission grants (GR-1–GR-6) › GR-2: no UI rejects; subagents are refused; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › requesting an unknown rule id throws and lists the known ids; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a persisted grant without a rules field still loads
 
 #### GR-2: Human approval
 
@@ -820,7 +820,7 @@ Pinned by: permission grants (GR-1–GR-6) › GR-2: reject, and clarify with te
 
 #### GR-3: Yolo consensus
 
-In `yolo` nothing prompts: the judge classifier reviews the request (the task paragraph `Grant review`, choices allow/deny), and a configured `classifierFallbackModel` must also allow, regardless of `classifierFallbackMode`. Both allow → the grant is created with `grantedBy: "classifier"`; any deny, error, a missing model or a missing allow → rejected with nothing granted. The existence hint of PP-7 is not sent: the request and the grants are the whole brief.
+In `yolo` nothing prompts: the judge classifier reviews the request (the task paragraph `Grant review`, choices allow/deny; the request, its paths and its rule ids are the whole brief, and a grant that names built-in rules or paths needs the narrowest scope that serves the request), and a configured `classifierFallbackModel` must also allow, regardless of `classifierFallbackMode`. Both allow → the grant is created with `grantedBy: "classifier"`; any deny, error, a missing model or a missing allow → rejected with nothing granted. The existence hint of PP-7 is not sent: the request and the grants are the whole brief.
 
 Why: yolo has no human, so a grant needs two independent agreements rather than the agent's say-so.
 Code: `grantConsensus`, `GRANT_REVIEW_TASK`
@@ -828,19 +828,19 @@ Pinned by: permission grants (GR-1–GR-6) › GR-3: yolo grants only when the j
 
 #### GR-4: Authority in classifier prompts
 
-Active grants are part of the user policy block of every classifier and fallback system prompt (CL-5), after the root rule and the classification rules, as `Permission grants (…)` with one `- G<n>: <request>` line per grant. Within its literal scope a grant is authoritative: the classifier may allow a call the grant clearly covers; nothing it does not literally cover is widened. A grant never overrides the built-in floor or a user `deny` rule, which are decided before the classifier (RL-2). Protected-path entries are NOT sent in ordinary classifier prompts (PP-6): each grant with entries carries only `(plus N protected-path access entry/entries, enforced separately)`.
+Active grants are part of the user policy block of every classifier and fallback system prompt (CL-5), after the root rule and the classification rules, as `Permission grants (…)` with one `- G<n>: <request>` line per grant, followed by `(danger rules: <ids>)` when it names rules. Within its literal scope a grant is authoritative: the classifier may allow a call the grant clearly covers; nothing it does not literally cover is widened. A grant does not override a user `deny` rule, which is decided before the classifier (RL-2); it lifts a built-in rule only through the coverage check of GR-5. Protected-path entries are NOT sent in ordinary classifier prompts (PP-6): each grant with entries carries only `(plus N protected-path access entry/entries, enforced separately)`.
 
 Why: the grant text is the user's own words, approved this session, so it is policy and not injected content; the protected-path plaintext rule (PP-6) stays intact outside the coverage check.
 Code: `classifierPolicy`, `trustedPolicyBlock`
 Pinned by: permission grants (GR-1–GR-6) › GR-2/GR-4/GR-6: approved grant is persisted and reaches the classifier prompt after the rules header; permission grants (GR-1–GR-6) › GR-4: the fallback classifier prompt carries the grants too; permission grants (GR-1–GR-6) › GR-4: protected-path text is withheld from ordinary classifier calls (count only)
 
-#### GR-5: Protected-path coverage check
+#### GR-5: Coverage check
 
-A grant may list protected-path access entries (`paths`). When a call would be a terminal ask because of `denyPaths` (PP-5) or the `.omp` gate (PP-8) and at least one active grant has entries, the coverage check runs before the ask (and before the yolo outcome of MD-4). A grant covers the call only if every protected path the call touches lies under one of its entries (segment boundary, base forms, PP-3/PP-4) and the access fits: a command tool accepts any access level, `write` and `edit` need `write` or `full`, every other file tool needs `read` or `full`. If no grant covers every touch (a command touching a `denyPaths` entry and a `.omp` directory needs both covered) the call asks as before and no model is called. Otherwise the judge, and a configured fallback, are asked once each with the call, the covering grants and their paths (task paragraph `Coverage check`, choices allow/ask); both must answer allow for the call to pass, any other outcome keeps the ask. A passing call is allowed with source `protected-path` and reason `permission grant <ids> covers this protected-path access`, recorded in the audit log (AU-1) with the path and silent outside debug (PR-3).
+A grant may list protected-path access entries (`paths`) and danger-rule ids (`rules`). When a call would be a terminal ask because of `denyPaths` (PP-5) or the `.omp` gate (PP-8), or has built-in rule hits that make it a deny or an ask (RL-5, PG-3–PG-5), and at least one active grant could apply, the coverage check runs before the ask or deny (and before the yolo outcome of MD-4). A grant covers the call only if every protected path the call touches lies under one of its entries (segment boundary, base forms, PP-3/PP-4) and the access fits (a command tool accepts any access level, `write` and `edit` need `write` or `full`, every other file tool needs `read` or `full`), and every danger-rule hit's id is among its `rules`; a built-in path-tier hit is covered by a path entry that contains the path (the same entry rule). Several grants may cover different parts of one call (a command touching a `denyPaths` entry and a `.omp` directory needs both covered). If no grant covers every touch or hit the call asks or is denied as before (a built-in deny whose block text carries the grant hint) and no model is called. Otherwise the judge, and a configured fallback, are asked once each with the call, the covering grants and their paths and rule ids (task paragraph `Coverage check`, choices allow/ask); both must answer allow for the call to pass, any other outcome keeps the ask or deny. A passing call is allowed with reason `permission grant <ids> covers this gated access`, recorded in the audit log (AU-1) with source `protected-path` and silent outside debug (PR-3). A grant never lifts a user `deny` rule (RL-2 step 1).
 
-Why: a protected path is a user-declared boundary, so lifting it for one call needs the user's own approval of the path (GR-2) plus two checks that this call is within it; an uncovered call must not leak the path to a model.
+Why: a protected path is a user-declared boundary and a built-in rule is the gate's own claim, so lifting either for one call needs the user's own approval of the path or rule (GR-2) plus two checks that this call is within it; an uncovered call must not leak the path to a model.
 Code: `coveringGrants`, `denyPathHits`, `ompTouches`, `grantConsensus`, `GRANT_COVERAGE_TASK`, `adjudicate`
-Pinned by: permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › without a covering grant a protected-path read asks the user, with no model call; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a covering read grant lets the scope check allow the read without asking; the reason and notices carry no path; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › an access level that does not fit never reaches a model: write with a read grant asks; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a command touching a denyPath and a .omp path is not coverable when only the .omp path is granted; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › the scope check answering ask falls back to today's ask; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › headless, an uncovered or refused protected-path call still denies
+Pinned by: permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › without a covering grant a protected-path read asks the user, with no model call; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a covering read grant lets the scope check allow the read without asking; the reason and notices carry no path; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › an access level that does not fit never reaches a model: write with a read grant asks; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a command touching a denyPath and a .omp path is not coverable when only the .omp path is granted; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › the scope check answering ask falls back to today's ask; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › headless, an uncovered or refused protected-path call still denies; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a grant naming the rule id lets the scope check lift the built-in deny; judge ask keeps the block with the hint; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a grant without the id does not cover the rule: deny with no model call; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a rule set to ask is liftable the same way (headless included); permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a path grant covers its built-in tier at a fitting access level only; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › yolo: a gate whose yolo action is allow still refuses a built-in ask underneath
 
 #### GR-6: Lifetime, revocation and visibility
 

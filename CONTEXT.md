@@ -53,14 +53,23 @@ Rules: [MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets), [MD-2](do
 The deterministic first stage of the pipeline; it decides allow, deny or ask from rules without calling a model, or leaves the call gray.
 Rules: [RL-2](docs/adjudication-rules.md#rl-2-evaluation-order)
 
-**Built-in deny floor**:
-The built-in part of the rule layer, made of danger rules and path grading, that declares denies and never declares a command allowed.
-_Avoid_: built-in allowlist
+**Built-in rules**:
+The built-in part of the rule layer, made of danger rules and path tiers, each with a configurable rule action (`deny` by default for most); it never declares a command allowed — `allow` hands the call on to the classifier.
+_Avoid_: built-in deny floor, built-in allowlist
 Rules: [RL-5](docs/adjudication-rules.md#rl-5-danger-rules), [RL-6](docs/adjudication-rules.md#rl-6-builtindenyfloor), [PG-3](docs/adjudication-rules.md#pg-3-s0-secrets)
 
 **Danger rule**:
-A built-in regular expression, identified by an id, whose match on a command string denies the call.
+A regular expression, identified by an id and carrying a rule action, whose match on a command string denies, asks or passes the call; the built-in ones can be reconfigured or removed and users can add custom ones (`dangerRules`).
 Rules: [RL-5](docs/adjudication-rules.md#rl-5-danger-rules)
+
+**Path tier**:
+One of the built-in grades of the path-grading part of the built-in rules (`s0-secret`, `s1-system-read`, `s1-system-write`, `s2-user-rc-write`, `s3-git-meta-write`), each with a configurable rule action (`pathRules`).
+Rules: [PG-3](docs/adjudication-rules.md#pg-3-s0-secrets), [PG-4](docs/adjudication-rules.md#pg-4-reads), [PG-5](docs/adjudication-rules.md#pg-5-writes)
+
+**Rule action**:
+What a matching built-in rule does: `deny` blocks, `ask` asks the user (a deny headless or in `yolo`), `allow` passes no judgment so the call goes to the classifier.
+_Avoid_: verdict (that is the final allow/ask/deny of the pipeline)
+Rules: [RL-5](docs/adjudication-rules.md#rl-5-danger-rules), [RL-6](docs/adjudication-rules.md#rl-6-builtindenyfloor)
 
 **Path grading**:
 The built-in classification of a file path into a sensitivity grade that yields allow, gray or deny for a file tool.
@@ -326,17 +335,17 @@ Rules: [RG-1](docs/adjudication-rules.md#rg-1-transcript-only), [RG-2](docs/adju
 ### Permission grants
 
 **Permission grant**:
-A session-long, natural-language authorization the agent requests through `verdict_grant` and the user approves (in `yolo`, the judge and fallback classifiers both allow); classifiers treat it as authoritative within its literal scope, and it is revocable at any time.
+A session-long, natural-language authorization the agent requests through `verdict_grant`, optionally naming protected-path access entries and danger-rule ids, and the user approves (in `yolo`, the judge and fallback classifiers both allow); classifiers treat it as authoritative within its literal scope, it is the only thing that lifts a built-in deny, and it is revocable at any time.
 _Avoid_: approval (that is a human answer to an ask), permission, allowlist entry
 Rules: [GR-1](docs/adjudication-rules.md#gr-1-request-tool), [GR-2](docs/adjudication-rules.md#gr-2-human-approval), [GR-4](docs/adjudication-rules.md#gr-4-authority-in-classifier-prompts), [GR-6](docs/adjudication-rules.md#gr-6-lifetime-revocation-and-visibility)
 
 **Protected-path access entry**:
-A path plus an access level (`read`, `write` or `full`) listed in a permission grant, used only by the grant coverage check.
-Rules: [GR-5](docs/adjudication-rules.md#gr-5-protected-path-coverage-check)
+A path plus an access level (`read`, `write` or `full`) listed in a permission grant, used only by the grant coverage check; it covers protected paths and, for the built-in path tiers, the tier hits at that path.
+Rules: [GR-5](docs/adjudication-rules.md#gr-5-coverage-check)
 
 **Grant coverage check**:
-The step before a protected-path or `.omp` gate ask that allows the call without a human when every touched protected path lies under an access entry of an active grant and both the judge and fallback classifiers confirm the call is within it.
-Rules: [GR-5](docs/adjudication-rules.md#gr-5-protected-path-coverage-check), [PP-6](docs/adjudication-rules.md#pp-6-plaintext-confinement)
+The step before a gated ask or a built-in rule deny/ask that allows the call without a human when every touched protected path lies under an access entry of an active grant, every danger-rule hit is named in a grant's `rules`, and both the judge and fallback classifiers confirm the call is within it.
+Rules: [GR-5](docs/adjudication-rules.md#gr-5-coverage-check), [PP-6](docs/adjudication-rules.md#pp-6-plaintext-confinement)
 
 **Grant review**:
 The yolo-mode consensus in which the judge and a configured fallback classifier both must allow a grant request before it is created.
