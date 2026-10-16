@@ -6,7 +6,7 @@
 **pi-verdict is a minimal permission gate for [pi](https://pi.dev) in the style of Claude Code's auto mode: every tool call gets checked before it runs — allow, deny, or ask you first.**
 
 - Minimal — two TypeScript files, zero runtime dependencies, no build step
-- Built-in danger rules and your own allow/deny rules settle the clear cases first, at zero latency
+- Built-in danger rules (each one's action configurable, with your own rules addable) and your own allow/deny rules settle the clear cases first, at zero latency
 - Everything else goes to a model classifier that sees the conversation context
 - Any uncertainty or failure fails closed; nothing ever runs silently
 
@@ -82,6 +82,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 - `verdict_settings` (agent tool, not a command) — lets the agent read the gate settings and propose changes (`set` / `unset` / `add` / `remove` at the `global`, `local` or `session` scope); every change opens a confirmation dialog and nothing is written without your approval. `denyPaths` are only ever returned as a count, and the tool is refused in subagents and when there is no UI ([ST-1](docs/adjudication-rules.md#st-1-actions-and-keys) to [ST-5](docs/adjudication-rules.md#st-5-writes))
 - `verdict_grant` (agent tool, not a command) — lets the agent request a session-long, natural-language permission grant (`request` / `release` / `list`), optionally with protected-path access entries (`{path, access: read|write|full}`). You approve in a dialog (I approve / I reject / ask for clarification or revision); in `yolo` the judge and the configured fallback classifier must both allow. Active grants are given to every classifier prompt as authoritative within their literal scope; protected-path entries only feed the coverage check before a `denyPaths` / `.omp` ask. A classifier, yolo-retry or declined block tells the agent it may request a grant ([GR-1](docs/adjudication-rules.md#gr-1-request-tool) to [GR-6](docs/adjudication-rules.md#gr-6-lifetime-revocation-and-visibility))
 - `/grants [list|revoke <id>|revoke all]` — list the active permission grants or revoke them (bare call with a UI opens a menu); a revocation also tells the agent. While grants exist the footer shows a key segment with their count, and on omp the status bar shows `🔑 N` (`grantStatus` key, default on)
+- built-in rules are configurable (`dangerRules`, `pathRules` in `pi-verdict.json`, or the `danger rules & path tiers` page of `/verdict`): every danger rule and path tier takes the action `deny`, `ask` or `allow` (`allow` = no judgment, the classifier decides); `false` removes a built-in danger rule and `{"pattern": …}` adds your own. A permission grant naming the rule id (`verdict_grant` `rules`) or the path can lift a built-in deny. Example: `{"dangerRules": {"gh-release": "ask", "npm-publish": {"pattern": "\\bnpm\\s+publish\\b"}}, "pathRules": {"s0-secret": "ask"}}` ([RL-5](docs/adjudication-rules.md#rl-5-danger-rules), [PG-3](docs/adjudication-rules.md#pg-3-s0-secrets), [GR-5](docs/adjudication-rules.md#gr-5-coverage-check))
 - `/automode-setup [global|local|session]` — draft the **root rule**, the classifier's single baseline policy, from this session and the project (also reachable from the `/automode` panel with `r`): the menu holds the generator inputs — `strictness` (`relaxed` / `balanced` / `strict`), `history` (this session's user messages and tool calls, never tool output), `codebase` (project docs, manifests, CI files and git remotes with credentials removed; secret and `denyPaths` files are skipped) and your `clarifications` (trusted instructions, never sent to the classifier) — and `g` generates. The session model drafts the policy (up to 3 attempts with a model critic, at most 4000 characters), you review the preview and save it to the session, project or global config; your `rules` apply on top of it and win on conflict ([RR-1](docs/adjudication-rules.md#rr-1-storage-and-resolution) to [RR-4](docs/adjudication-rules.md#rr-4-loop-and-review))
 - footer status (`footer` key): `full` = Nerd Font powerline blocks (gate state, risky settings, classifier model, verdict counters, badges), `compact` = one plain line, `off` = none; a switched-off gate always shows as `AUTO OFF · ungated`
 - mode chip in the prompt status bar (`modeStatus` key, default on): `🛡 AUTO` / `🛡 YOLO` / `🛡 NO-AUTODENY` / `🛡 OFF · ungated` through `setStatus`; on omp it appears in the status line's `status` segment, on pi it is hidden while the footer is on (the footer already shows the mode) and shown with `footer: "off"`
@@ -152,8 +153,10 @@ Honest framing: pi-automode and pi-verdict have **converged on the same architec
 tool_call
   │
   ├─ 1. Rule layer (deterministic, zero latency)
-  │     ├─ built-in base: command danger rules → deny; file paths graded S0–S3 → deny / gray / allow
-  │     ├─ your deny rules: beat your allow rules
+  │     ├─ your deny rules: first, beat your allow rules
+  │     ├─ built-in rules (each action configurable: deny | ask | allow = classifier):
+  │     │   command danger rules (dangerRules, add your own) and file path tiers S0–S3 (pathRules)
+  │     │   a permission grant naming the rule id or the path can lift a built-in deny/ask
   │     ├─ gateOmpDir: any .omp directory access → terminal ask
   │     ├─ denyPaths: protected paths → terminal ask, before your allow rules;
   │     │   the classifier sees an existence hint only
@@ -198,7 +201,7 @@ Design decisions here are settled by measurement, and the lab notes ship with th
 
 - no built-in **command** allowlist by design (see the [bypass writeup](research/rule-layer-security-audit.md)); with an empty `allow` config most commands go to the classifier — point `--auto-mode-model` at a fast model if per-call latency matters
 - path grading applies to file tools only: bash and powershell command strings are matched by the danger rules alone, so e.g. `cat ~/.ssh/id_rsa` goes to the classifier rather than the deterministic S0 deny (the file-tool spelling `read ~/.ssh/id_rsa` does deny) ([PG-6](docs/adjudication-rules.md#pg-6-commands-are-not-path-graded))
-- on Windows the built-in floor covers bash-shaped patterns only — PowerShell-native dangerous commands (`Remove-Item -Recurse -Force`, `Invoke-Expression`, `Set-ExecutionPolicy`, …) rely on the classifier (fail-closed)
+- on Windows the built-in rules cover bash-shaped patterns only — PowerShell-native dangerous commands (`Remove-Item -Recurse -Force`, `Invoke-Expression`, `Set-ExecutionPolicy`, …) rely on the classifier (fail-closed)
 - AGENTS.md is not passed to the classifier as downweighted intent evidence (Claude Code does this)
 - parallel gray-zone calls are adjudicated serially
 - self-reflection means the session model adjudicates — point `--auto-mode-model` at a lighter model if verdict latency/cost matters (open question tracked in the issue tracker)

@@ -159,7 +159,7 @@ const clearAudit = () => fs.rmSync(VERDICTS(), { recursive: true, force: true })
 beforeAll(() => { process.env.PI_CODING_AGENT_DIR = TMP_AGENT; });
 afterAll(() => { delete process.env.PI_CODING_AGENT_DIR; });
 
-function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; gateOmpDir?: unknown; classifierModel?: string | null; explainGateModel?: string | null; explainGatePrompt?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; footer?: unknown; modeStatus?: unknown; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; confidenceThreshold?: unknown; classifierFallbackMode?: unknown; mode?: unknown; autoDeny?: unknown; defaultDenyThreshold?: unknown; defaultAllowThreshold?: unknown; yoloDenyThreshold?: unknown; noAutoDenyAllowThreshold?: unknown; yoloDenyPaths?: unknown; yoloOmpDir?: unknown; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
+function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; dangerRules?: unknown; pathRules?: unknown; gateOmpDir?: unknown; classifierModel?: string | null; explainGateModel?: string | null; explainGatePrompt?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; footer?: unknown; modeStatus?: unknown; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; confidenceThreshold?: unknown; classifierFallbackMode?: unknown; mode?: unknown; autoDeny?: unknown; defaultDenyThreshold?: unknown; defaultAllowThreshold?: unknown; yoloDenyThreshold?: unknown; noAutoDenyAllowThreshold?: unknown; yoloDenyPaths?: unknown; yoloOmpDir?: unknown; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
 	fs.rmSync(path.join(TMP_AGENT, "config", "pi-verdict-sessions"), { recursive: true, force: true }); // session overrides never leak between tests
 	config = { allow: cfg.allow ?? [], deny: cfg.deny ?? [] };
 	const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
@@ -182,6 +182,9 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 	if (cfg.modeStatus !== undefined) raw.modeStatus = cfg.modeStatus;
 	if (cfg.subagentGate !== undefined) raw.subagentGate = cfg.subagentGate;
 	if (cfg.subagentAskTimeoutMs !== undefined) raw.subagentAskTimeoutMs = cfg.subagentAskTimeoutMs;
+	// built-in rule maps (CF-4–CF-6): arbitrary JSON so negative tests can write invalid entries
+	if (cfg.dangerRules !== undefined) raw.dangerRules = cfg.dangerRules;
+	if (cfg.pathRules !== undefined) raw.pathRules = cfg.pathRules;
 	// denyPaths (PP-1–PP-9): unknown[] lets negative tests mix in non-string entries
 	if (cfg.denyPaths !== undefined) raw.denyPaths = cfg.denyPaths;
 	// Invalid-regex test: mix the invalid entry directly into the allow array
@@ -270,7 +273,7 @@ async function withTempDir(prefix: string, fn: (dir: string) => void | Promise<v
 
 // ── 1. Built-in deny floor (not overridable) + no built-in allowlist ─────────
 
-describe("built-in deny floor", () => {
+describe("built-in rules (RL-5, RL-6, PG)", () => {
 	test("danger regex (rm -rf) → deny, zero model calls", async () => {
 		const h = session({});
 		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }); // concatenated so the dangerous regex does not block the test file
@@ -301,6 +304,133 @@ describe("built-in deny floor", () => {
 		const r = await toolCall(h, "write", { path: "/proj/src/a.ts", content: "x" });
 		expect(r).toBeUndefined();
 		expect(h.calls.length).toBe(0);
+	});
+	describe("configurable actions, custom rules, merge and order", () => {
+		const startWarnings = async (h: Harness): Promise<string> => {
+			await h.handlers.session_start({}, h.ctx);
+			return h.notifies.filter(([, l]) => l === "warning").map(([m]) => m).join("\n");
+		};
+		test("danger rule set to ask: dialog with a UI, block with the grant hint headless, block in yolo without a dialog", async () => {
+			const h = session({ dangerRules: { sudo: "ask" } });
+			expect(await toolCall(h, "bash", { command: "sudo ls" })).toBeUndefined(); // confirmAnswer defaults to yes
+			expect(h.confirms).toBe(1);
+			expect(h.calls).toHaveLength(0);
+			const headless = session({ dangerRules: { sudo: "ask" } });
+			headless.ctx.hasUI = false;
+			const r = await toolCall(headless, "bash", { command: "sudo ls" });
+			expect(r?.reason).toContain("[auto-mode rule block]");
+			expect(r?.reason).toContain("request a permission grant with verdict_grant");
+			expect(headless.confirms).toBe(0);
+			const yolo = session({ mode: "yolo", dangerRules: { sudo: "ask" } });
+			const ry = await toolCall(yolo, "bash", { command: "sudo ls" });
+			expect(ry?.block).toBe(true);
+			expect(ry?.reason).toContain("[auto-mode rule block]");
+			expect(yolo.confirms).toBe(0);
+			expect(yolo.calls).toHaveLength(0);
+		});
+		test("action allow (or removal with false) passes no judgment: the call goes to the classifier", async () => {
+			for (const entry of ["allow", false]) {
+				const h = session({ dangerRules: { "git-restore": entry } });
+				h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+				expect(await toolCall(h, "bash", { command: "git restore x" })).toBeUndefined();
+				expect(h.calls).toHaveLength(1);
+			}
+		});
+		test("custom rule: case-insensitive by default, flags override, reason defaults", async () => {
+			const h = session({ dangerRules: { "npm-publish": { pattern: "\\bnpm\\s+publish\\b" } } });
+			const r = await toolCall(h, "bash", { command: "NPM PUBLISH" });
+			expect(r?.block).toBe(true);
+			expect(r?.reason).toContain("rule npm-publish: custom danger rule");
+			expect(h.calls).toHaveLength(0);
+			const strict = session({ dangerRules: { "npm-publish": { pattern: "\\bnpm\\s+publish\\b", flags: "" } } });
+			strict.responses = [{ text: "<verdict>allow</verdict> ok" }];
+			expect(await toolCall(strict, "bash", { command: "NPM PUBLISH" })).toBeUndefined();
+			expect(strict.calls).toHaveLength(1);
+		});
+		test("all hits count: a deny beats an ask and the reason names every hit of the winning action", async () => {
+			const h = session({ dangerRules: { sudo: "ask", "git-restore": "ask", "gh-release": "deny", "git-reset-hard": "deny" } });
+			const r = await toolCall(h, "bash", { command: "sudo git reset --hard && gh release create v1" });
+			expect(r?.block).toBe(true);
+			expect(r?.reason).toContain("rule git-reset-hard: ");
+			expect(r?.reason).toContain("rule gh-release: ");
+			expect(r?.reason).not.toContain("rule sudo: ");
+			expect(h.confirms).toBe(0);
+		});
+		test("invalid entries are skipped with a warning and leave the built-in in force", async () => {
+			const h = session({ dangerRules: { sudo: "maybe", "bad-re": { pattern: "(" }, nope: "ask", flagged: { pattern: "x", flags: "g" }, "Bad Id": { pattern: "x" } } });
+			const warnings = await startWarnings(h);
+			expect(warnings).toContain("dangerRules.sudo");
+			expect(warnings).toContain("dangerRules.bad-re.pattern");
+			expect(warnings).toContain("dangerRules.nope: unknown rule id");
+			expect(warnings).toContain("dangerRules.flagged.flags");
+			expect(warnings).toContain("dangerRules.Bad Id: invalid rule id");
+			expect((await toolCall(h, "bash", { command: "sudo ls" }))?.block).toBe(true);
+			expect(h.confirms + h.calls.length).toBe(0);
+		});
+		test("builtinDenyFloor:false sets built-in rules to allow; custom rules stay active", async () => {
+			const h = session({ builtinDenyFloor: false, dangerRules: { "no-foo": { pattern: "\\bfoo\\b" } } });
+			h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+			expect(await toolCall(h, "bash", { command: "sudo ls" })).toBeUndefined();
+			expect(h.calls).toHaveLength(1);
+			const r = await toolCall(h, "bash", { command: "foo" });
+			expect(r?.reason).toContain("rule no-foo");
+			expect(h.calls).toHaveLength(1);
+		});
+		test("entries merge per id across global, trusted project and session", async () => {
+			await withTempDir("pv-rules-merge-", async (dir) => {
+				fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
+				fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ dangerRules: { "git-restore": "allow" } }));
+				fs.writeFileSync(path.join(TMP_AGENT, "config", "pi-verdict-trust.json"), JSON.stringify({ trusted: [dir], untrusted: [] }));
+				try {
+					const h = session({ dangerRules: { sudo: "ask" } }, { cwd: dir });
+					await h.handlers.session_start({}, h.ctx);
+					expect(await toolCall(h, "bash", { command: "sudo ls" })).toBeUndefined();
+					expect(h.confirms).toBe(1); // global sudo:ask applies
+					h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+					expect(await toolCall(h, "bash", { command: "git restore x" })).toBeUndefined();
+					expect(h.calls).toHaveLength(1); // local git-restore:allow applies alongside it
+					await h.tools.verdict_settings.execute("t1", { action: "set", key: "dangerRules", value: { sudo: "deny" }, scope: "session", reason: "r" }, undefined, undefined, h.ctx);
+					const confirmsBefore = h.confirms;
+					expect((await toolCall(h, "bash", { command: "sudo ls" }))?.block).toBe(true); // session overrides global per id
+					expect(h.confirms).toBe(confirmsBefore);
+					expect(h.calls).toHaveLength(1);
+				} finally {
+					fs.rmSync(path.join(TMP_AGENT, "config", "pi-verdict-trust.json"), { force: true });
+				}
+			});
+		});
+		test("user deny precedes the built-in rules; user allow beats a built-in ask but never a built-in deny", async () => {
+			const denied = session({ deny: ["sudo"] });
+			expect((await toolCall(denied, "bash", { command: "sudo ls" }))?.reason).toContain("user deny rule");
+			const askAllowed = session({ allow: ["^sudo\\b"], dangerRules: { sudo: "ask" } });
+			expect(await toolCall(askAllowed, "bash", { command: "sudo ls" })).toBeUndefined();
+			expect(askAllowed.confirms + askAllowed.calls.length).toBe(0);
+			const denyStays = session({ allow: ["^sudo\\b"] });
+			expect((await toolCall(denyStays, "bash", { command: "sudo ls" }))?.reason).toContain("rule sudo");
+			expect(denyStays.calls).toHaveLength(0);
+		});
+		test("path tiers: ask opens the dialog, deny blocks with the tier id in the reason", async () => {
+			const ask = session({ pathRules: { "s0-secret": "ask" } });
+			expect(await toolCall(ask, "read", { path: "~/.npmrc" })).toBeUndefined();
+			expect(ask.confirms).toBe(1);
+			expect(ask.calls).toHaveLength(0);
+			const deny = session({ pathRules: { "s1-system-read": "deny" } });
+			const r = await toolCall(deny, "read", { path: "/etc/hosts" });
+			expect(r?.block).toBe(true);
+			expect(r?.reason).toContain("tier s1-system-read:");
+			expect(deny.calls).toHaveLength(0);
+			const gray = session({ pathRules: { "s0-secret": "allow" } });
+			gray.responses = [{ text: "<verdict>deny</verdict> mock" }];
+			expect((await toolCall(gray, "read", { path: "~/.npmrc" }))?.block).toBe(true);
+			expect(gray.calls).toHaveLength(1);
+		});
+		test("invalid pathRules entries are skipped with a warning", async () => {
+			const h = session({ pathRules: { "s9-nope": "deny", "s0-secret": "sometimes" } });
+			const warnings = await startWarnings(h);
+			expect(warnings).toContain("pathRules.s9-nope");
+			expect(warnings).toContain("pathRules.s0-secret");
+			expect((await toolCall(h, "read", { path: "~/.npmrc" }))?.block).toBe(true);
+		});
 	});
 });
 
@@ -2658,13 +2788,27 @@ describe("/verdict config editor", () => {
 		expect(after.at(-1)).toContain("invalid");
 		expect(after.at(-1)).toContain("fix by hand");
 	});
+
+	test("built-in rules page: cycling a danger rule persists its action; a custom rule keeps its pattern", async () => {
+		const h = session({ dangerRules: { "npm-publish": { pattern: "\\bnpm\\s+publish\\b" } } });
+		const rendered: string[] = [];
+		await run(h, "", [...times(9, DOWN), ENTER, DOWN, DOWN, RIGHT], rendered);
+		expect(readUser().dangerRules["npm-publish"]).toEqual({ pattern: "\\bnpm\\s+publish\\b" });
+		expect(readUser().dangerRules.sudo).toBe("ask");
+		driveMenu(h, [...times(9, DOWN), ENTER, ...times(14, DOWN), RIGHT]);
+		await h.commands.verdict.handler("", h.ctx);
+		expect(readUser().dangerRules["npm-publish"]).toEqual({ pattern: "\\bnpm\\s+publish\\b", action: "ask" });
+		driveMenu(h, [...times(9, DOWN), ENTER, DOWN, DOWN, LEFT]); // sudo ask → deny; the page keeps LEFT for the value, not for going back
+		await h.commands.verdict.handler("", h.ctx);
+		expect(readUser().dangerRules.sudo).toBe("deny");
+	});
 });
 
 describe("/verdict omp custom roles", () => {
 	const TAGS = { "verdict-fallback": { name: "VERDICT FALLBACK" }, "explain-gate": { name: "EXPLAIN GATE" } };
 	const parse = (file: string): any => Bun.YAML.parse(fs.readFileSync(file, "utf8"));
 	const { DOWN, ENTER, LEFT, RIGHT, ESC } = MENU;
-	const ROLES_ROW = times(9, DOWN); // five lists, .omp gate, footer, mode in status bar, grants in status bar, then custom roles
+	const ROLES_ROW = times(10, DOWN); // five lists, .omp gate, footer, mode in status bar, grants in status bar, built-in rules page, then custom roles
 	async function open(h: Harness, dir: string, keys: string[], rendered: string[] = [], after: string[] = []): Promise<void> {
 		h.ompAgentDir = dir;
 		await h.handlers.session_start({}, h.ctx);
@@ -4871,6 +5015,26 @@ describe("settings tool (ST-1–ST-5)", () => {
 		expect(text).not.toContain("pv-secret-x");
 		expect(text).toContain('"count": 1');
 	});
+
+	test("dangerRules set at session scope applies to the next call; a null id restores the default", async () => {
+		const h = await open({});
+		await call(h, { action: "set", key: "dangerRules", value: { sudo: "ask" }, scope: "session", reason: "r" });
+		expect(h.confirms).toBe(1);
+		expect(await toolCall(h, "bash", { command: "sudo ls" })).toBeUndefined();
+		expect(h.confirms).toBe(2); // the ask dialog
+		await call(h, { action: "set", key: "dangerRules", value: { sudo: null }, scope: "session", reason: "r" });
+		expect((await toolCall(h, "bash", { command: "sudo ls" }))?.block).toBe(true);
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("an invalid rule entry is rejected before the dialog", async () => {
+		const h = await open({});
+		await expect(call(h, { action: "set", key: "dangerRules", value: { x1: { pattern: "(" } }, scope: "global", reason: "r" })).rejects.toThrow("pattern");
+		await expect(call(h, { action: "set", key: "dangerRules", value: { nope: "ask" }, scope: "global", reason: "r" })).rejects.toThrow("unknown rule id");
+		await expect(call(h, { action: "set", key: "pathRules", value: { "s0-secret": "maybe" }, scope: "global", reason: "r" })).rejects.toThrow("pathRules");
+		expect(h.confirms).toBe(0);
+		expect(readUser().dangerRules).toBeUndefined();
+	});
 });
 
 describe("permission grants (GR-1–GR-6)", () => {
@@ -5122,7 +5286,7 @@ describe("permission grants (GR-1–GR-6)", () => {
 			expect(h.notifies.some(([m]) => m.includes(SENS))).toBe(false);
 			const rec = readAudit().at(-1);
 			expect(rec).toMatchObject({ verdict: "allow", source: "protected-path" });
-			expect(rec.reason).toContain("permission grant G1 covers this protected-path access");
+			expect(rec.reason).toContain("permission grant G1 covers this gated access");
 			clearAudit();
 		});
 
@@ -5206,6 +5370,75 @@ describe("permission grants (GR-1–GR-6)", () => {
 			await quiet.handlers.session_start({}, quiet.ctx);
 			await approve(quiet, { request: "deploy" });
 			expect(key(quiet)).toBeUndefined();
+		});
+	});
+
+	describe("built-in rules and path tiers (GR-5)", () => {
+		const GH = { command: "gh release create v1" };
+		const tierGrantPaths = [{ path: "~/.npmrc", access: "read" }];
+		test("a grant naming the rule id lets the scope check lift the built-in deny; judge ask keeps the block with the hint", async () => {
+			const h = await open({ audit: true });
+			clearAudit();
+			await approve(h, { request: "publish release v1", rules: ["gh-release"] });
+			h.responses = [ALLOW];
+			expect(await toolCall(h, "bash", GH)).toBeUndefined();
+			expect(h.calls).toHaveLength(1);
+			expect(readAudit().at(-1).reason).toContain("permission grant G1 covers this gated access");
+			clearAudit();
+			h.responses = [ASK];
+			const r = await toolCall(h, "bash", GH);
+			expect(r?.block).toBe(true);
+			expect(r?.reason).toContain("verdict_grant");
+			expect(h.calls).toHaveLength(2);
+		});
+		test("a grant without the id does not cover the rule: deny with no model call", async () => {
+			const h = await open({});
+			await approve(h, { request: "sudo job", rules: ["sudo"] });
+			const r = await toolCall(h, "bash", GH);
+			expect(r?.block).toBe(true);
+			expect(r?.reason).toContain("request a permission grant with verdict_grant");
+			expect(h.calls).toHaveLength(0);
+		});
+		test("a rule set to ask is liftable the same way (headless included)", async () => {
+			const h = await open({ dangerRules: { sudo: "ask" } });
+			await approve(h, { request: "sudo job", rules: ["sudo"] });
+			h.ctx.hasUI = false;
+			h.responses = [ALLOW];
+			expect(await toolCall(h, "bash", { command: "sudo ls" })).toBeUndefined();
+			expect(h.calls).toHaveLength(1);
+			expect(h.confirms).toBe(0);
+		});
+		test("requesting an unknown rule id throws and lists the known ids", async () => {
+			const h = await open({});
+			await expect(call(h, { action: "request", request: "x", rules: ["no-such-rule"] })).rejects.toThrow('unknown danger rule "no-such-rule"');
+			expect(h.selects + h.confirms).toBe(0);
+		});
+		test("a path grant covers its built-in tier at a fitting access level only", async () => {
+			const h = await open({});
+			await approve(h, { request: "read npm config", paths: tierGrantPaths });
+			h.responses = [ALLOW];
+			expect(await toolCall(h, "read", { path: "~/.npmrc" })).toBeUndefined();
+			expect(h.calls).toHaveLength(1);
+			const w = await toolCall(h, "write", { path: "~/.npmrc", content: "x" }); // read access does not fit a write
+			expect(w?.block).toBe(true);
+			expect(h.calls).toHaveLength(1);
+		});
+		test("a persisted grant without a rules field still loads", async () => {
+			const h = session({});
+			fs.mkdirSync(path.dirname(SESSION_FILE()), { recursive: true });
+			fs.writeFileSync(SESSION_FILE(), JSON.stringify({ grants: { next: 2, active: [{ id: "G1", request: "old grant", paths: [], grantedBy: "user", grantedAt: "2025-01-01T00:00:00.000Z" }] } }));
+			await h.handlers.session_start({}, h.ctx);
+			expect(JSON.parse(await text(h, { action: "list" })).grants).toMatchObject([{ id: "G1", rules: [] }]);
+		});
+		test("yolo: a gate whose yolo action is allow still refuses a built-in ask underneath", async () => {
+			const h = await open({ mode: "yolo", denyPaths: [SENS], yoloDenyPaths: "allow", pathRules: { "s0-secret": "ask" } });
+			const r = await toolCall(h, "read", { path: path.join(SENS, ".env") });
+			expect(r?.block).toBe(true);
+			expect(r?.reason).toContain("tier s0-secret:");
+			expect(r?.reason).toContain("verdict_grant");
+			expect(h.calls).toHaveLength(0);
+			const plain = await open({ mode: "yolo", denyPaths: [SENS], yoloDenyPaths: "allow" });
+			expect(await toolCall(plain, "read", { path: path.join(SENS, "notes.md") })).toBeUndefined();
 		});
 	});
 });
