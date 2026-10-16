@@ -89,6 +89,15 @@ Why: the tool's own confirmation dialog is the human gate for every change (ST-2
 Code: `classifyByRules`, `SETTINGS_TOOL_NAME`
 Pinned by: settings tool (ST-1–ST-5) › tool call is a mechanical allow, no classifier call
 
+#### RL-9: Grant tool
+
+A call to the tool named `verdict_grant` is allowed by the rule layer with reason `pi-verdict permission grant tool (the user or both models approve every grant)`, without a classifier call and silently (PR-3). It sits where the `tools` allowlist sits (RL-2 step 6); like RL-8 it has no rule target (RL-3).
+
+Why: the tool's own dialog (GR-2) or yolo consensus (GR-3) is its gate; the permission to ask for permission must itself be mechanical.
+Code: `classifyByRules`, `GRANT_TOOL_NAME`
+Pinned by: permission grants (GR-1–GR-6) › GR-1: the tool call itself is a mechanical allow
+
+
 ## PG: Path grading
 
 #### PG-1: Applicability
@@ -183,7 +192,7 @@ Pinned by: denyPaths (PP-1–PP-9) › read of a denyPath → interactive ask: o
 
 #### PP-6: Plaintext confinement
 
-The matched protected path MAY appear only in the local ask dialog and in the local audit record (AU-1). It NEVER appears in a block reason, a notification, a classifier, fallback, EXPLAIN-GATE or rule-generator model call, the status widget, or a verdict label. Notifications of protected-path outcomes omit the action line, which can embed the path; the ask reason is the fixed text `user-declared protected path (denyPaths) [path withheld; see pi-verdict.json]`.
+The matched protected path MAY appear only in the local ask dialog and in the local audit record (AU-1). It NEVER appears in a block reason, a notification, a classifier, fallback, EXPLAIN-GATE or rule-generator model call, the status widget, or a verdict label. Notifications of protected-path outcomes omit the action line, which can embed the path; the ask reason is the fixed text `user-declared protected path (denyPaths) [path withheld; see pi-verdict.json]`. The one exception is the grant coverage check (GR-5): when an active grant lists protected-path access entries, the judge and fallback calls of that check receive the call, the covering grants and their entries, because the user approved those paths in the grant dialog. No other call carries them (GR-4), and an uncovered call never reaches a model.
 
 Why: reasons and notifications flow back into the agent context and prompts leave the machine for the model provider; the audit log is a local record in the same trust domain as `pi-verdict.json`.
 Code: `Verdict.detail`, `RuleResult.detail`, `presentVerdict`, `generateRule`, `critiqueRule`
@@ -207,7 +216,7 @@ Pinned by: gateOmpDir forced gate › bash: .omp as a path component or bare wor
 
 #### PP-9: No Explain for gate asks
 
-The ask dialog of a protected-path or `.omp` gate ask NEVER offers Explain… (PR-5); its decline path accepts inline text but makes no model call.
+The ask dialog of a protected-path or `.omp` gate ask NEVER offers Explain… (PR-5); its decline path accepts inline text but makes no model call. The permission grant dialog (GR-2) never offers it either.
 
 Why: the explanation request would send protected-path content to a model provider (PP-6).
 Code: `presentVerdict`, `confirmAsk`
@@ -249,10 +258,10 @@ Pinned by: transcript line injection (#22) › multi-line user message cannot fo
 
 #### CL-5: System prompt composition
 
-The system prompt is built from the effective verdict set of the approval mode (MD-1): the criteria of the allowed verdicts only, the guidance line, a marker line `Allowed verdicts: …` when the set is restricted, and the verdict-prefix format line. It is followed by the existence hint when `denyPaths` is non-empty (PP-7) and then by the user policy block: the root rule (the `rootRule` key, RR-2) and the user's classification rules (the `rules` key). Where a rule applies it takes precedence over the default criteria, and a classification rule takes precedence over the root rule. The marker line precedes the hint and the policy block so the jev adapter's user-rules slice excludes it.
+The system prompt is built from the effective verdict set of the approval mode (MD-1): the criteria of the allowed verdicts only, the guidance line, a marker line `Allowed verdicts: …` when the set is restricted, and the verdict-prefix format line. It is followed by the existence hint when `denyPaths` is non-empty (PP-7) and then by the user policy block: the root rule (the `rootRule` key, RR-2), the user's classification rules (the `rules` key) and the active permission grants (GR-4). Where a rule applies it takes precedence over the default criteria, and a classification rule takes precedence over the root rule. The marker line precedes the hint and the policy block so the jev adapter's user-rules slice excludes it.
 
 Why: the default three-verdict prompt is kept byte-identical so unrestricted behavior does not drift; restricted sets must reach jev through the marker (JV-3).
-Code: `classifierSystem`, `modeChoices`, `userRulesHint`, `classifyWithModel`
+Code: `classifierSystem`, `modeChoices`, `classifierPolicy`, `trustedPolicyBlock`, `classifyWithModel`
 Pinned by: approval modes › classifier prompt › yolo lists only allow/deny with the marker line; noAutoDeny only allow/ask; default carries no marker; concern question + reason (approve dialog) › the decisions body carries a typed concern question whose criteria match the vocabulary; user rules extend only the verdict
 
 #### CL-6: Verdict prefix contract
@@ -477,6 +486,8 @@ A blocked call returns `[auto-mode <tag> block] BLOCKED — this action did NOT 
 | `subagent-auto` | a subagent ask resolved without a human and not approved (SG-4) |
 | `subagent-cancelled` | the subagent run was cancelled while awaiting approval (SG-2) |
 
+The tags `classifier`, `yolo-retry` and `user-declined` end the block reason with ` If this action is required, request a permission grant with verdict_grant (describe the exact operation and scope).` (GR-6). Rule, fail-closed, protected-path and subagent blocks do not carry it: a grant cannot lift them.
+
 Why: structured error signaling does not reach every provider lane, and verbatim rule or classifier reasons can be empty or too terse for the acting model to recognize a block (#53).
 Code: `blockedReason`, `presentVerdict`
 Pinned by: agent-facing block reason form (#53) › classifier with empty reason → fallback detail, exact canonical form; agent-facing block reason form (#53) › rule block → rule tag; UI notify text unchanged; agent-facing block reason form (#53) › no classifier model available → fail-closed tag
@@ -615,7 +626,7 @@ Pinned by: /verdict config editor › local: first add copies the global list, n
 
 #### CF-5: Session scope
 
-Session overrides live in `<agentDir>/config/pi-verdict-sessions/<sessionId>.json` (a session id outside `[A-Za-z0-9._-]` is kept in memory only). A session file may set only `SESSION_KEYS` — `mode`, `confidenceThreshold`, the four jev thresholds, `yoloDenyPaths`, `yoloOmpDir`, `classifierFallbackMode`, `gateOmpDir`, `footer`, `modeStatus` — and `ruleAdditions`, whose `allow`, `deny`, `denyPaths`, `tools` and `rules` lists APPEND to the merged lists. Any other key is skipped with a warning. Precedence for every session key is session > local > global > default. The 50 newest session files are kept; new and forked sessions start without overrides.
+Session overrides live in `<agentDir>/config/pi-verdict-sessions/<sessionId>.json` (a session id outside `[A-Za-z0-9._-]` is kept in memory only). A session file may set only `SESSION_KEYS` — `mode`, `confidenceThreshold`, the four jev thresholds, `yoloDenyPaths`, `yoloOmpDir`, `classifierFallbackMode`, `gateOmpDir`, `footer`, `modeStatus`, `grantStatus` — and `ruleAdditions`, whose `allow`, `deny`, `denyPaths`, `tools` and `rules` lists APPEND to the merged lists, and `grants`, the active permission grants (GR-6). Any other key is skipped with a warning. Precedence for every session key is session > local > global > default. The 50 newest session files are kept; new and forked sessions start without overrides.
 
 Why: the right value differs per project and per session; the session file is kept apart from the audit directory and the trust store.
 Code: `SESSION_KEYS`, `sanitizeSessionRaw`, `applyRuleAdditions`, `writeSessionOverrides`, `pruneSessionOverrides`, `settingSourcesOf`
@@ -789,6 +800,56 @@ Why: one writer per scope keeps menu and tool edits identical; the copy-first ru
 Code: `writeScoped`, `setSessionRuleAdditions`
 Pinned by: settings tool (ST-1–ST-5) › local add starts from a copy of the global list; settings tool (ST-1–ST-5) › session add to deny takes effect immediately
 
+## GR: Permission grants
+
+#### GR-1: Request tool
+
+The tool `verdict_grant` takes `action` = `request`, `release` or `list`. `request` carries `request` (natural language, at most 1000 characters, the exact operation and scope) and optional `paths` (at most 10 entries of `{path, access}`, `access` = `read`, `write` or `full`, path at most 500 characters). At most 20 grants are active; an identical active request (same text and paths) answers `Already granted` without asking. `release` drops one of the agent's own grants by id; `list` returns the active grants. In approval mode `off` every action answers `NA: …` and nothing else happens (MD-2); the tool is refused in subagents. A grant is a session-long, natural-language authorization; it is never written to a config file.
+
+Why: the agent needs a sanctioned way to ask for an authorization a block told it about, and a human-approved scope the classifiers can read is narrower than a regex the user must write.
+Code: `verdict_grant` (registered in `autoMode`), `GRANT_TOOL_NAME`, `parseGrants`
+Pinned by: permission grants (GR-1–GR-6) › GR-1: mode off answers NA to every action, with no dialog and no model call; permission grants (GR-1–GR-6) › GR-2: invalid requests throw, an identical active request is not asked twice; permission grants (GR-1–GR-6) › GR-2: no UI rejects; subagents are refused
+
+#### GR-2: Human approval
+
+In `default` and `noAutoDeny` a request opens the grant dialog with I approve, I reject and Ask for clarification or revision (the last is an inline text field; empty text leaves the dialog open). Approval creates grant `G<n>` (ids are never reused within a session) with `grantedBy: "user"`. Reject answers `Rejected by the user` and tells the agent not to repeat the request; clarify returns the user's text to the agent and grants nothing. Without a UI the request is rejected, and a dialog failure or abort grants nothing. Hosts without the rich dialog use a plain select (plus an input for the clarification). The dialog never offers Explain… (PP-9).
+
+Why: a grant widens what the classifiers may allow, so only a human, or in yolo a model consensus (GR-3), may create one.
+Code: `confirmGrant`, `buildApproveDialog` (variant `grant`)
+Pinned by: permission grants (GR-1–GR-6) › GR-2: reject, and clarify with text, grant nothing; permission grants (GR-1–GR-6) › GR-2: clarify with empty input returns to the choices; permission grants (GR-1–GR-6) › GR-2: rich dialog lists the three choices; an empty clarification row keeps it open until text is typed
+
+#### GR-3: Yolo consensus
+
+In `yolo` nothing prompts: the judge classifier reviews the request (the task paragraph `Grant review`, choices allow/deny), and a configured `classifierFallbackModel` must also allow, regardless of `classifierFallbackMode`. Both allow → the grant is created with `grantedBy: "classifier"`; any deny, error, a missing model or a missing allow → rejected with nothing granted. The existence hint of PP-7 is not sent: the request and the grants are the whole brief.
+
+Why: yolo has no human, so a grant needs two independent agreements rather than the agent's say-so.
+Code: `grantConsensus`, `GRANT_REVIEW_TASK`
+Pinned by: permission grants (GR-1–GR-6) › GR-3: yolo grants only when the judge allows; a configured fallback must allow as well
+
+#### GR-4: Authority in classifier prompts
+
+Active grants are part of the user policy block of every classifier and fallback system prompt (CL-5), after the root rule and the classification rules, as `Permission grants (…)` with one `- G<n>: <request>` line per grant. Within its literal scope a grant is authoritative: the classifier may allow a call the grant clearly covers; nothing it does not literally cover is widened. A grant never overrides the built-in floor or a user `deny` rule, which are decided before the classifier (RL-2). Protected-path entries are NOT sent in ordinary classifier prompts (PP-6): each grant with entries carries only `(plus N protected-path access entry/entries, enforced separately)`.
+
+Why: the grant text is the user's own words, approved this session, so it is policy and not injected content; the protected-path plaintext rule (PP-6) stays intact outside the coverage check.
+Code: `classifierPolicy`, `trustedPolicyBlock`
+Pinned by: permission grants (GR-1–GR-6) › GR-2/GR-4/GR-6: approved grant is persisted and reaches the classifier prompt after the rules header; permission grants (GR-1–GR-6) › GR-4: the fallback classifier prompt carries the grants too; permission grants (GR-1–GR-6) › GR-4: protected-path text is withheld from ordinary classifier calls (count only)
+
+#### GR-5: Protected-path coverage check
+
+A grant may list protected-path access entries (`paths`). When a call would be a terminal ask because of `denyPaths` (PP-5) or the `.omp` gate (PP-8) and at least one active grant has entries, the coverage check runs before the ask (and before the yolo outcome of MD-4). A grant covers the call only if every protected path the call touches lies under one of its entries (segment boundary, base forms, PP-3/PP-4) and the access fits: a command tool accepts any access level, `write` and `edit` need `write` or `full`, every other file tool needs `read` or `full`. If no grant covers every touch (a command touching a `denyPaths` entry and a `.omp` directory needs both covered) the call asks as before and no model is called. Otherwise the judge, and a configured fallback, are asked once each with the call, the covering grants and their paths (task paragraph `Coverage check`, choices allow/ask); both must answer allow for the call to pass, any other outcome keeps the ask. A passing call is allowed with source `protected-path` and reason `permission grant <ids> covers this protected-path access`, recorded in the audit log (AU-1) with the path and silent outside debug (PR-3).
+
+Why: a protected path is a user-declared boundary, so lifting it for one call needs the user's own approval of the path (GR-2) plus two checks that this call is within it; an uncovered call must not leak the path to a model.
+Code: `coveringGrants`, `denyPathHits`, `ompTouches`, `grantConsensus`, `GRANT_COVERAGE_TASK`, `adjudicate`
+Pinned by: permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › without a covering grant a protected-path read asks the user, with no model call; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a covering read grant lets the scope check allow the read without asking; the reason and notices carry no path; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › an access level that does not fit never reaches a model: write with a read grant asks; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a command touching a denyPath and a .omp path is not coverable when only the .omp path is granted; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › the scope check answering ask falls back to today's ask; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › headless, an uncovered or refused protected-path call still denies
+
+#### GR-6: Lifetime, revocation and visibility
+
+Grants live in the session scope (`grants` in the session file, CF-5), survive a restart of the same session and are absent in other sessions; malformed stored entries are dropped with one notice. The agent releases its own grants; the user lists and revokes them with `/grants` (`list`, `revoke <id>`, `revoke all`, or an interactive menu with a confirmation). A revocation sends the agent a `verdict-grant-revoked` message naming the ids. While grants exist the footer shows the count (`\uF084 n` full, `🔑 n` compact) and, on hosts with a status bar, an extra `🔑 n` entry; the `grantStatus` switch (default on, session-scopable) controls the latter. With no grants nothing is rendered, byte-identical to a build without the feature. A block of tag `classifier`, `yolo-retry` or `user-declined` tells the agent it may request a grant (PR-2).
+
+Why: a grant is as sensitive as a rule, so it is visible, revocable and bounded by the session; the agent must also learn when a grant disappears under it.
+Code: `setGrants`, `revokeGrants`, `renderFooter`, `refreshStatus`, `GRANT_STATUS_KEY`, the `grants` command
+Pinned by: permission grants (GR-1–GR-6) › GR-6: release removes the grant from the next prompt; an unknown id throws; ids are not reused; permission grants (GR-1–GR-6) › GR-6: /grants revoke removes the grant and tells the agent; /grants lists; permission grants (GR-1–GR-6) › GR-6: /grants menu revokes a picked grant after confirmation, and revoke all clears the rest; permission grants (GR-1–GR-6) › GR-6: grants survive a restart of the same session id and not a different one; malformed entries are dropped with a notice; permission grants (GR-1–GR-6) › status surfaces (GR-6) › full footer shows the grant count only while grants exist and is byte-identical to the featureless render at 0; permission grants (GR-1–GR-6) › status surfaces (GR-6) › compact footer shows the grant count only while grants exist and is byte-identical to the featureless render at 0; permission grants (GR-1–GR-6) › status surfaces (GR-6) › prompt status bar (omp): 🔑 N while grants exist; grantStatus:false, mode off and zero grants clear it
+
 ## Decision tables
 
 ### Table A: effective outcome by approval mode
@@ -800,6 +861,7 @@ Each cell is interactive / headless. `off` evaluates nothing (MD-2).
 | floor or user deny (RL-2, RL-5) | deny / deny | deny / deny | ask / deny |
 | `.omp` gate hit (PP-8) | ask / deny | `yoloOmpDir` (MD-4) | ask / deny |
 | denyPaths hit (PP-5) | ask / deny | `yoloDenyPaths` (MD-4) | ask / deny |
+| `.omp` or denyPaths hit covered by a grant, judge and fallback both allow (GR-5) | allow | allow | allow |
 | rule allow: user allow, path-grading allow, `tools`, empty command (RL-2) | allow | allow | allow |
 | classifier allow | allow | allow | allow |
 | classifier ask | ask / deny | `yolo-retry` block (after the yolo-ask cascade, CS-3) | ask / deny |
