@@ -239,8 +239,13 @@ The label in a block reason that names the kind of block, such as `rule` or `yol
 Rules: [PR-2](docs/adjudication-rules.md#pr-2-block-reason)
 
 **Ask dialog**:
-The confirmation dialog with Yes, No and Explain… through which a human answers an ask.
-Rules: [PR-4](docs/adjudication-rules.md#pr-4-ask-dialog), [PP-9](docs/adjudication-rules.md#pp-9-no-explain-for-gate-asks)
+The confirmation dialog with Yes, Yes and don't ask again this session, No and Explain… through which a human answers an ask.
+Rules: [PR-4](docs/adjudication-rules.md#pr-4-ask-dialog), [PR-9](docs/adjudication-rules.md#pr-9-remembered-approval), [PP-9](docs/adjudication-rules.md#pp-9-no-explain-for-gate-asks)
+
+**Remembered approval**:
+A human Yes to an ask that the gate reuses for the identical tool call for the rest of the session.
+_Avoid_: session approval, always-allow
+Rules: [PR-9](docs/adjudication-rules.md#pr-9-remembered-approval)
 
 **Decline reason**:
 The text a user types into the No row, forwarded to the agent in the block reason.

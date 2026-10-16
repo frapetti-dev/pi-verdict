@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, anchorDenyPaths, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, collectProjectContext, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, collectProjectContext, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
 import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
 
 // ── Stub infrastructure ─────────────────────────────────
@@ -3474,7 +3474,7 @@ describe("approve dialog routing", () => {
 		const h = session({});
 		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
 		const rendered: string[] = [];
-		driveDialog(h, ["\x1b[B", "\r"], rendered);
+		driveDialog(h, ["\x1b[B", "\x1b[B", "\r"], rendered);
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(r.reason).toContain("user-declined");
 		expect(h.confirms).toBe(0);
@@ -3543,7 +3543,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		h.responses = [ASK, { text: "Compiles the project; builds run arbitrary scripts." }];
 		h.inputs = ["does it touch the network?"];
 		const rendered: string[] = [];
-		driveDialogs(h, [[DOWN, DOWN, "\r"], ["\r"]], rendered);
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], rendered);
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(r).toBeUndefined(); // second dialog: Yes
 		expect(h.calls).toHaveLength(2);
@@ -3564,7 +3564,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		const h = session({});
 		h.responses = [ASK, { text: "Compiles the project." }];
 		h.inputs = [""];
-		driveDialogs(h, [[DOWN, DOWN, "\r"], [DOWN, "\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], [DOWN, DOWN, "\r"]], []);
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(String(h.calls[1].messages[0].content)).toContain(`Task: ${EXPLAIN_GATE_DEFAULT_PROMPT}`);
 		expect(h.calls[1].model).toBe("mock/glm");
@@ -3578,7 +3578,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		h.findMap = { "mock/explain": { id: "explain-model" } };
 		h.responses = [ASK, { text: "ok" }];
 		h.inputs = [""];
-		driveDialogs(h, [[DOWN, DOWN, "\r"], ["\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], []);
 		await toolCall(h, "bash", { command: "cargo build" });
 		expect(h.calls[1].model).toBe("explain-model");
 		expect(h.calls[1].effort).toBe("low");
@@ -3590,7 +3590,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		h.responses = [ASK, new Error("boom")];
 		h.inputs = [""];
 		const rendered: string[] = [];
-		driveDialogs(h, [[DOWN, DOWN, "\r"]], rendered); // second dialog: Escape
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"]], rendered); // second dialog: Escape
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("EXPLAIN-GATE failed") && m.includes("boom"))).toBe(true);
 		expect(rendered).toHaveLength(2);
@@ -3603,7 +3603,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		const h = session({});
 		h.responses = [ASK];
 		h.inputs = [undefined];
-		driveDialogs(h, [[DOWN, DOWN, "\r"], ["\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], []);
 		expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
 		expect(h.calls).toHaveLength(1);
 	});
@@ -3611,7 +3611,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 	test("No with inline text: the user's text reaches the agent in the block reason", async () => {
 		const h = session({});
 		h.responses = [ASK];
-		driveDialogs(h, [[DOWN, ..."use npm ci instead".split(""), "\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, ..."use npm ci instead".split(""), "\r"]], []);
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(r.block).toBe(true);
 		expect(r.reason).toContain("user-declined");
@@ -3621,7 +3621,7 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 	test("No with pasted text: newlines are stripped by the inline field", async () => {
 		const h = session({});
 		h.responses = [ASK];
-		driveDialogs(h, [[DOWN, "\x1b[200~fix\nit\x1b[201~", "\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, "\x1b[200~fix\nit\x1b[201~", "\r"]], []);
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(r.block).toBe(true);
 		expect(r.reason).toContain('saying: "fixit"');
@@ -3630,27 +3630,27 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 	test("No row: empty text declines plainly, Escape discards typed text, text survives navigation, j/k are text", async () => {
 		const plain = session({});
 		plain.responses = [ASK];
-		driveDialogs(plain, [[DOWN, "\r"]], []);
+		driveDialogs(plain, [[DOWN, DOWN, "\r"]], []);
 		const p = await toolCall(plain, "bash", { command: "cargo build" });
 		expect(p.block).toBe(true);
 		expect(p.reason).not.toContain("saying");
 
 		const esc = session({});
 		esc.responses = [ASK];
-		driveDialogs(esc, [[DOWN, "a", "b", "\x1b"]], []);
+		driveDialogs(esc, [[DOWN, DOWN, "a", "b", "\x1b"]], []);
 		const e = await toolCall(esc, "bash", { command: "cargo build" });
 		expect(e.block).toBe(true);
 		expect(e.reason).not.toContain("saying");
 
 		const nav = session({});
 		nav.responses = [ASK];
-		driveDialogs(nav, [[DOWN, "x", UP, DOWN, "\r"]], []);
+		driveDialogs(nav, [[DOWN, DOWN, "x", UP, DOWN, "\r"]], []);
 		const n = await toolCall(nav, "bash", { command: "cargo build" });
 		expect(n.reason).toContain('saying: "x"');
 
 		const vim = session({});
 		vim.responses = [ASK];
-		driveDialogs(vim, [[DOWN, "j", "k", "\r"]], []);
+		driveDialogs(vim, [[DOWN, DOWN, "j", "k", "\r"]], []);
 		const v = await toolCall(vim, "bash", { command: "cargo build" });
 		expect(v.reason).toContain('saying: "jk"');
 	});
@@ -3660,18 +3660,18 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		h.responses = [ASK];
 		const rendered: string[] = [];
 		const after: string[] = [];
-		driveDialogs(h, [[DOWN, "f", "o", "\x1b"]], rendered, after);
+		driveDialogs(h, [[DOWN, DOWN, "f", "o", "\x1b"]], rendered, after);
 		await toolCall(h, "bash", { command: "cargo build" });
 		expect(rendered[0]!.split("\n").some((l) => l.trim() === "No")).toBe(true);
-		expect(after[0]).toContain("→ No, ");
-		expect(after[0]).toContain("tell the agent what to do instead");
-		expect(after[2]).toContain("→ No, fo");
-		expect(after[2]).not.toContain("tell the agent what to do instead");
+		expect(after[1]).toContain("→ No, ");
+		expect(after[1]).toContain("tell the agent what to do instead");
+		expect(after[3]).toContain("→ No, fo");
+		expect(after[3]).not.toContain("tell the agent what to do instead");
 	});
 
 	test("protected-path ask: declining with inline text works, and no model call is made", async () => {
 		const h = session({});
-		driveDialogs(h, [[DOWN, ..."not that file".split(""), "\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, ..."not that file".split(""), "\r"]], []);
 		const r = await toolCall(h, "read", { path: "/proj/.omp/notes.md" });
 		expect(r.block).toBe(true);
 		expect(r.reason).toContain('saying: "not that file"');
@@ -4758,7 +4758,7 @@ describe("omp model roles", () => {
 		h.findMap = { "mock/explain": { id: "explain-model" }, "r/xp": { id: "xp-model" } };
 		h.responses = [ASK, { text: "ok" }];
 		h.inputs = [""];
-		driveDialogs(h, [[DOWN, DOWN, "\r"], ["\r"]], []);
+		driveDialogs(h, [[DOWN, DOWN, DOWN, "\r"], ["\r"]], []);
 		await toolCall(h, "bash", { command: "cargo build" });
 		expect(h.calls[1].model).toBe("xp-model");
 		expect(h.calls[1].effort).toBe("low");
@@ -5440,5 +5440,145 @@ describe("permission grants (GR-1–GR-6)", () => {
 			const plain = await open({ mode: "yolo", denyPaths: [SENS], yoloDenyPaths: "allow" });
 			expect(await toolCall(plain, "read", { path: path.join(SENS, "notes.md") })).toBeUndefined();
 		});
+	});
+});
+
+describe("remembered approval (PR-9)", () => {
+	const { DOWN } = MENU;
+	const ASK = { text: "<verdict>ask</verdict> needs a human" };
+	const LABEL = "Yes, and don't ask again this session";
+	const SENS = path.join(TMP_AGENT, "sensitive-pr9");
+	fs.mkdirSync(SENS, { recursive: true });
+	const lastStatus = (h: Harness): string | undefined => h.statusSets.at(-1)?.[1];
+	const BUILD = { command: "cargo build" };
+	/** Remember a gray `cargo build` ask through the dialog's second row. */
+	async function remembered(cfg: Parameters<typeof setConfig>[0] = {}): Promise<Harness> {
+		const h = session(cfg);
+		h.responses = [ASK];
+		driveDialogs(h, [[DOWN, "\r"]], []);
+		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
+		return h;
+	}
+
+	test("remember row on a gray ask: identical call skips classifier and dialog", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		const rendered: string[] = [];
+		driveDialogs(h, [[DOWN, "\r"]], rendered);
+		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
+		expect(rendered[0]).toContain(LABEL);
+		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
+		expect(rendered).toHaveLength(1);
+		expect(h.calls).toHaveLength(1);
+		driveDialogs(h, [["\r"]], rendered);
+		expect(await toolCall(h, "bash", { command: "cargo test" })).toBeUndefined();
+		expect(rendered).toHaveLength(2);
+		expect(h.calls).toHaveLength(2);
+	});
+
+	test("plain Yes is not remembered", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		const rendered: string[] = [];
+		driveDialogs(h, [["\r"], ["\r"]], rendered);
+		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
+		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
+		expect(rendered).toHaveLength(2);
+		expect(h.calls).toHaveLength(2);
+	});
+
+	test("No stays one-shot even after a remembered Yes for a different input", async () => {
+		const h = await remembered();
+		driveDialogs(h, [[DOWN, DOWN, "\r"]], []);
+		const r = await toolCall(h, "bash", { command: "cargo test" });
+		expect(r?.block).toBe(true);
+		driveDialogs(h, [[DOWN, DOWN, "\r"]], []);
+		expect((await toolCall(h, "bash", { command: "cargo test" }))?.block).toBe(true);
+	});
+
+	test("protected-path ask offers the row; remembered without leaking the path", async () => {
+		const h = session({ denyPaths: [SENS] });
+		const rendered: string[] = [];
+		driveDialogs(h, [[DOWN, "\r"]], rendered);
+		const target = { path: path.join(SENS, "secret.md") };
+		expect(await toolCall(h, "read", target)).toBeUndefined();
+		expect(rendered[0]).toContain(LABEL);
+		expect(await toolCall(h, "read", target)).toBeUndefined();
+		expect(rendered).toHaveLength(1);
+		expect(h.calls).toHaveLength(0);
+		expect(h.notifies.some(([m]) => m.includes(SENS))).toBe(false);
+	});
+
+	test("grant dialog has no remember row", async () => {
+		const h = session({});
+		await h.handlers.session_start({}, h.ctx);
+		const rendered: string[] = [];
+		driveDialogs(h, [["\r"]], rendered);
+		const r = await h.tools.verdict_grant.execute("t1", { action: "request", request: "deploy to staging" }, undefined, undefined, h.ctx);
+		expect(r.content[0].text.startsWith("Approved by the user")).toBe(true);
+		expect(rendered[0]).toContain("I approve");
+		expect(rendered[0]).not.toContain(LABEL);
+	});
+
+	test("applies in yolo: the identical call passes without a classifier call", async () => {
+		const h = await remembered();
+		await h.commands.automode.handler("yolo", h.ctx);
+		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
+		expect(h.calls).toHaveLength(1);
+	});
+
+	test("rule deny wins outside noAutoDeny; the key carries the ask origin", async () => {
+		const call = { toolName: "bash", input: BUILD };
+		const run = (state: SessionState) => adjudicate(state, call, adjudicateEnv({ hasUI: true }));
+		setConfig({ deny: ["^cargo\\b"] });
+		const gray = new SessionState(undefined, TMP_AGENT);
+		gray.rememberApproval(approvalKey("gray", "bash", BUILD, "/proj"));
+		expect((await run(gray)).verdict).toBe("deny");
+		const denied = new SessionState(undefined, TMP_AGENT);
+		denied.rememberApproval(approvalKey("rule-deny", "bash", BUILD, "/proj"));
+		expect((await run(denied)).verdict).toBe("deny");
+		setConfig({ mode: "noAutoDeny", deny: ["^cargo\\b"] });
+		const relaxed = new SessionState(undefined, TMP_AGENT);
+		relaxed.rememberApproval(approvalKey("rule-deny", "bash", BUILD, "/proj"));
+		expect(await run(relaxed)).toMatchObject({ verdict: "allow", remembered: true });
+	});
+
+	test("built-in ask: remembered in default, still passes in yolo for the exact call only", async () => {
+		const cfg = { dangerRules: { "make-deploy": { pattern: "\\bmake\\s+deploy\\b", action: "ask" } } };
+		const h = session(cfg);
+		driveDialogs(h, [[DOWN, "\r"]], []);
+		expect(await toolCall(h, "bash", { command: "make deploy" })).toBeUndefined();
+		expect(h.calls).toHaveLength(0);
+		await h.commands.automode.handler("yolo", h.ctx);
+		expect(await toolCall(h, "bash", { command: "make deploy" })).toBeUndefined();
+		const other = await toolCall(h, "bash", { command: "make deploy prod" });
+		expect(other?.block).toBe(true);
+		expect(other?.reason).toContain("[auto-mode rule block]");
+	});
+
+	test("/automode forget clears the count and the call asks again", async () => {
+		const h = await remembered({ footer: "compact" });
+		expect(lastStatus(h)).toContain("👤 1");
+		await h.commands.automode.handler("forget", h.ctx);
+		expect(h.notifies.some(([m]) => m.includes("forgot 1 remembered approval"))).toBe(true);
+		expect(lastStatus(h)).not.toContain("👤");
+		const rendered: string[] = [];
+		h.responses = [ASK];
+		driveDialogs(h, [["\r"]], rendered);
+		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
+		expect(rendered).toHaveLength(1);
+		await h.commands.automode.handler("forget", h.ctx);
+		await h.commands.automode.handler("forget", h.ctx);
+		expect(h.notifies.some(([m]) => m.includes("no remembered approvals"))).toBe(true);
+	});
+
+	test("session_start forgets", async () => {
+		const h = await remembered();
+		await h.handlers.session_start({}, h.ctx);
+		const rendered: string[] = [];
+		h.responses = [ASK];
+		driveDialogs(h, [["\r"]], rendered);
+		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
+		expect(rendered).toHaveLength(1);
 	});
 });

@@ -19,6 +19,7 @@ Pinned by: denyPaths (PP-1–PP-9) › omitted path hits in both directions for 
 #### RL-2: Evaluation order
 
 The rule layer MUST evaluate a tool call in this order and stop at the first terminal result: (1) user `deny` regexes → deny (before the built-in rules); (2) the built-in rules at their configured action — RL-5 danger rules for command tools, PG path tiers for file tools; a built-in deny is terminal: neither a user `allow` nor a gate overrides it, only a permission grant can lift it (GR-5); (3) the forced `.omp` gate (PP-8) → ask; (4) `denyPaths` (PP-5) → ask; (5) user `allow` regexes → allow (this beats a built-in ask, never a built-in deny); (6) the base result: a built-in ask (no gate: dialog with a UI, deny without, MD-4 in yolo), a path-grading allow, a `tools` allowlist allow (RL-7), the settings-tool allow (RL-8), or gray (the call goes to the classifier, CL-1). When the `.omp` gate or `denyPaths` replaces a built-in ask, the built-in hits stay attached so a grant can still cover them (GR-5) and yolo can still refuse them (MD-4). Steps 1 and 3–5 run only when the call has a rule target (RL-3).
+A remembered approval (PR-9) for the exact call is checked after the rule layer and before the grant coverage check (GR-5).
 
 Why: a protected path is the user's exception to their own allow rules ("not even my allow list may touch these"), and a built-in deny must not depend on user allow rules; a user deny states the user's own policy and is cheaper to explain than a built-in reason, so it is evaluated first; deny-beats-allow follows the rule-layer audit ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md)). A built-in ask is a prompt, which the user's explicit allow regex may pre-answer.
 Code: `classifyByRules`
@@ -440,6 +441,7 @@ Pinned by: approval modes › yolo › default mode keeps the terminal ask for p
 #### MD-4: yolo
 
 `yolo` NEVER prompts. A rule deny stays a deny, and so does a built-in ask (RL-2 step 6): the block names the rule or tier and carries the grant hint, because there is no one to ask. A `.omp` gate hit follows `yoloOmpDir` and a protected-path hit follows `yoloDenyPaths` (each `deny` by default; `allow` passes silently), with source `protected-path` and no path plaintext — except that a gate hit with built-in rule hits underneath is never passed silently: with the gate's action `allow` it is still a deny with the built-in reason (and the grant hint), because `allow` on the gate cannot waive a built-in rule. Every other ask-shaped effective outcome — a classifier ask, a demotion without enforce authority, a failed enforce fallback, a yolo-ask slip — becomes a deny block tagged `yolo-retry` that tells the agent to explain why the action is needed or rewrite it narrower; this also applies headless. A classifier deny stays a deny.
+A remembered approval (PR-9) is the exception: it passes the identical call before these outcomes, a built-in ask and a gate hit with built-in hits underneath included, because the human already answered that exact call.
 
 Why: long unattended runs still want the deterministic floor and a classifier, without uncertain calls collapsing into a bare deny the agent cannot learn from.
 Code: `adjudicate`, `YOLO_RETRY_SUFFIX`, `presentVerdict`
@@ -503,6 +505,7 @@ Pinned by: notifyAllows (#60) › notifyAllows: one classifier-allow notificatio
 #### PR-4: Ask dialog
 
 An ask presents a dialog with Yes, No and (when allowed, PP-9) Explain…. While highlighted, No is an inline text field: non-empty text is sanitized to a single line and forwarded to the agent in the block reason as `, saying: "<text>"`; empty text or Escape declines plainly. A decline blocks with tag `user-declined`. Hosts without the rich dialog get a plain yes/no confirm. Dialogs are serialized process-wide. The dialog shows the code under review and, for a jev ask, its probability bar and concern.
+With PR-9 the dialog's second row is "Yes, and don't ask again this session" (never in the permission-grant dialog).
 
 Why: not recorded.
 Code: `confirmAsk`, `buildApproveDialog`, `declineDetail`
@@ -527,6 +530,7 @@ Pinned by: live classifier status widget › row never carries command text; liv
 #### PR-7: Verdict label
 
 After an allowed call's result the gate records a label: how it passed (`rule`, `classifier`, `user`, `second-model`) plus jev probabilities and confidence when present. A label carries no reason text and no path. Rule labels are recorded but not rendered. On pi the label is a TUI-only transcript entry outside the model context; on omp it is an `aside` custom message and is therefore visible to the model.
+A call passed by a remembered approval (PR-9) is labelled `remembered`; unlike `rule` labels it is rendered.
 
 Why: a pass should be attributable at a glance; the omp transport has no TUI-only channel.
 Code: `verdictLabelFor`, `VerdictLabel`, the `tool_result` handler in `autoMode`
@@ -539,6 +543,14 @@ The footer counts final pipeline verdicts (allow, ask, deny) of the root session
 Why: not recorded.
 Code: `SessionState.verdictCounts`
 Pinned by: footer status › counters count the final verdict: mechanical deny and ask-once
+
+#### PR-9: Remembered approval
+
+Every interactive ask dialog except the permission-grant dialog offers "Yes, and don't ask again this session" as its second row. Choosing it allows the call and remembers it for the session in memory: the key is the ask origin (rule-layer deny, built-in ask, gate ask, gray), the tool name, the exact input and the cwd. A later call with the same key is allowed right after the rule layer, without a classifier call or a dialog, in every approval mode; a rule-layer deny is overridden only in `noAutoDeny`. A remembered allow is not audited and notifies only in debug. The footer shows the count; `/automode forget` or the `/automode` panel clears all; a new session starts empty (`/verdict` and `/automode <mode>` reloads keep it). The plain confirm fallback cannot remember.
+
+Why: repeated identical calls (a build, a test run) otherwise prompt every time; keying on the origin keeps a later deny rule, `denyPaths` entry or built-in ask from being bypassed by an earlier approval.
+Code: `approvalKey`, `SessionState.rememberApproval`, `adjudicate`, `presentVerdict`
+Pinned by: remembered approval (PR-9) › remember row on a gray ask: identical call skips classifier and dialog; remembered approval (PR-9) › plain Yes is not remembered; remembered approval (PR-9) › protected-path ask offers the row; remembered without leaking the path; remembered approval (PR-9) › grant dialog has no remember row; remembered approval (PR-9) › applies in yolo: the identical call passes without a classifier call; remembered approval (PR-9) › rule deny wins outside noAutoDeny; the key carries the ask origin; remembered approval (PR-9) › built-in ask: remembered in default, still passes in yolo for the exact call only; remembered approval (PR-9) › /automode forget clears the count and the call asks again; remembered approval (PR-9) › session_start forgets
 
 ## SG: Subagent gate
 
