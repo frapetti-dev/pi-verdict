@@ -2983,8 +2983,8 @@ export type MenuTone = "text" | "muted" | "warning";
 export type MenuInfo = Array<{ tone: MenuTone; text: string }>;
 export type MenuRow =
 	| { kind: "section"; label: string } // "" = plain rule
-	| { kind: "choice"; id: string; label: string; values: readonly string[]; value: string; shortcut?: string; confirm?: boolean; locked?: string; info(value: string): MenuInfo }
-	| { kind: "percent"; id: string; label: string; allowInherit: boolean; value: string; info(value: string): MenuInfo }
+	| { kind: "choice"; id: string; label: string; values: readonly string[]; value: string; shortcut?: string; confirm?: boolean; locked?: string; info(value: string): MenuInfo; maxInfo?(value: string): MenuInfo }
+	| { kind: "percent"; id: string; label: string; allowInherit: boolean; value: string; info(value: string): MenuInfo; maxInfo?(value: string): MenuInfo }
 	| { kind: "page"; id: string; label: string; locked?: string; info(): MenuInfo }
 	| { kind: "action"; id: string; label: string; key?: string; confirm?: boolean; info(): MenuInfo }
 	| { kind: "add"; id: string; placeholder: string; info(): MenuInfo }
@@ -3197,6 +3197,9 @@ export function buildSettingsMenu(
 		}
 	};
 
+	const WARN_APPLY = "press enter to apply";
+	const WARN_CONFIRM = "press enter again to confirm";
+	const WARN_REMOVE = "press d again to remove";
 	const infoOf = (row: MenuRow | undefined): MenuInfo => {
 		if (row === undefined) return [];
 		let info: MenuInfo = [];
@@ -3204,10 +3207,40 @@ export function buildSettingsMenu(
 		if (row.kind === "choice") info = row.info(isPending ? pending!.value : row.value);
 		else if (row.kind === "percent") info = row.info(row.value);
 		else if (row.kind !== "section") info = row.info();
-		if (isPending) info = [...info, { tone: "warning", text: "press enter to apply" }];
-		if (row.kind === "action" && row.confirm && armed === row.id) info = [...info, { tone: "warning", text: "press enter again to confirm" }];
-		if (row.kind === "entry" && armed === row.id) info = [...info, { tone: "warning", text: "press d again to remove" }];
+		if (isPending) info = [...info, { tone: "warning", text: WARN_APPLY }];
+		if (row.kind === "action" && row.confirm && armed === row.id) info = [...info, { tone: "warning", text: WARN_CONFIRM }];
+		if (row.kind === "entry" && armed === row.id) info = [...info, { tone: "warning", text: WARN_REMOVE }];
 		return info;
+	};
+
+	/** Wrapped line count of a description at width `w` (same wrapping as `render`). */
+	const wrappedCount = (info: MenuInfo, w: number): number => {
+		let n = 0;
+		for (const item of info) n += wrapTextWithAnsi(item.text, Math.max(1, w - 4)).length;
+		return n;
+	};
+	/** Description lines to reserve on the current page: the tallest description any selectable row can show
+	 *  (every choice value, percent states, transient warnings), so the menu keeps one height while the selection moves or values change. */
+	const infoHeight = (rs: MenuRow[], w: number): number => {
+		let height = 0;
+		for (const r of rs) {
+			if (r.kind === "section" || !selectable(r)) continue;
+			let candidates: MenuInfo[];
+			let warning: string | undefined;
+			if (r.kind === "choice") {
+				candidates = [...new Set([...r.values, r.value])].map((v) => (r.maxInfo ?? r.info)(v));
+				if (r.confirm) warning = WARN_APPLY;
+			} else if (r.kind === "percent") {
+				candidates = [...new Set([r.value, "off", "100%", ...(r.allowInherit ? ["inherit"] : [])])].map((v) => (r.maxInfo ?? r.info)(v));
+			} else {
+				candidates = [r.info()];
+				if (r.kind === "action" && r.confirm) warning = WARN_CONFIRM;
+				else if (r.kind === "entry" && r.editable) warning = WARN_REMOVE;
+			}
+			const extra = warning === undefined ? 0 : wrappedCount([{ tone: "warning", text: warning }], w);
+			for (const c of candidates) height = Math.max(height, wrappedCount(c, w) + extra);
+		}
+		return height;
 	};
 
 	const hintFor = (row: MenuRow | undefined, rs: MenuRow[]): string => {
@@ -3245,8 +3278,17 @@ export function buildSettingsMenu(
 		});
 		lines.push("");
 		const info = infoOf(row);
-		for (const item of info) for (const l of wrapTextWithAnsi(item.text, Math.max(1, w - 4))) lines.push("  " + fg(item.tone, l));
-		if (info.length > 0) lines.push("");
+		const allScopeRows = ctl.scopes.flatMap((s) => (s === scope ? rs : ctl.rows(s, page)));
+		const reserve = Math.max(infoHeight(allScopeRows, w), wrappedCount(info, w));
+		let emitted = 0;
+		for (const item of info) {
+			for (const l of wrapTextWithAnsi(item.text, Math.max(1, w - 4))) {
+				lines.push("  " + fg(item.tone, l));
+				emitted++;
+			}
+		}
+		for (; emitted < reserve; emitted++) lines.push("");
+		if (reserve > 0) lines.push("");
 		lines.push(truncateToWidth("  " + fg("dim", hintFor(row, rs)), w));
 		lines.push(...bottom.render(w));
 		return lines;
@@ -5531,8 +5573,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		return { source: "default", text: MENU_DEFAULTS[key] ?? "off" };
 	};
 
-	/** Description lines of a setting row: value meaning, effective value + source, a precedence warning, an untrusted-project warning. */
-	const settingInfo = (scope: MenuScope, key: SessionKey, value: string, localFile: string | null): MenuInfo => {
+	/** Description lines of a setting row: value meaning, effective value + source, a precedence warning, an untrusted-project warning.
+	 *  `worstCase` ignores live state and includes every warning the scope could ever show, so the menu can reserve a stable height. */
+	const settingInfo = (scope: MenuScope, key: SessionKey, value: string, localFile: string | null, worstCase = false): MenuInfo => {
 		let meaning: string;
 		if (value === "inherit") {
 			const from = inheritedFrom(scope, key, localFile);
@@ -5547,8 +5590,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			{ tone: "text", text: meaning },
 			{ tone: "muted", text: `Effective: ${effText} (${src})` },
 		];
-		if (SOURCE_RANK[src] > SOURCE_RANK[scope]) info.push({ tone: "warning", text: `${src} sets this too and wins over ${scope}` });
-		if (scope === "local" && localFile !== null && !projectTrusted(localFile)) info.push({ tone: "warning", text: "not applied until this project is trusted" });
+		if (worstCase ? scope !== "session" : SOURCE_RANK[src] > SOURCE_RANK[scope]) info.push({ tone: "warning", text: `${worstCase ? "session" : src} sets this too and wins over ${scope}` });
+		if (scope === "local" && (worstCase || (localFile !== null && !projectTrusted(localFile)))) info.push({ tone: "warning", text: "not applied until this project is trusted" });
 		return info;
 	};
 
@@ -5589,6 +5632,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						value: storedValueText(raw, "mode", scope),
 						shortcut: registeredToggleKey ?? undefined,
 						info: (v) => settingInfo(scope, "mode", v, localFile),
+						maxInfo: (v) => settingInfo(scope, "mode", v, localFile, true),
 					},
 				];
 				for (const sec of sections) {
@@ -5597,11 +5641,12 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					for (const item of sec.items) {
 						const value = storedValueText(raw, item.key, scope);
 						const info = (v: string): MenuInfo => settingInfo(scope, item.key, v, localFile);
+						const maxInfo = (v: string): MenuInfo => settingInfo(scope, item.key, v, localFile, true);
 						const values = ENUM_VALUES[item.key];
 						rows.push(
 							values
-								? { kind: "choice", id: item.key, label: item.label, values: scope === "global" ? values : ["inherit", ...values], value, info }
-								: { kind: "percent", id: item.key, label: item.label, allowInherit: scope !== "global", value, info },
+								? { kind: "choice", id: item.key, label: item.label, values: scope === "global" ? values : ["inherit", ...values], value, info, maxInfo }
+								: { kind: "percent", id: item.key, label: item.label, allowInherit: scope !== "global", value, info, maxInfo },
 						);
 					}
 				}
@@ -6033,6 +6078,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				value: valid ? storedValueText(raw, key, scope) : "invalid",
 				...(valid ? {} : { locked: "fix by hand" }),
 				info: (v) => settingInfo(scope, key, v, localFile),
+				maxInfo: (v) => settingInfo(scope, key, v, localFile, true),
 			};
 		};
 

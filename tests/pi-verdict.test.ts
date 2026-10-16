@@ -2712,7 +2712,7 @@ describe("gateOmpDir forced gate", () => {
 describe("/verdict config editor", () => {
 	const USER_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
 	const readUser = () => JSON.parse(fs.readFileSync(USER_FILE(), "utf8"));
-	const { DOWN, ENTER, LEFT, RIGHT, BACKSPACE } = MENU;
+	const { DOWN, ENTER, LEFT, RIGHT, BACKSPACE, TAB } = MENU;
 	const GATE_ROW = times(5, DOWN); // allow → deny → tools → denyPaths → classifier rules → .omp gate
 	const localFileOf = (dir: string) => {
 		const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
@@ -2724,6 +2724,23 @@ describe("/verdict config editor", () => {
 		driveMenu(h, keys, rendered, after);
 		await h.commands.verdict.handler(arg, h.ctx);
 	}
+
+	test("menu height stays constant across rows, values and scopes on one page", async () => {
+		const h = session({});
+		const rendered: string[] = [];
+		const after: string[] = [];
+		await run(h, "", [...times(8, DOWN), TAB, ...times(8, DOWN), TAB, ...times(8, DOWN), RIGHT, LEFT], rendered, after);
+		const heights = [rendered[0]!, ...after].map((s) => s.split("\n").length);
+		expect(new Set(heights).size).toBe(1);
+
+		const r2: string[] = [];
+		const a2: string[] = [];
+		driveMenu(h, [...times(12, DOWN), RIGHT, LEFT, TAB, ...times(12, DOWN), TAB, ...times(12, DOWN)], r2, a2);
+		await h.commands.automode.handler("", h.ctx);
+		expect(r2.length).toBe(1);
+		const heights2 = [r2[0]!, ...a2].map((s) => s.split("\n").length);
+		expect(new Set(heights2).size).toBe(1);
+	});
 
 	test("add persists to the global file and takes effect immediately (no classifier call)", async () => {
 		const h = session({});
