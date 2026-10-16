@@ -47,7 +47,7 @@ Every danger rule has an id, a pattern, a reason and an action (`deny`, `ask` or
 
 | id | matches |
 |---|---|
-| `rm-recursive` | `rm` with `-r`/`-rf`/`-fr` style flags or `--recursive` |
+| `rm-recursive` | `rm` with `-r`/`-rf`/`-fr` style flags or `--recursive`, unless every operand resolves strictly inside the workspace (session cwd) or the temp directory (`os.tmpdir()`, `/tmp` on non-Windows): then the rule makes no judgment (`rmEscapesScope`). Unresolvable operands (`$VAR`, backticks, `{}`, `~user`, relative operands after `cd`/`pushd`/`popd`, no operands), the scope roots themselves, and a filesystem-root or home-directory cwd still hit |
 | `rm-root` | `rm` of `/`, `/etc`, `/usr`, `/var`, `~` or `$HOME` |
 | `sudo` | the word `sudo` |
 | `chmod-777` | `chmod` with `777`, `a+rwx`, `ugo+rwx`, `ugo=rwx` or setuid/setgid (`u+s`, `g+s`) |
@@ -63,8 +63,9 @@ Every danger rule has an id, a pattern, a reason and an action (`deny`, `ask` or
 | `fork-bomb` | `:(){` |
 
 Why: command-string regex allowlists were bypassed in all audited payloads ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md)), so only deny-by-default rules ship and everything else is judged by meaning (CL-1); each rule's action is configurable because what is dangerous depends on the user's workflow, and `allow` means "no judgment" rather than "allowed" so a configuration can never make the rule layer auto-approve a command; the cap bounds regex backtracking on long separator-free strings (#25).
-Code: `BASH_DANGER_RULES`, `DangerRule`, `parseDangerRules`, `parseDangerRuleEntry`, `classifyBash`, `BASH_MAX_MATCH_LEN`
+Code: `BASH_DANGER_RULES`, `DangerRule`, `parseDangerRules`, `parseDangerRuleEntry`, `classifyBash`, `rmEscapesScope`, `rmOperandsInScope`, `rmScopeBases`, `BASH_MAX_MATCH_LEN`
 Pinned by: built-in rules (RL-5, RL-6, PG) › danger regex (rm -rf) → deny, zero model calls; built-in rules (RL-5, RL-6, PG) › no built-in whitelist: ls → gray → classifier; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › danger rule set to ask: dialog with a UI, block with the grant hint headless, block in yolo without a dialog; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › action allow (or removal with false) passes no judgment: the call goes to the classifier; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › custom rule: case-insensitive by default, flags override, reason defaults; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › all hits count: a deny beats an ask and the reason names every hit of the winning action; user rules (deny > allow > gray) › bash commands longer than the match cap are truncated before rule matching
+Pinned by (rm-recursive scope): built-in rules (RL-5, RL-6, PG) › rm-recursive workspace/temp scope › targets inside the workspace or temp directory pass to the classifier; built-in rules (RL-5, RL-6, PG) › rm-recursive workspace/temp scope › targets outside, unresolvable, or the scope roots themselves still deny; built-in rules (RL-5, RL-6, PG) › rm-recursive workspace/temp scope › a home-directory cwd gives no workspace exemption; built-in rules (RL-5, RL-6, PG) › rm-recursive workspace/temp scope › the waiver applies at any configured action (user override to ask)
 
 #### RL-6: builtinDenyFloor
 

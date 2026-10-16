@@ -113,11 +113,13 @@ export interface DangerRule {
 	action: RuleAction;
 	/** true = shipped rule (possibly with a user-replaced pattern/action); false = user-added custom rule */
 	builtin: boolean;
+	/** Built-in path-scoped rule: a regex hit is waived when every rm operand resolves strictly inside the workspace or temp directory (rmEscapesScope). */
+	scoped?: true;
 }
 
 /** Built-in danger rules (defaults; read-only): matched against the full command string (covers pipes/compound commands); the default action is deny (from research report §4.3). The effective list is `UserRules.dangerRules`. */
-const BASH_DANGER_RULES: ReadonlyArray<{ id: string; pattern: RegExp; reason: string }> = [
-	{ id: "rm-recursive", pattern: /\brm\b[^;|&]*(\s-(?:[a-zA-Z]*r[a-zA-Z]*f?|[a-zA-Z]*f[a-zA-Z]*r)\b|--recursive)/i, reason: "recursive delete (rm -r)" },
+const BASH_DANGER_RULES: ReadonlyArray<{ id: string; pattern: RegExp; reason: string; scoped?: true }> = [
+	{ id: "rm-recursive", pattern: /\brm\b[^;|&]*(\s-(?:[a-zA-Z]*r[a-zA-Z]*f?|[a-zA-Z]*f[a-zA-Z]*r)\b|--recursive)/i, reason: "recursive delete (rm -r) outside the workspace and temp directory", scoped: true },
 	{ id: "rm-root", pattern: /\brm\s+(-[a-zA-Z]*\s+)*(--recursive\s+)?(\/|\/etc|\/usr|\/var|~|\$HOME)(?:\s|$)/i, reason: "delete root/system/home directory" },
 	{ id: "sudo", pattern: /\bsudo\b/i, reason: "privilege escalation (sudo)" },
 	{ id: "chmod-777", pattern: /\bchmod\b[^;|&]*(777|a\+rwx|ugo\+rwx|ugo=rwx|[ug]\+s)\b/i, reason: "permission weakening (chmod 777/setuid)" },
@@ -162,9 +164,9 @@ interface RuleResult {
 export const BASH_MAX_MATCH_LEN = 8192;
 
 /** Rules whose action is `allow` are skipped (no judgment). Any deny hit wins over ask hits; the reason lists every hit of the winning action. */
-function classifyBash(command: string, rules: readonly DangerRule[]): RuleResult {
+function classifyBash(command: string, rules: readonly DangerRule[], cwd: string): RuleResult {
 	const capped = command.length > BASH_MAX_MATCH_LEN ? command.slice(0, BASH_MAX_MATCH_LEN) : command;
-	const hits = rules.filter((r) => r.action !== "allow" && r.pattern.test(capped));
+	const hits = rules.filter((r) => r.action !== "allow" && r.pattern.test(capped) && (!r.scoped || rmEscapesScope(command, r.pattern, cwd)));
 	if (hits.length) {
 		const action: "deny" | "ask" = hits.some((r) => r.action === "deny") ? "deny" : "ask";
 		const won = hits.filter((r) => r.action === action);
@@ -231,6 +233,91 @@ const CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform ==
 const fold = (s: string): string => (CASE_INSENSITIVE_FS ? s.toLowerCase() : s);
 const pathEquals = (a: string, b: string): boolean => fold(a) === fold(b);
 const pathStartsWith = (child: string, base: string): boolean => fold(child).startsWith(fold(base) + path.sep);
+
+// ----------------------------------------------------------------------------
+// Path-scoped built-in rules: `rm-recursive` is waived when every rm operand resolves strictly inside the workspace (session cwd) or the temp directory.
+// A waiver is "no judgment" (the call continues to user rules and the classifier), never a mechanical allow.
+// ----------------------------------------------------------------------------
+
+/** Directories an `rm` may delete inside of: the workspace (unless it is a filesystem root or the home directory) and the temp directory. */
+function rmScopeBases(cwd: string): string[] {
+	const ws = path.resolve(cwd);
+	const bases: string[] = [];
+	if (path.parse(ws).root !== ws && !pathEquals(ws, os.homedir())) bases.push(...baseForms(ws));
+	bases.push(...baseForms(os.tmpdir()));
+	if (process.platform !== "win32") bases.push(...baseForms("/tmp"));
+	return bases;
+}
+
+/** Split on unquoted whitespace; quotes group and are removed; null on an unbalanced quote. No escape handling. */
+function shellWords(segment: string): string[] | null {
+	const words: string[] = [];
+	let cur = "";
+	let has = false;
+	let quote: string | null = null;
+	for (const ch of segment) {
+		if (quote) {
+			if (ch === quote) quote = null;
+			else cur += ch;
+		} else if (ch === "'" || ch === '"') {
+			quote = ch;
+			has = true;
+		} else if (/\s/.test(ch)) {
+			if (has) words.push(cur);
+			cur = "";
+			has = false;
+		} else {
+			cur += ch;
+			has = true;
+		}
+	}
+	if (quote) return null;
+	if (has) words.push(cur);
+	return words;
+}
+
+/** true only if every operand of the segment's `rm` provably resolves strictly inside one of `bases`. */
+function rmOperandsInScope(segment: string, cwd: string, bases: string[], cwdChanged: boolean): boolean {
+	const raw = shellWords(segment);
+	if (!raw) return false;
+	const words: string[] = [];
+	for (let i = 0; i < raw.length; i++) {
+		const w = raw[i];
+		if (/^\d*(?:>>?|<)&?$/.test(w)) i++;
+		else if (/^\d*(?:>>?|<)/.test(w)) continue;
+		else words.push(w);
+	}
+	const at = words.findIndex((w) => w.replace(/^\\/, "").split(/[\\/]/).pop() === "rm");
+	if (at < 0) return false;
+	const operands: string[] = [];
+	let optionsEnded = false;
+	for (const w of words.slice(at + 1)) {
+		if (!optionsEnded && w === "--") optionsEnded = true;
+		else if (optionsEnded || !w.startsWith("-")) operands.push(w);
+	}
+	if (!operands.length) return false;
+	for (const op of operands) {
+		if (/[`{]/.test(op) || /\$(?!HOME(?:\/|$))/.test(op)) return false;
+		if (op.startsWith("~") && op !== "~" && !op.startsWith("~/")) return false;
+		if (process.platform !== "win32" && op.includes("\\")) return false;
+		const t = expandHome(op.replace(/^\$HOME(?=\/|$)/, os.homedir()));
+		if (cwdChanged && !path.isAbsolute(t)) return false;
+		const forms = rebuiltForms(path.resolve(cwd, t));
+		if (!forms.every((f) => bases.some((b) => pathStartsWith(f, b)))) return false;
+	}
+	return true;
+}
+
+/** true = a scoped rule must hit: some matched rm segment has a target outside the workspace/temp directory (or cannot be resolved). */
+function rmEscapesScope(command: string, pattern: RegExp, cwd: string): boolean {
+	if (command.length > BASH_MAX_MATCH_LEN) return true;
+	const segments = command.split(/&&|\|\||\$\(|[;|&\n()`]/);
+	const matched = segments.filter((s) => pattern.test(s));
+	if (!matched.length) return true;
+	const cwdChanged = /\b(?:cd|pushd|popd)\b/.test(command);
+	const bases = rmScopeBases(cwd);
+	return matched.some((s) => !rmOperandsInScope(s, cwd, bases, cwdChanged));
+}
 
 // ============================================================================
 // User rules: allowlist/denylist (configurable; #12 audit response)
@@ -1344,7 +1431,7 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 	let base: RuleResult;
 	const kind = toolKind(toolName);
 	if (kind === "command") {
-		base = classifyBash(String(input.command ?? ""), user.dangerRules);
+		base = classifyBash(String(input.command ?? ""), user.dangerRules, cwd);
 	} else if (toolName === "write" || toolName === "edit") {
 		// isWrite grading nuance stays per-tool (not part of the family map)
 		base = classifyPath(toolName, String(input.path ?? ""), cwd, true, user.pathRules);

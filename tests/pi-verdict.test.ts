@@ -276,14 +276,14 @@ async function withTempDir(prefix: string, fn: (dir: string) => void | Promise<v
 describe("built-in rules (RL-5, RL-6, PG)", () => {
 	test("danger regex (rm -rf) → deny, zero model calls", async () => {
 		const h = session({});
-		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }); // concatenated so the dangerous regex does not block the test file
+		const r = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }); // concatenated so the dangerous regex does not block the test file
 		expect(r?.block).toBe(true);
 		expect(r.reason).toContain("rm-recursive");
 		expect(h.calls.length).toBe(0);
 	});
 	test("floor NOT overridable by user allow", async () => {
 		const h = session({ allow: ["^rm"] });
-		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" });
+		const r = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" });
 		expect(r?.block).toBe(true);
 		expect(h.calls.length).toBe(0);
 	});
@@ -432,6 +432,73 @@ describe("built-in rules (RL-5, RL-6, PG)", () => {
 			expect((await toolCall(h, "read", { path: "~/.npmrc" }))?.block).toBe(true);
 		});
 	});
+	describe("rm-recursive workspace/temp scope", () => {
+		const RMF = "rm " + "-rf ";
+		const withWs = async (fn: (ws: string) => Promise<void>) => {
+			const ws = fs.mkdtempSync(path.join(os.homedir(), ".pv-rm-"));
+			try {
+				await fn(ws);
+			} finally {
+				fs.rmSync(ws, { recursive: true, force: true });
+			}
+		};
+		const gray = async (cfg: Parameters<typeof setConfig>[0], cwd: string, command: string) => {
+			const h = session(cfg, { cwd });
+			h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+			const r = await toolCall(h, "bash", { command });
+			return { r, calls: h.calls.length };
+		};
+		const isDeny = async (cwd: string, command: string) => {
+			const { r, calls } = await gray({}, cwd, command);
+			expect(r?.block).toBe(true);
+			expect(String(r?.reason)).toContain("rule rm-recursive");
+			expect(calls).toBe(0);
+		};
+		const isGray = async (cwd: string, command: string, cfg: Parameters<typeof setConfig>[0] = {}) => {
+			const { r, calls } = await gray(cfg, cwd, command);
+			expect(r).toBeUndefined();
+			expect(calls).toBe(1);
+		};
+
+		test("targets inside the workspace or temp directory pass to the classifier", async () => {
+			await withWs(async (ws) => {
+				for (const c of [
+					RMF + "build",
+					RMF + "./a/b",
+					RMF + "build/*",
+					RMF + path.join(ws, "build"),
+					RMF + path.join(os.tmpdir(), "pv-x"),
+					RMF + "build > /dev/null 2>&1",
+					"git rm -r --cached build",
+				]) await isGray(ws, c);
+			});
+		});
+		test("targets outside, unresolvable, or the scope roots themselves still deny", async () => {
+			await withWs(async (ws) => {
+				for (const c of [
+					RMF + "../x",
+					RMF + ".",
+					RMF + ws,
+					RMF + "build /opt/x",
+					RMF + os.tmpdir(),
+					"cd /opt && " + RMF + "build",
+					RMF + "$X/y",
+					RMF + "~/x",
+					"find . | xargs " + "rm -rf",
+					"echo ok; " + RMF + "../x",
+					RMF + '"unbalanced',
+				]) await isDeny(ws, c);
+			});
+		});
+		test("a home-directory cwd gives no workspace exemption", async () => {
+			await isDeny(os.homedir(), RMF + "build");
+		});
+		test("the waiver applies at any configured action (user override to ask)", async () => {
+			await withWs(async (ws) => {
+				await isGray(ws, RMF + "build", { dangerRules: { "rm-recursive": "ask" } });
+			});
+		});
+	});
 });
 
 // ── 2. User rules (denylist takes priority over allowlist) ─────────────────────
@@ -476,7 +543,7 @@ describe("user rules (deny > allow > gray)", () => {
 		const warnings = h.notifies.filter(([, level]) => level === "warning").map(([m]) => m).join("\n");
 		expect(warnings).toContain("parse");
 		// the built-in floor still denies
-		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" });
+		const r = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" });
 		expect(r?.block).toBe(true);
 		expect(h.calls.length).toBe(0);
 	});
@@ -485,20 +552,20 @@ describe("user rules (deny > allow > gray)", () => {
 		const head = "a".repeat(BASH_MAX_MATCH_LEN);
 		// danger within the capped prefix → rule-layer deny, zero model calls
 		const h = session({});
-		const r1 = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x && " + head });
+		const r1 = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x && " + head });
 		expect(r1?.block).toBe(true);
 		expect(h.calls.length).toBe(0);
 		// danger beyond the cap loses rule matching (truncation) → gray → classifier
 		const h2 = session({});
 		h2.responses = [{ text: "<verdict>deny</verdict> mock" }];
-		const r2 = await toolCall(h2, "bash", { command: head + " ; rm " + "-rf /tmp/x" });
+		const r2 = await toolCall(h2, "bash", { command: head + " ; rm " + "-rf /opt/x" });
 		expect(h2.calls.length).toBe(1);
 		expect(r2?.block).toBe(true);
 	});
 	test("builtinDenyFloor: false disables the whole built-in deny floor (risk accepted by user)", async () => {
 		const h = session({ builtinDenyFloor: false });
 		h.responses = [{ text: "<verdict>deny</verdict> floor off" }];
-		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }); // dangerous regex disabled
+		const r = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }); // dangerous regex disabled
 		expect(h.calls.length).toBe(1);        // handed to the classifier
 		expect(r?.block).toBe(true);           // classifier verdict still applies
 	});
@@ -511,7 +578,7 @@ describe("user rules (deny > allow > gray)", () => {
 	});
 	test("builtinDenyFloor default true keeps the floor", async () => {
 		const h = session({ allow: ["^rm"] });
-		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" });
+		const r = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" });
 		expect(r?.block).toBe(true);           // default on: floor still takes priority over user allow
 		expect(h.calls.length).toBe(0);
 	});
@@ -953,7 +1020,7 @@ describe("/automode command", () => {
 	test("off actually disables gating", async () => {
 		const h = session({});
 		await h.commands.automode.handler("off", h.ctx);
-		const r = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" });
+		const r = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" });
 		expect(r).toBeUndefined(); // once off, dangerous commands are no longer blocked
 	});
 	test("unknown arg → warning with usage", async () => {
@@ -1001,7 +1068,7 @@ describe("toggle shortcut", () => {
 			pressKey();
 			expect(h.notifies.length).toBe(n); // the shortcut itself never notifies
 		};
-		expect((await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }))?.block).toBe(true); // default: floor blocks
+		expect((await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }))?.block).toBe(true); // default: floor blocks
 		const modeOf = async () => {
 			h.notifies.length = 0;
 			await h.commands.automode.handler("status", h.ctx);
@@ -1013,10 +1080,10 @@ describe("toggle shortcut", () => {
 		expect(await modeOf()).toBe("noAutoDeny");
 		press();
 		expect(await modeOf()).toBe("off");
-		expect(await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined(); // off: ungated
+		expect(await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" })).toBeUndefined(); // off: ungated
 		press();
 		expect(await modeOf()).toBe("default");
-		expect((await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }))?.block).toBe(true);
+		expect((await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }))?.block).toBe(true);
 	});
 	test("footer chip per mode: default success, yolo error, noAutoDeny warning, off warning", async () => {
 		const h = session({});
@@ -2405,7 +2472,7 @@ describe("adjudicate pipeline (interface level)", () => {
 			return adjudicate(new SessionState(), { toolName: tool, input }, env);
 		};
 		expect(await run({ allow: ["^ls\\b"] }, "bash", { command: "ls -la" }, adjudicateEnv())).toMatchObject({ verdict: "allow", source: "rule", degraded: false });
-		expect(await run({}, "bash", { command: "rm " + "-rf /tmp/x" }, adjudicateEnv())).toMatchObject({ verdict: "deny", source: "rule", degraded: false });
+		expect(await run({}, "bash", { command: "rm " + "-rf /opt/x" }, adjudicateEnv())).toMatchObject({ verdict: "deny", source: "rule", degraded: false });
 		expect(await run({ denyPaths: [secret] }, "write", { path: path.join(secret, "n.md"), content: "x" }, adjudicateEnv())).toMatchObject({ verdict: "ask", source: "protected-path", degraded: false });
 		expect(await run({ denyPaths: [secret] }, "write", { path: path.join(secret, "n.md"), content: "x" }, adjudicateEnv({ hasUI: false }))).toMatchObject({ verdict: "deny", source: "protected-path", degraded: true });
 		expect(await run({}, "bash", { command: "echo hello" }, adjudicateEnv({ text: "<verdict>allow</verdict> ok" }))).toMatchObject({ verdict: "allow", source: "classifier", degraded: false });
@@ -3200,7 +3267,7 @@ describe("footer status", () => {
 		const h = session({});
 		withBg(h);
 		await h.handlers.session_start({}, h.ctx);
-		await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" });
+		await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" });
 		expect(lastStatus(h)).toContain("\uF05E 1");
 		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
 		h.confirmAnswer = true;
@@ -3940,16 +4007,16 @@ describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 
 	test("off: the gate is inert in subagents (the root stays gated)", async () => {
 		await withBridge({ subagentGate: "off" }, async (root, sub) => {
-			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
+			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /opt/x" })).toBeUndefined();
 			expect(sub.calls.length).toBe(0);
-			const r = await toolCall(root, "bash", { command: "rm " + "-rf /tmp/x" });
+			const r = await toolCall(root, "bash", { command: "rm " + "-rf /opt/x" });
 			expect(r?.block).toBe(true);
 		});
 	});
 
 	test("default is off: a fresh config leaves subagents ungated", async () => {
 		await withBridge({ subagentGate: undefined }, async (root, sub) => {
-			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
+			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /opt/x" })).toBeUndefined();
 			expect(sub.calls.length).toBe(0);
 			expect(root.confirms).toBe(0);
 		});
@@ -4025,7 +4092,7 @@ describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 		await h.handlers["session_shutdown"]({}, h.ctx);
 		// an invalid mode falls back to the default (off): the subagent is not gated, nothing prompts
 		await withBridge({ subagentGate: "x", subagentAskTimeoutMs: 0 }, async (root, sub) => {
-			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /tmp/x" })).toBeUndefined();
+			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /opt/x" })).toBeUndefined();
 			expect(root.confirms).toBe(0);
 		});
 	});
@@ -4154,7 +4221,7 @@ describe("approve dialog code expansion and verdict label", () => {
 		await result(h, "c2");
 		expect(h.entries.map((e) => e[1].how)).toEqual(["classifier", "user"]);
 
-		const denied = await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }, "c3");
+		const denied = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }, "c3");
 		expect(denied?.block).toBe(true);
 		expect(await result(h, "c3")).toBeUndefined();
 
@@ -4300,7 +4367,7 @@ describe("approve dialog code expansion and verdict label", () => {
 describe("approval modes", () => {
 	const SENS = path.join(TMP_AGENT, "sensitive-modes");
 	const OMP_FILE = "/proj/.omp/notes.md";
-	const RM = "rm " + "-rf /tmp/x";
+	const RM = "rm " + "-rf /opt/x";
 	const SESSION_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict-sessions", "s1.json");
 	const statusText = async (h: Harness) => {
 		h.notifies.length = 0;
@@ -4820,7 +4887,7 @@ describe("root rule (RR-1–RR-4)", () => {
 		const h = rrSession({ rootRule: { text: 5, strictness: "x" } });
 		await h.handlers.session_start({}, h.ctx);
 		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("rootRule.text") && m.includes("rootRule.strictness"))).toBe(true);
-		expect((await toolCall(h, "bash", { command: "rm " + "-rf /tmp/x" }))?.block).toBe(true);
+		expect((await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }))?.block).toBe(true);
 	});
 
 	test("root rule sits inside the user rules block; rules win on conflict", async () => {
