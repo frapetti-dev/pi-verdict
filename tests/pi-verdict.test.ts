@@ -2873,6 +2873,16 @@ describe("/verdict config editor", () => {
 		expect(after.at(-1)).toContain("fix by hand");
 	});
 
+	test("built-in rules page: an inherit row shows the lower scope's action or the built-in default", async () => {
+		const h = session({ dangerRules: { sudo: "ask" } });
+		const rendered: string[] = [];
+		const after: string[] = [];
+		await run(h, "session", [...times(9, DOWN), ENTER], rendered, after);
+		const lines = after.at(-1)!.split("\n");
+		expect(lines.find((l) => l.includes("sudo"))).toMatch(/inherit.*ask · global$/);
+		expect(lines.find((l) => l.includes("s0-secret"))).toMatch(/inherit.*deny · default$/);
+	});
+
 	test("built-in rules page: cycling a danger rule persists its action; a custom rule keeps its pattern", async () => {
 		const h = session({ dangerRules: { "npm-publish": { pattern: "\\bnpm\\s+publish\\b" } } });
 		const rendered: string[] = [];
@@ -4618,6 +4628,19 @@ describe("approval modes", () => {
 			const other = lines.find((l) => l.includes("confidence threshold"))!;
 			expect(other).not.toContain("‹");
 			expect(other).not.toContain("›");
+		});
+
+		test("inherit rows show the inherited value and its source in a right column; other values hide it", async () => {
+			const h = session({ mode: "yolo" });
+			const rendered: string[] = [];
+			const after: string[] = [];
+			driveMenu(h, [RIGHT], rendered, after);
+			await h.commands.automode.handler("", h.ctx);
+			const first = rendered[0]!.split("\n");
+			expect(first.find((l) => l.startsWith("› mode"))).toMatch(/inherit.*yolo · global  ctrl\+shift\+y$/);
+			expect(first.find((l) => l.includes("confidence threshold"))).toMatch(/off · default$/);
+			expect(after[0]!.split("\n").find((l) => l.startsWith("› mode"))).not.toContain("· global");
+			fs.rmSync(SESSION_FILE(), { force: true });
 		});
 
 		test("percent rows: RIGHT walks inherit → off → 0% → +5%, the bar follows, the session file stores the number", async () => {

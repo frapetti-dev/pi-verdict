@@ -2983,8 +2983,8 @@ export type MenuTone = "text" | "muted" | "warning";
 export type MenuInfo = Array<{ tone: MenuTone; text: string }>;
 export type MenuRow =
 	| { kind: "section"; label: string } // "" = plain rule
-	| { kind: "choice"; id: string; label: string; values: readonly string[]; value: string; shortcut?: string; confirm?: boolean; locked?: string; info(value: string): MenuInfo; maxInfo?(value: string): MenuInfo }
-	| { kind: "percent"; id: string; label: string; allowInherit: boolean; value: string; info(value: string): MenuInfo; maxInfo?(value: string): MenuInfo }
+	| { kind: "choice"; id: string; label: string; values: readonly string[]; value: string; shortcut?: string; confirm?: boolean; locked?: string; inherited?: { text: string; source: string }; info(value: string): MenuInfo; maxInfo?(value: string): MenuInfo }
+	| { kind: "percent"; id: string; label: string; allowInherit: boolean; value: string; inherited?: { text: string; source: string }; info(value: string): MenuInfo; maxInfo?(value: string): MenuInfo }
 	| { kind: "page"; id: string; label: string; locked?: string; info(): MenuInfo }
 	| { kind: "action"; id: string; label: string; key?: string; confirm?: boolean; info(): MenuInfo }
 	| { kind: "add"; id: string; placeholder: string; info(): MenuInfo }
@@ -3138,6 +3138,9 @@ export function buildSettingsMenu(
 		const filled = n === null ? 0 : Math.max(0, Math.min(10, Math.round(n / 10)));
 		return fg("accent", "█".repeat(filled)) + fg("dim", "░".repeat(10 - filled));
 	};
+	/** Right column of a row showing `inherit`: the inherited value (accent) · its source scope (muted). */
+	const inheritedSeg = (row: { inherited?: { text: string; source: string } }, shown: string): string =>
+		shown === "inherit" && row.inherited ? fg("accent", row.inherited.text) + fg("dim", " · ") + fg("muted", row.inherited.source) : "";
 
 	const inputLine = (pfx: string, w: number): string => {
 		const e = editing!;
@@ -3168,7 +3171,7 @@ export function buildSettingsMenu(
 					const r = i >= 0 && i < row.values.length - 1 ? "›" : " ";
 					seg = fg("dim", l) + " " + fg(isPending ? "warning" : "text", shown) + " " + fg("dim", r);
 				} else seg = "  " + fg(isPending ? "warning" : "muted", shown);
-				return rightAlign(pfx + fg("text", lab(row)) + seg, row.shortcut ? fg("dim", row.shortcut) : "", w);
+				return rightAlign(pfx + fg("text", lab(row)) + seg, [inheritedSeg(row, shown), row.shortcut ? fg("dim", row.shortcut) : ""].filter((s) => s !== "").join("  "), w);
 			}
 			case "percent": {
 				const n = /^\d+(?:\.\d+)?%$/.test(row.value) ? Number.parseFloat(row.value) : null;
@@ -3178,7 +3181,7 @@ export function buildSettingsMenu(
 					const r = row.value === "100%" ? " " : "›";
 					seg = `${fg("dim", l)} ${bar(n)} ${fg("text", row.value)} ${fg("dim", r)}`;
 				} else seg = "  " + fg("muted", row.value);
-				return pfx + fg("text", lab(row)) + seg;
+				return rightAlign(pfx + fg("text", lab(row)) + seg, inheritedSeg(row, row.value), w);
 			}
 			case "page":
 				if (row.locked !== undefined) return rightAlign(pfx + fg("dim", row.label), fg("dim", row.locked), w);
@@ -5562,11 +5565,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if (err) ctx.ui.notify(`pi-verdict: could not save ${key} (${scope}): ${err}`, "error");
 	};
 
+	/** Scopes `inherit` at `scope` falls through to, nearest first; an untrusted local file is skipped. */
+	const lowerScopes = (scope: MenuScope, localFile: string | null): MenuScope[] =>
+		(scope === "session" ? (["local", "global"] as MenuScope[]) : scope === "local" ? (["global"] as MenuScope[]) : []).filter((s) => s !== "local" || (localFile !== null && projectTrusted(localFile)));
+
 	/** The next lower scope that sets `key` (what `inherit` resolves to at `scope`); an untrusted local file is skipped. */
 	const inheritedFrom = (scope: MenuScope, key: SessionKey, localFile: string | null): { source: MenuScope | "default"; text: string } => {
-		const lower: MenuScope[] = scope === "session" ? ["local", "global"] : ["global"];
-		for (const s of lower) {
-			if (s === "local" && (localFile === null || !projectTrusted(localFile))) continue;
+		for (const s of lowerScopes(scope, localFile)) {
 			const raw = storedAt(s, localFile);
 			if (raw[key] !== undefined) return { source: s, text: storedValueText(raw, key, s) };
 		}
@@ -5631,6 +5636,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						values: scope === "global" ? modeValues : ["inherit", ...modeValues],
 						value: storedValueText(raw, "mode", scope),
 						shortcut: registeredToggleKey ?? undefined,
+						...(scope === "global" ? {} : { inherited: inheritedFrom(scope, "mode", localFile) }),
 						info: (v) => settingInfo(scope, "mode", v, localFile),
 						maxInfo: (v) => settingInfo(scope, "mode", v, localFile, true),
 					},
@@ -5642,11 +5648,12 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						const value = storedValueText(raw, item.key, scope);
 						const info = (v: string): MenuInfo => settingInfo(scope, item.key, v, localFile);
 						const maxInfo = (v: string): MenuInfo => settingInfo(scope, item.key, v, localFile, true);
+						const inh = scope === "global" ? {} : { inherited: inheritedFrom(scope, item.key, localFile) };
 						const values = ENUM_VALUES[item.key];
 						rows.push(
 							values
-								? { kind: "choice", id: item.key, label: item.label, values: scope === "global" ? values : ["inherit", ...values], value, info, maxInfo }
-								: { kind: "percent", id: item.key, label: item.label, allowInherit: scope !== "global", value, info, maxInfo },
+								? { kind: "choice", id: item.key, label: item.label, values: scope === "global" ? values : ["inherit", ...values], value, ...inh, info, maxInfo }
+								: { kind: "percent", id: item.key, label: item.label, allowInherit: scope !== "global", value, ...inh, info, maxInfo },
 						);
 					}
 				}
@@ -6077,6 +6084,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				values: !valid ? ["invalid"] : scope === "global" ? base : ["inherit", ...base],
 				value: valid ? storedValueText(raw, key, scope) : "invalid",
 				...(valid ? {} : { locked: "fix by hand" }),
+				...(valid && scope !== "global" ? { inherited: inheritedFrom(scope, key, localFile) } : {}),
 				info: (v) => settingInfo(scope, key, v, localFile),
 				maxInfo: (v) => settingInfo(scope, key, v, localFile, true),
 			};
@@ -6091,6 +6099,21 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			"s3-git-meta-write": "writes to .git/hooks, .git/config, .git/modules, .gitmodules",
 		};
 		const plainObject = (v: unknown): Record<string, unknown> | null => (typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+		/** What `inherit` resolves to for one danger rule / path tier at `scope`: the nearest lower scope with a valid entry, else the built-in default. */
+		const inheritedBuiltin = (scope: MenuScope, mapKey: "dangerRules" | "pathRules", id: string, fallback: string): { source: MenuScope | "default"; text: string } => {
+			for (const s of lowerScopes(scope, localFile)) {
+				const e = plainObject(storedAt(s, localFile)[mapKey])?.[id];
+				let text: string | null = null;
+				if (isRuleAction(e)) text = e;
+				else if (mapKey === "dangerRules" && e === false) text = "off";
+				else if (mapKey === "dangerRules") {
+					const obj = plainObject(e);
+					if (obj !== null) text = obj.action === undefined ? "deny" : isRuleAction(obj.action) ? obj.action : null;
+				}
+				if (text !== null) return { source: s, text };
+			}
+			return { source: "default", text: fallback };
+		};
 		/** One choice row per built-in/custom danger rule and per path tier at `scope`: the stored entry (or inherit) as the value. */
 		const builtinRows = (scope: MenuScope): MenuRow[] => {
 			const stored = storedAt(scope, localFile);
@@ -6117,6 +6140,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					values: value === "invalid" ? ["invalid"] : scope === "global" ? base : ["inherit", ...base],
 					value,
 					...(value === "invalid" ? { locked: "fix by hand" } : {}),
+					...(value === "inherit" ? { inherited: inheritedBuiltin(scope, "dangerRules", id, BASH_DANGER_RULES.some((r) => r.id === id) ? "deny" : "off") } : {}),
 					info: () => [
 						{ tone: "text", text: live ? live.reason : "(removed at this or a lower scope)" },
 						...(live ? [{ tone: "muted" as const, text: `pattern: /${live.pattern.source}/${live.pattern.flags}` }] : []),
@@ -6136,6 +6160,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					values: value === "invalid" ? ["invalid"] : scope === "global" ? [...RULE_ACTIONS] : ["inherit", ...RULE_ACTIONS],
 					value,
 					...(value === "invalid" ? { locked: "fix by hand" } : {}),
+					...(value === "inherit" ? { inherited: inheritedBuiltin(scope, "pathRules", tier, PATH_TIER_DEFAULTS[tier]) } : {}),
 					info: () => [
 						{ tone: "text", text: PATH_TIER_DESC[tier] },
 						{ tone: "muted", text: `Effective: ${state.userRules.pathRules[tier]} (default ${PATH_TIER_DEFAULTS[tier]}). allow = no judgment, the classifier decides.` },
