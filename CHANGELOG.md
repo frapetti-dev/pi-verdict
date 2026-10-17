@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Changed
+
+- **Agent guidance for built-in rules**: the `verdict_settings` and `verdict_grant` tool descriptions and their `promptGuidelines` now tell the agent to check a built-in rule's current action with `verdict_settings` `get` (key `dangerRules` or `pathRules`) before saying it blocks an operation, and to request a `verdict_grant` listing the rule ids in `rules` (or protected paths in `paths`) instead of refusing or asking the user to run the step. Text only; gate behavior, `GRANT_BLOCK_HINT` and block reasons are unchanged.
+
 ## [0.21.0] - 2026-10-17
 
 ### Added

@@ -6587,7 +6587,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		},
 	};
 	const settingsToolDescription =
-		"Read pi-verdict (permission gate) settings or propose a change. Actions: get (read effective and per-scope values; no approval), set (replace a key's whole value), unset (drop a key at one scope), add/remove (one entry of a list key: allow, deny, denyPaths, tools, rules). " +
+		"Read pi-verdict (permission gate) settings or propose a change. " +
+		"Before saying a built-in rule blocks an operation, call get with key \"dangerRules\" (danger rules such as gh-release, sudo, rm-recursive) or \"pathRules\" (path tiers) to see the current action of each rule (deny, ask, allow); get needs no approval. " +
+		"Actions: get (read effective and per-scope values; no approval), set (replace a key's whole value), unset (drop a key at one scope), add/remove (one entry of a list key: allow, deny, denyPaths, tools, rules). " +
 		"Scopes: global = the user config; local = the project config (applied only when the project is trusted); session = this session only, highest precedence. " +
 		"Session scope takes only the approval keys (mode, thresholds, yoloDenyPaths, yoloOmpDir, classifierFallbackMode), gateOmpDir, footer, modeStatus, grantStatus, rootRule, dangerRules and pathRules; on list keys it appends to the effective list. " +
 		"dangerRules (per-id map: action \"deny\"|\"ask\"|\"allow\" for a built-in or custom danger rule, false removes a rule, {pattern, action?, reason?, flags?} adds a custom rule) and pathRules (path tier → action) merge per id with the entries already stored at the scope on set: a null id is dropped at that scope, and unset drops the whole map. " +
@@ -6598,6 +6600,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		label: "Verdict settings",
 		description: settingsToolDescription,
 		promptSnippet: "Read pi-verdict gate settings or propose a change (every change needs the user's approval)",
+		promptGuidelines: ["Before telling the user that a pi-verdict built-in rule (a danger rule like gh-release, or a path tier) blocks an operation, check its current action with verdict_settings get (key dangerRules or pathRules)."],
 		parameters: settingsToolParameters,
 		...(isOmpHost ? { approval: "write" } : {}),
 		execute: async (_toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) => {
@@ -6755,6 +6758,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	};
 	const grantToolDescription =
 		"Request, release or list permission grants: explicit, session-long authorizations from the user for one operation described in natural language. " +
+		"Never refuse an operation, or hand it to the user, because a built-in rule might block it: check the rule's current action with verdict_settings get (key dangerRules or pathRules); if it is deny or ask, request a grant listing the rule ids in rules (or the paths in paths), then run the operation once it is approved; if it is allow, just run it. " +
 		"Use action \"request\" (1) when an operation needs the user's explicit authorization by its nature — e.g. deploying, publishing, pushing to a shared remote, deleting data, contacting external systems — or (2) when a tool call you must run was blocked by the user or by the pi-verdict classifier. " +
 		"Describe the exact operation and its scope narrowly (what, where, which environment or resources); the user sees it verbatim and approves, rejects, or asks you for clarification or a revised scope. " +
 		"An approved grant lasts until the session ends, you release it, or the user revokes it, and the permission classifier treats it as authoritative for actions within its literal scope. " +
@@ -6766,6 +6770,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		label: "Verdict grant",
 		description: grantToolDescription,
 		promptSnippet: "Request an explicit, session-long permission grant from the user for an operation (deploys, blocked commands); release it when done",
+		promptGuidelines: ["If an operation you need is set to deny or ask by a pi-verdict built-in rule, or was blocked by one, request a grant with verdict_grant (list the rule ids in rules, protected paths in paths) instead of refusing or asking the user to run it themselves."],
 		parameters: grantToolParameters,
 		...(isOmpHost ? { approval: "write" } : {}),
 		execute: async (_toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) => {
