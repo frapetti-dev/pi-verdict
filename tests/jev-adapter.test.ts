@@ -152,7 +152,8 @@ describe("parseJevConfidence (#63)", () => {
 });
 
 describe("verdict prefix contract (real adjudicate pipeline)", () => {
-	const state = new SessionState();
+	// Built in the test, not at collection time: the default rules come from PI_CODING_AGENT_DIR, which `beforeAll` points at TMP_AGENT
+	// (a describe-level `new SessionState()` would load the developer's live config, e.g. mode noAutoDeny turns every deny into an ask).
 	const envFor = (text: string) => ({
 		cwd: "/proj",
 		hasUI: true,
@@ -165,6 +166,7 @@ describe("verdict prefix contract (real adjudicate pipeline)", () => {
 	test("adapter output passes parseVerdict for all three choices", async () => {
 		for (const [choice, expected] of [["allow", "allow"], ["ask", "ask"], ["deny", "deny"]] as const) {
 			const text = verdictText(decisionResponse(choice, { [choice]: 0.9 }, 0.8));
+			const state = new SessionState();
 			const v = await adjudicate(state, { toolName: "bash", input: { command: "echo hello" } }, envFor(text));
 			expect(v.verdict).toBe(expected);
 			expect(v.source).toBe("classifier");
