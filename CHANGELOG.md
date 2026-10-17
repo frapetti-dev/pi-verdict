@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-17
+
 ### Added
 
 - **Configurable built-in rules** ([RL-5](docs/adjudication-rules.md#rl-5-danger-rules), [RL-6](docs/adjudication-rules.md#rl-6-builtindenyfloor), [PG-3](docs/adjudication-rules.md#pg-3-s0-secrets) to [PG-5](docs/adjudication-rules.md#pg-5-writes), [CF-4](docs/adjudication-rules.md#cf-4-merge-semantics) to [CF-6](docs/adjudication-rules.md#cf-6-invalid-values)): the built-in deny floor is now called *built-in rules* and every one of them carries a rule action — `deny`, `ask` or `allow` (`allow` passes no judgment: the call goes to the classifier, never a mechanical allow). New config key `dangerRules` (object keyed by danger-rule id: an action string changes a built-in, `false` removes it, `{pattern, action?, reason?, flags?}` adds a custom rule; defaults `deny`, reason `custom danger rule`, case-insensitive) and `pathRules` (path tier id → action; tiers `s0-secret`, `s1-system-read`, `s1-system-write`, `s2-user-rc-write`, `s3-git-meta-write` keep their old defaults). Both merge per id across global, trusted project and session scope, are settable through `verdict_settings` (`null` drops an id at a scope) and editable in `/verdict` on a new `danger rules & path tiers` page (←/→ cycles the action). A built-in `ask` opens the ask dialog with a UI (no Explain for path tiers, PP-9), is a grantable deny headless and in `yolo`, and is beaten by a user `allow` regex; when several danger rules match the strongest action wins and the reason lists every hit. Invalid entries are skipped with a warning. `builtinDenyFloor: false` now means every built-in rule acts as `allow`; custom danger rules stay active.
