@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-10-19
+
 ### Added
 
 - **Gate briefing** ([GR-7](docs/adjudication-rules.md#gr-7-gate-briefing)): every agent turn the `before_agent_start` hook appends a `## Permission gate (pi-verdict)` section to the system prompt (pi string and omp section list both supported) that names the approval mode, lists the effective `deny` and `ask` danger rules, the non-`allow` path tiers, the `denyPaths` count (never the paths, PP-6) and the `.omp` gate, and tells the agent not to retry or rephrase a blocked call but to request a `verdict_grant` (subagents report the need instead). Omitted when the mode is `off` or for a subagent while `subagentGate` is `off`; no config switch, and it holds no per-session data besides mode and rules so the prompt stays cacheable.
