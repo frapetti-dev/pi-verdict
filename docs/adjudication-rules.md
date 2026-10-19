@@ -18,12 +18,12 @@ Pinned by: denyPaths (PP-1–PP-9) › omitted path hits in both directions for 
 
 #### RL-2: Evaluation order
 
-The rule layer MUST evaluate a tool call in this order and stop at the first terminal result: (1) user `deny` regexes → deny (before the built-in rules); (2) the built-in rules at their configured action — RL-5 danger rules for command tools, PG path tiers for file tools; a built-in deny is terminal: neither a user `allow` nor a gate overrides it, only a permission grant can lift it (GR-5); (3) the forced `.omp` gate (PP-8) → ask; (4) `denyPaths` (PP-5) → ask; (5) user `allow` regexes → allow (this beats a built-in ask, never a built-in deny); (6) the base result: a built-in ask (no gate: dialog with a UI, deny without, MD-4 in yolo), a path-grading allow, a `tools` allowlist allow (RL-7), the settings-tool allow (RL-8), or gray (the call goes to the classifier, CL-1). When the `.omp` gate or `denyPaths` replaces a built-in ask, the built-in hits stay attached so a grant can still cover them (GR-5) and yolo can still refuse them (MD-4). Steps 1 and 3–5 run only when the call has a rule target (RL-3).
+The rule layer MUST evaluate a tool call in this order and stop at the first terminal result: (1) user `deny` regexes → deny (before the built-in rules); (2) the built-in rules at their configured action — RL-5 danger rules for command tools, PG path tiers for file tools; a built-in deny is terminal: neither a user `allow` nor a gate overrides it, only a permission grant can lift it (GR-5); (3) the forced `.omp` gate (PP-8) → ask; (4) `denyPaths` (PP-5) → ask; (5) user `allow` regexes → allow (this beats a built-in ask, never a built-in deny); (6) the base result: a built-in ask (no gate: dialog with a UI, deny without, MD-4 in unattended), a path-grading allow, a `tools` allowlist allow (RL-7), the settings-tool allow (RL-8), or gray (the call goes to the classifier, CL-1). When the `.omp` gate or `denyPaths` replaces a built-in ask, the built-in hits stay attached so a grant can still cover them (GR-5) and unattended can still refuse them (MD-4). Steps 1 and 3–5 run only when the call has a rule target (RL-3).
 A remembered approval (PR-9) for the exact call is checked after the rule layer and before the grant coverage check (GR-5).
 
 Why: a protected path is the user's exception to their own allow rules ("not even my allow list may touch these"), and a built-in deny must not depend on user allow rules; a user deny states the user's own policy and is cheaper to explain than a built-in reason, so it is evaluated first; deny-beats-allow follows the rule-layer audit ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md)). A built-in ask is a prompt, which the user's explicit allow regex may pre-answer.
 Code: `classifyByRules`
-Pinned by: built-in rules (RL-5, RL-6, PG) › floor NOT overridable by user allow; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › user deny precedes the built-in rules; user allow beats a built-in ask but never a built-in deny; user rules (deny > allow > gray) › user deny beats user allow; denyPaths (PP-1–PP-9) › priority: user deny beats denyPaths (deny reason, zero confirms); denyPaths (PP-1–PP-9) › priority: denyPaths hit overrides user allow (^ls\\b + ls over denyPath → confirm); permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › yolo: a gate whose yolo action is allow still refuses a built-in ask underneath
+Pinned by: built-in rules (RL-5, RL-6, PG) › floor NOT overridable by user allow; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › user deny precedes the built-in rules; user allow beats a built-in ask but never a built-in deny; user rules (deny > allow > gray) › user deny beats user allow; denyPaths (PP-1–PP-9) › priority: user deny beats denyPaths (deny reason, zero confirms); denyPaths (PP-1–PP-9) › priority: denyPaths hit overrides user allow (^ls\\b + ls over denyPath → confirm); permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › unattended: a gate whose unattended action is allow still refuses a built-in ask underneath
 
 #### RL-3: Rule target
 
@@ -64,7 +64,7 @@ Every danger rule has an id, a pattern, a reason and an action (`deny`, `ask` or
 
 Why: command-string regex allowlists were bypassed in all audited payloads ([research/rule-layer-security-audit.md](../research/rule-layer-security-audit.md)), so only deny-by-default rules ship and everything else is judged by meaning (CL-1); each rule's action is configurable because what is dangerous depends on the user's workflow, and `allow` means "no judgment" rather than "allowed" so a configuration can never make the rule layer auto-approve a command; the cap bounds regex backtracking on long separator-free strings (#25).
 Code: `BASH_DANGER_RULES`, `DangerRule`, `parseDangerRules`, `parseDangerRuleEntry`, `classifyBash`, `rmEscapesScope`, `rmOperandsInScope`, `rmScopeBases`, `BASH_MAX_MATCH_LEN`
-Pinned by: built-in rules (RL-5, RL-6, PG) › danger regex (rm -rf) → deny, zero model calls; built-in rules (RL-5, RL-6, PG) › no built-in whitelist: ls → gray → classifier; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › danger rule set to ask: dialog with a UI, block with the grant hint headless, block in yolo without a dialog; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › action allow (or removal with false) passes no judgment: the call goes to the classifier; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › custom rule: case-insensitive by default, flags override, reason defaults; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › all hits count: a deny beats an ask and the reason names every hit of the winning action; user rules (deny > allow > gray) › bash commands longer than the match cap are truncated before rule matching
+Pinned by: built-in rules (RL-5, RL-6, PG) › danger regex (rm -rf) → deny, zero model calls; built-in rules (RL-5, RL-6, PG) › no built-in whitelist: ls → gray → classifier; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › danger rule set to ask: dialog with a UI, block with the grant hint headless, block in unattended without a dialog; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › action allow (or removal with false) passes no judgment: the call goes to the classifier; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › custom rule: case-insensitive by default, flags override, reason defaults; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › all hits count: a deny beats an ask and the reason names every hit of the winning action; user rules (deny > allow > gray) › bash commands longer than the match cap are truncated before rule matching
 Pinned by (rm-recursive scope): built-in rules (RL-5, RL-6, PG) › rm-recursive workspace/temp scope › targets inside the workspace or temp directory pass to the classifier; built-in rules (RL-5, RL-6, PG) › rm-recursive workspace/temp scope › targets outside, unresolvable, or the scope roots themselves still deny; built-in rules (RL-5, RL-6, PG) › rm-recursive workspace/temp scope › a home-directory cwd gives no workspace exemption; built-in rules (RL-5, RL-6, PG) › rm-recursive workspace/temp scope › the waiver applies at any configured action (user override to ask)
 
 #### RL-6: builtinDenyFloor
@@ -95,7 +95,7 @@ Pinned by: settings tool (ST-1–ST-5) › tool call is a mechanical allow, no c
 
 A call to the tool named `verdict_grant` is allowed by the rule layer with reason `pi-verdict permission grant tool (the user or both models approve every grant)`, without a classifier call and silently (PR-3). It sits where the `tools` allowlist sits (RL-2 step 6); like RL-8 it has no rule target (RL-3).
 
-Why: the tool's own dialog (GR-2) or yolo consensus (GR-3) is its gate; the permission to ask for permission must itself be mechanical.
+Why: the tool's own dialog (GR-2) or unattended consensus (GR-3) is its gate; the permission to ask for permission must itself be mechanical.
 Code: `classifyByRules`, `GRANT_TOOL_NAME`
 Pinned by: permission grants (GR-1–GR-6) › GR-1: the tool call itself is a mechanical allow
 
@@ -264,7 +264,7 @@ The system prompt is built from the effective verdict set of the approval mode (
 
 Why: the default three-verdict prompt is kept byte-identical so unrestricted behavior does not drift; restricted sets must reach jev through the marker (JV-3).
 Code: `classifierSystem`, `modeChoices`, `classifierPolicy`, `trustedPolicyBlock`, `classifyWithModel`
-Pinned by: approval modes › classifier prompt › yolo lists only allow/deny with the marker line; noAutoDeny only allow/ask; default carries no marker; concern question + reason (approve dialog) › the decisions body carries a typed concern question whose criteria match the vocabulary; user rules extend only the verdict
+Pinned by: approval modes › classifier prompt › unattended lists only allow/deny with the marker line; supervised only allow/ask; auto carries no marker; concern question + reason (approve dialog) › the decisions body carries a typed concern question whose criteria match the vocabulary; user rules extend only the verdict
 
 #### CL-6: Verdict prefix contract
 
@@ -302,7 +302,7 @@ Pinned by: transport selection and endpoint override › the typesafe transport 
 
 #### JV-3: Translation
 
-The jev state is the last user message of the classifier request (the transcript, CL-4). The `verdict` question is a `choice` whose criteria mirror the LLM prompt, restricted to the verdicts named by the `Allowed verdicts:` marker line (yolo: allow/deny with a no-human instruction; noAutoDeny: allow/ask with ask absorbing the deny criterion). The slice of the system prompt starting at the user-rules header (the root rule and the classification rules, RR-2) is appended to the question's instructions; the rest of the system prompt, including the existence hint, is dropped. A second `choice` question, `concern`, names the risk category; its answer is cosmetic: a known non-`none` category is appended to the reason as ` — concern: <label>`, anything else is omitted and never fails the call. The answer is synthesized into `<verdict>X</verdict> jev: X p% (confidence c%; …)`, which satisfies CL-6.
+The jev state is the last user message of the classifier request (the transcript, CL-4). The `verdict` question is a `choice` whose criteria mirror the LLM prompt, restricted to the verdicts named by the `Allowed verdicts:` marker line (unattended: allow/deny with a no-human instruction; supervised: allow/ask with ask absorbing the deny criterion). The slice of the system prompt starting at the user-rules header (the root rule and the classification rules, RR-2) is appended to the question's instructions; the rest of the system prompt, including the existence hint, is dropped. A second `choice` question, `concern`, names the risk category; its answer is cosmetic: a known non-`none` category is appended to the reason as ` — concern: <label>`, anything else is omitted and never fails the call. The answer is synthesized into `<verdict>X</verdict> jev: X p% (confidence c%; …)`, which satisfies CL-6.
 
 Why: jev treats state as data, so splicing an LLM-voiced system prompt into it would disturb its calibration; the typed reason lets the ask dialog render probabilities and the concern.
 Code: `extractState`, `buildDecisionsBody`, `parseVerdictChoices`, `verdictText`, `parseJevReason`, `USER_RULES_HEADER`, `VERDICT_CHOICES_PREFIX`
@@ -348,27 +348,27 @@ Each mode has optional jev probability thresholds (percent) that re-map a non-de
 
 | mode | rule |
 |---|---|
-| `default` | deny if P(deny) ≥ `defaultDenyThreshold`; else allow if P(allow) ≥ `defaultAllowThreshold`; else ask |
-| `yolo` | deny if P(deny) ≥ `yoloDenyThreshold`; else allow |
-| `noAutoDeny` | allow if P(allow) ≥ `noAutoDenyAllowThreshold`; else ask |
+| `auto` | deny if P(deny) ≥ `autoDenyThreshold`; else allow if P(allow) ≥ `autoAllowThreshold`; else ask |
+| `unattended` | deny if P(deny) ≥ `unattendedDenyThreshold`; else allow |
+| `supervised` | allow if P(allow) ≥ `supervisedAllowThreshold`; else ask |
 
 LLM verdicts and fallback verdicts are NEVER re-mapped.
 
 Why: a threshold must never turn a fallback's judgment into something it did not say; the global floor (CS-1) runs first.
 Code: `applyModeThresholds`
-Pinned by: approval modes › jev probability thresholds › default: defaultDenyThreshold turns an allow with 35% deny probability into a deny, recorded in the audit; approval modes › jev probability thresholds › default: unset thresholds leave jev's own choice alone; approval modes › jev probability thresholds › noAutoDeny: noAutoDenyAllowThreshold turns a 60% allow into an ask
+Pinned by: approval modes › jev probability thresholds › auto: autoDenyThreshold turns an allow with 35% deny probability into a deny, recorded in the audit; approval modes › jev probability thresholds › auto: unset thresholds leave jev's own choice alone; approval modes › jev probability thresholds › supervised: supervisedAllowThreshold turns a 60% allow into an ask
 
 #### CS-3: Cascade triggers
 
-A call enters the cascade on exactly three triggers: a demotion (CS-1); a fail-closed first layer, meaning the classifier failed both attempts (CL-7) or no classifier model resolved (CL-2); and a yolo-ask slip, meaning in `yolo` mode the first-layer verdict, after thresholds, is ask. A confident ask in any other mode goes straight to the human and does not cascade.
+A call enters the cascade on exactly three triggers: a demotion (CS-1); a fail-closed first layer, meaning the classifier failed both attempts (CL-7) or no classifier model resolved (CL-2); and an unattended-ask slip, meaning in `unattended` mode the first-layer verdict, after thresholds, is ask. A confident ask in any other mode goes straight to the human and does not cascade.
 
-Why: a confident ask is the first layer's own request for a human, so a second model call would be wasted; yolo has no human to receive it.
+Why: a confident ask is the first layer's own request for a human, so a second model call would be wasted; unattended has no human to receive it.
 Code: `adjudicate`, `runConfidenceCascade`
-Pinned by: confidence floor + cascade (#67) › a high-confidence ask goes straight to the human — no fallback call; confidence floor + cascade (#67) › no-model fail-closed: enforce + fallback rescues; no fallback denies unchanged; approval modes › yolo › enforce fallback resolves the contract slip: fallback allow runs the call (two model calls)
+Pinned by: confidence floor + cascade (#67) › a high-confidence ask goes straight to the human — no fallback call; confidence floor + cascade (#67) › no-model fail-closed: enforce + fallback rescues; no fallback denies unchanged; approval modes › unattended › enforce fallback resolves the contract slip: fallback allow runs the call (two model calls)
 
 #### CS-4: No fallback
 
-Without a configured fallback (`classifierFallbackModel` unset) a demotion becomes an ask (reason annotated with the confidence and threshold), a fail-closed keeps its deny, and a yolo slip keeps its ask, which yolo turns into a `yolo-retry` block (MD-4).
+Without a configured fallback (`classifierFallbackModel` unset) a demotion becomes an ask (reason annotated with the confidence and threshold), a fail-closed keeps its deny, and an unattended slip keeps its ask, which unattended turns into a `unattended-retry` block (MD-4).
 
 Why: uncertainty must degrade to friction, never to permission.
 Code: `runConfidenceCascade`
@@ -384,7 +384,7 @@ Pinned by: omp model roles › the verdict-fallback role beats classifierFallbac
 
 #### CS-6: Shadow mode
 
-In `classifierFallbackMode: "shadow"` (default) the fallback is consulted on triggered calls and its opinion is recorded (audit `fallback`, session counters), but it NEVER changes a verdict: a demotion still asks the human, a fail-closed deny stands, a yolo slip still blocks as `yolo-retry`.
+In `classifierFallbackMode: "shadow"` (default) the fallback is consulted on triggered calls and its opinion is recorded (audit `fallback`, session counters), but it NEVER changes a verdict: a demotion still asks the human, a fail-closed deny stands, an unattended slip still blocks as `unattended-retry`.
 
 Why: shadow-first rollout so fallback behavior can be measured against ground truth (AU-3) before it holds authority; observe-only state follows the shadow-cache discipline (AU-5); flipping to `enforce` is a human decision after about two weeks of shadow data with no ground-truth evidence of fallback false-allows ([research/classifier-fallback-model-feasibility.md](../research/classifier-fallback-model-feasibility.md)).
 Code: `runConfidenceCascade`, `FallbackCascade`
@@ -392,7 +392,7 @@ Pinned by: confidence floor + cascade (#67) › shadow + demotion: the human is 
 
 #### CS-7: Enforce mode
 
-In `classifierFallbackMode: "enforce"` the fallback's verdict applies de novo to the triggered call, including allow, whether the origin was a demotion, a fail-closed or a yolo slip. The one carve-out: a demoted first-layer deny that the fallback would allow becomes an ask, NEVER an automatic allow; headless it degrades to deny and a subagent never auto-allows it (SG-5).
+In `classifierFallbackMode: "enforce"` the fallback's verdict applies de novo to the triggered call, including allow, whether the origin was a demotion, a fail-closed or an unattended slip. The one carve-out: a demoted first-layer deny that the fallback would allow becomes an ask, NEVER an automatic allow; headless it degrades to deny and a subagent never auto-allows it (SG-5).
 
 Why: the cascade exists to absorb uncertain first-layer calls, but a first layer that said deny keeps a human veto over a second model's allow.
 Code: `runConfidenceCascade`
@@ -400,7 +400,7 @@ Pinned by: confidence floor + cascade (#67) › enforce + demotion: the fallback
 
 #### CS-8: Fallback failure
 
-If the fallback is unresolvable or both its attempts fail: in `shadow` the outcome is as CS-6 with the failure recorded as an error; in `enforce` the result is an ask with reason `fallback classifier unavailable (first layer abstained) — your call` and source `fail-closed` (headless: deny; yolo: `yolo-retry` block).
+If the fallback is unresolvable or both its attempts fail: in `shadow` the outcome is as CS-6 with the failure recorded as an error; in `enforce` the result is an ask with reason `fallback classifier unavailable (first layer abstained) — your call` and source `fail-closed` (headless: deny; unattended: `unattended-retry` block).
 
 Why: once the user configures a second layer its silent failure must not quietly degrade the gate to a single layer; the tier that was to adjudicate is down, so the human decides.
 Code: `runConfidenceCascade`
@@ -414,14 +414,16 @@ There are four approval modes. The verdict set is the set of verdicts the classi
 
 | mode | classifier verdicts | human asked |
 |---|---|---|
-| `default` | allow, ask, deny | yes |
-| `yolo` | allow, deny | never |
-| `noAutoDeny` | allow, ask | yes |
+| `auto` | allow, ask, deny | yes |
+| `unattended` | allow, deny | never |
+| `supervised` | allow, ask | yes |
 | `off` | none (ungated) | no |
 
-Why: one mode switch replaces the earlier independent master switch, `autoDeny` and confidence knobs, and adds the unattended posture they lacked.
+The modes were renamed from `default`, `yolo` and `noAutoDeny` to `auto`, `unattended` and `supervised`, and the keys `defaultDenyThreshold`, `defaultAllowThreshold`, `yoloDenyThreshold`, `noAutoDenyAllowThreshold`, `yoloDenyPaths` and `yoloOmpDir` to `autoDenyThreshold`, `autoAllowThreshold`, `unattendedDenyThreshold`, `supervisedAllowThreshold`, `unattendedDenyPaths` and `unattendedOmpDir`. A former mode value or key in a config file or a session override file is reported as renamed (`mode: "yolo" renamed to "unattended" — ignored`, `yoloDenyThreshold: renamed to unattendedDenyThreshold — key ignored`) and ignored, never mapped, so the mode falls back to `auto`.
+
+Why: one mode switch replaces the earlier independent master switch, `autoDeny` and confidence knobs, and adds the unattended posture they lacked. An ignored former value falls back to `auto`, which is stricter than both `unattended` and `supervised`, so the rename never loosens the gate.
 Code: `APPROVAL_MODES`, `modeChoices`, `adjudicate`
-Pinned by: approval modes › classifier prompt › yolo lists only allow/deny with the marker line; noAutoDeny only allow/ask; default carries no marker
+Pinned by: approval modes › classifier prompt › unattended lists only allow/deny with the marker line; supervised only allow/ask; auto carries no marker; approval mode rename (MD-1, MD-6) › a former mode value in a config file is reported and ignored: the mode falls back to auto (full three-verdict prompt); approval mode rename (MD-1, MD-6) › former threshold keys in a config file are reported and ignored; approval mode rename (MD-1, MD-6) › a former approval key in a session override file is reported and ignored
 
 #### MD-2: off
 
@@ -431,38 +433,38 @@ Why: a config file, in particular a cloned repository's project config, must nev
 Code: `tool_call` handler in `autoMode`, `loadUserRules`, `applySetting`
 Pinned by: /automode command › off actually disables gating; approval modes › scopes › "off" in a config file is ignored with a warning (session-only); autoDeny reports its replacement; denyPaths (PP-1–PP-9) › master switch off → denyPaths inert (direct pass-through)
 
-#### MD-3: default
+#### MD-3: auto
 
-In `default` a rule deny is a deny, a gate ask is an ask, and a classifier verdict stands as produced after CS-1 to CS-8: allow passes, deny blocks, ask goes to the human.
+In `auto` a rule deny is a deny, a gate ask is an ask, and a classifier verdict stands as produced after CS-1 to CS-8: allow passes, deny blocks, ask goes to the human.
 
 Why: the baseline posture; every other mode is a documented reshaping of it.
 Code: `adjudicate`
-Pinned by: approval modes › yolo › default mode keeps the terminal ask for protected paths; classifier › ask + interactive confirm → allow; headless → deny
+Pinned by: approval modes › unattended › auto mode keeps the terminal ask for protected paths; classifier › ask + interactive confirm → allow; headless → deny
 
-#### MD-4: yolo
+#### MD-4: unattended
 
-`yolo` NEVER prompts. A rule deny stays a deny, and so does a built-in ask (RL-2 step 6): the block names the rule or tier and carries the grant hint, because there is no one to ask. A `.omp` gate hit follows `yoloOmpDir` and a protected-path hit follows `yoloDenyPaths` (each `deny` by default; `allow` passes silently), with source `protected-path` and no path plaintext — except that a gate hit with built-in rule hits underneath is never passed silently: with the gate's action `allow` it is still a deny with the built-in reason (and the grant hint), because `allow` on the gate cannot waive a built-in rule. Every other ask-shaped effective outcome — a classifier ask, a demotion without enforce authority, a failed enforce fallback, a yolo-ask slip — becomes a deny block tagged `yolo-retry` that tells the agent to explain why the action is needed or rewrite it narrower; this also applies headless. A classifier deny stays a deny.
+`unattended` NEVER prompts. A rule deny stays a deny, and so does a built-in ask (RL-2 step 6): the block names the rule or tier and carries the grant hint, because there is no one to ask. A `.omp` gate hit follows `unattendedOmpDir` and a protected-path hit follows `unattendedDenyPaths` (each `deny` by default; `allow` passes silently), with source `protected-path` and no path plaintext — except that a gate hit with built-in rule hits underneath is never passed silently: with the gate's action `allow` it is still a deny with the built-in reason (and the grant hint), because `allow` on the gate cannot waive a built-in rule. Every other ask-shaped effective outcome — a classifier ask, a demotion without enforce authority, a failed enforce fallback, an unattended-ask slip — becomes a deny block tagged `unattended-retry` that tells the agent to explain why the action is needed or rewrite it narrower; this also applies headless. A classifier deny stays a deny.
 A remembered approval (PR-9) is the exception: it passes the identical call before these outcomes, a built-in ask and a gate hit with built-in hits underneath included, because the human already answered that exact call.
 
 Why: long unattended runs still want the deterministic floor and a classifier, without uncertain calls collapsing into a bare deny the agent cannot learn from.
-Code: `adjudicate`, `YOLO_RETRY_SUFFIX`, `presentVerdict`
-Pinned by: approval modes › yolo › an ask from the classifier becomes an explain-or-rewrite block, never a prompt; approval modes › yolo › rule denies stay denies; the floor is untouched; approval modes › yolo › protected paths: denied by default with no path plaintext; yoloDenyPaths allow passes silently; approval modes › yolo › .omp gate follows yoloOmpDir, independent of yoloDenyPaths
+Code: `adjudicate`, `UNATTENDED_RETRY_SUFFIX`, `presentVerdict`
+Pinned by: approval modes › unattended › an ask from the classifier becomes an explain-or-rewrite block, never a prompt; approval modes › unattended › rule denies stay denies; the floor is untouched; approval modes › unattended › protected paths: denied by default with no path plaintext; unattendedDenyPaths allow passes silently; approval modes › unattended › .omp gate follows unattendedOmpDir, independent of unattendedDenyPaths
 
-#### MD-5: noAutoDeny
+#### MD-5: supervised
 
-With a UI, `noAutoDeny` turns every effective deny — built-in rule, user deny, classifier deny, fail-closed, no-model — into an ask whose reason ends ` (noAutoDeny: this would have been denied — your call)`; such an ask resolves to deny for a subagent (SG-5). Without a UI the deny stands. Gate asks and built-in asks stay asks.
+With a UI, `supervised` turns every effective deny — built-in rule, user deny, classifier deny, fail-closed, no-model — into an ask whose reason ends ` (supervised: this would have been denied — your call)`; such an ask resolves to deny for a subagent (SG-5). Without a UI the deny stands. Gate asks and built-in asks stay asks.
 
 Why: it keeps the earlier `autoDeny: false` behavior (every automatic deny is reviewable by the human) under the single mode switch.
-Code: `adjudicate`, `NO_AUTO_DENY_SUFFIX`
-Pinned by: approval modes › noAutoDeny › a rule deny becomes an ask carrying the suffix; declining blocks; approval modes › noAutoDeny › a classifier deny becomes an ask; headless still denies
+Code: `adjudicate`, `SUPERVISED_SUFFIX`
+Pinned by: approval modes › supervised › a rule deny becomes an ask carrying the suffix; declining blocks; approval modes › supervised › a classifier deny becomes an ask; headless still denies
 
 #### MD-6: Setting a mode
 
-The mode is set by the `--verdict-mode` flag (seeds the session scope at session start; an invalid value warns and is ignored), `/automode <mode>` (case-insensitive), the settings panel, and the cycle shortcut (default `ctrl+shift+y`; order `default → yolo → noAutoDeny → off → default`). All of them write session scope. `mode` can also be set in a global or project file (CF-4), except `off`.
+The mode is set by the `--verdict-mode` flag (seeds the session scope at session start; an invalid value warns and is ignored), `/automode <mode>` (case-insensitive), the settings panel, and the cycle shortcut (default `ctrl+shift+y`; order `auto → unattended → supervised → off → auto`). All of them write session scope. `mode` can also be set in a global or project file (CF-4), except `off`. A former mode name (`default`, `yolo`, `noAutoDeny`) passed to `--verdict-mode` or `/automode` warns `renamed to <new>` and changes nothing.
 
 Why: the session layer is persisted per session id so a mode choice survives a restart of that session (CF-5).
 Code: `parseModeArg`, `setSessionSetting`, the `automode` command and shortcut in `autoMode`
-Pinned by: approval modes › scopes › --verdict-mode seeds the session scope; an invalid value warns and is ignored; toggle shortcut › handler cycles default → yolo → noAutoDeny → off → default silently
+Pinned by: approval modes › scopes › --verdict-mode seeds the session scope; an invalid value warns and is ignored; toggle shortcut › handler cycles auto → unattended → supervised → off → auto silently; approval mode rename (MD-1, MD-6) › --verdict-mode with a former mode name warns 'renamed to' and the mode stays auto; approval mode rename (MD-1, MD-6) › /automode with a former mode name warns 'renamed to' and leaves the mode unchanged
 
 ## PR: Outcome and presentation
 
@@ -480,16 +482,16 @@ A blocked call returns `[auto-mode <tag> block] BLOCKED — this action did NOT 
 
 | tag | meaning |
 |---|---|
-| `rule` | built-in rule (deny, or ask resolved to deny headless or by yolo) or user `deny` |
+| `rule` | built-in rule (deny, or ask resolved to deny headless or by unattended) or user `deny` |
 | `classifier` | classifier verdict, including a classifier failure (CL-7) |
 | `fail-closed` | no classifier model, or an unavailable enforce fallback with nobody to ask |
-| `protected-path` | gate ask denied headless or by yolo (MD-4) |
-| `yolo-retry` | yolo's stand-in for an ask (MD-4) |
+| `protected-path` | gate ask denied headless or by unattended (MD-4) |
+| `unattended-retry` | unattended's stand-in for an ask (MD-4) |
 | `user-declined` | the human declined an ask (PR-4) |
 | `subagent-auto` | a subagent ask resolved without a human and not approved (SG-4) |
 | `subagent-cancelled` | the subagent run was cancelled while awaiting approval (SG-2) |
 
-The tags `classifier`, `yolo-retry` and `user-declined` end the block reason with ` If this action is required, request a permission grant with verdict_grant (describe the exact operation and scope).` (GR-6). Rule, fail-closed, protected-path and subagent blocks do not carry it: a grant cannot lift them.
+The tags `classifier`, `unattended-retry` and `user-declined` end the block reason with ` If this action is required, request a permission grant with verdict_grant (describe the exact operation and scope).` (GR-6). Rule, fail-closed, protected-path and subagent blocks do not carry it: a grant cannot lift them.
 
 Why: structured error signaling does not reach every provider lane, and verbatim rule or classifier reasons can be empty or too terse for the acting model to recognize a block (#53).
 Code: `blockedReason`, `presentVerdict`
@@ -547,11 +549,11 @@ Pinned by: footer status › counters count the final verdict: mechanical deny a
 
 #### PR-9: Remembered approval
 
-Every interactive ask dialog except the permission-grant dialog offers "Yes, and don't ask again this session" as its second row. Choosing it allows the call and remembers it for the session in memory: the key is the ask origin (rule-layer deny, built-in ask, gate ask, gray), the tool name, the exact input and the cwd. A later call with the same key is allowed right after the rule layer, without a classifier call or a dialog, in every approval mode; a rule-layer deny is overridden only in `noAutoDeny`. A remembered allow is not audited and notifies only in debug. The footer shows the count; `/automode forget` or the `/automode` panel clears all; a new session starts empty (`/verdict` and `/automode <mode>` reloads keep it). The plain confirm fallback cannot remember.
+Every interactive ask dialog except the permission-grant dialog offers "Yes, and don't ask again this session" as its second row. Choosing it allows the call and remembers it for the session in memory: the key is the ask origin (rule-layer deny, built-in ask, gate ask, gray), the tool name, the exact input and the cwd. A later call with the same key is allowed right after the rule layer, without a classifier call or a dialog, in every approval mode; a rule-layer deny is overridden only in `supervised`. A remembered allow is not audited and notifies only in debug. The footer shows the count; `/automode forget` or the `/automode` panel clears all; a new session starts empty (`/verdict` and `/automode <mode>` reloads keep it). The plain confirm fallback cannot remember.
 
 Why: repeated identical calls (a build, a test run) otherwise prompt every time; keying on the origin keeps a later deny rule, `denyPaths` entry or built-in ask from being bypassed by an earlier approval.
 Code: `approvalKey`, `SessionState.rememberApproval`, `adjudicate`, `presentVerdict`
-Pinned by: remembered approval (PR-9) › remember row on a gray ask: identical call skips classifier and dialog; remembered approval (PR-9) › plain Yes is not remembered; remembered approval (PR-9) › protected-path ask offers the row; remembered without leaking the path; remembered approval (PR-9) › grant dialog has no remember row; remembered approval (PR-9) › applies in yolo: the identical call passes without a classifier call; remembered approval (PR-9) › rule deny wins outside noAutoDeny; the key carries the ask origin; remembered approval (PR-9) › built-in ask: remembered in default, still passes in yolo for the exact call only; remembered approval (PR-9) › /automode forget clears the count and the call asks again; remembered approval (PR-9) › session_start forgets
+Pinned by: remembered approval (PR-9) › remember row on a gray ask: identical call skips classifier and dialog; remembered approval (PR-9) › plain Yes is not remembered; remembered approval (PR-9) › protected-path ask offers the row; remembered without leaking the path; remembered approval (PR-9) › grant dialog has no remember row; remembered approval (PR-9) › applies in unattended: the identical call passes without a classifier call; remembered approval (PR-9) › rule deny wins outside supervised; the key carries the ask origin; remembered approval (PR-9) › built-in ask: remembered in auto, still passes in unattended for the exact call only; remembered approval (PR-9) › /automode forget clears the count and the call asks again; remembered approval (PR-9) › session_start forgets
 
 ## SG: Subagent gate
 
@@ -589,11 +591,11 @@ Pinned by: subagent gate (omp ctx.agent.kind = sub) › normal: unanswered past 
 
 #### SG-5: Never auto-allowed
 
-Asks that did not come from the classifier NEVER auto-allow (`autoResolve: "deny"`): protected-path and `.omp` gate asks, rule or fail-closed asks, and asks created by `noAutoDeny` from an effective deny. A demoted first-layer deny that the fallback would allow is never auto-allowed either (CS-7).
+Asks that did not come from the classifier NEVER auto-allow (`autoResolve: "deny"`): protected-path and `.omp` gate asks, rule or fail-closed asks, and asks created by `supervised` from an effective deny. A demoted first-layer deny that the fallback would allow is never auto-allowed either (CS-7).
 
 Why: a declaration's exception belongs to the declaring user; a first-layer deny keeps a human veto.
 Code: `adjudicate`, `resolveAskWithoutHuman`
-Pinned by: subagent gate (omp ctx.agent.kind = sub) › asks that did not come from the classifier never auto-allow (protected path, .omp, noAutoDeny); subagent gate (omp ctx.agent.kind = sub) › CS-7 carve-out holds for subagents: a demoted first-layer deny is never auto-allowed
+Pinned by: subagent gate (omp ctx.agent.kind = sub) › asks that did not come from the classifier never auto-allow (protected path, .omp, supervised); subagent gate (omp ctx.agent.kind = sub) › CS-7 carve-out holds for subagents: a demoted first-layer deny is never auto-allowed
 
 #### SG-6: omp handler timeout
 
@@ -639,7 +641,7 @@ Pinned by: /verdict config editor › local: first add copies the global list, n
 
 #### CF-5: Session scope
 
-Session overrides live in `<agentDir>/config/pi-verdict-sessions/<sessionId>.json` (a session id outside `[A-Za-z0-9._-]` is kept in memory only). A session file may set only `SESSION_KEYS` — `mode`, `confidenceThreshold`, the four jev thresholds, `yoloDenyPaths`, `yoloOmpDir`, `classifierFallbackMode`, `gateOmpDir`, `footer`, `modeStatus`, `grantStatus` — the rule maps `dangerRules` and `pathRules` (merged per id over local and global, CF-4), and `ruleAdditions`, whose `allow`, `deny`, `denyPaths`, `tools` and `rules` lists APPEND to the merged lists, and `grants`, the active permission grants (GR-6). Any other key is skipped with a warning. Precedence for every session key is session > local > global > default. The 50 newest session files are kept; new and forked sessions start without overrides.
+Session overrides live in `<agentDir>/config/pi-verdict-sessions/<sessionId>.json` (a session id outside `[A-Za-z0-9._-]` is kept in memory only). A session file may set only `SESSION_KEYS` — `mode`, `confidenceThreshold`, the four jev thresholds, `unattendedDenyPaths`, `unattendedOmpDir`, `classifierFallbackMode`, `gateOmpDir`, `footer`, `modeStatus`, `grantStatus` — the rule maps `dangerRules` and `pathRules` (merged per id over local and global, CF-4), and `ruleAdditions`, whose `allow`, `deny`, `denyPaths`, `tools` and `rules` lists APPEND to the merged lists, and `grants`, the active permission grants (GR-6). Any other key is skipped with a warning. Precedence for every session key is session > local > global > default. The 50 newest session files are kept; new and forked sessions start without overrides.
 
 Why: the right value differs per project and per session; the session file is kept apart from the audit directory and the trust store.
 Code: `SESSION_KEYS`, `sanitizeSessionRaw`, `applyRuleAdditions`, `writeSessionOverrides`, `pruneSessionOverrides`, `settingSourcesOf`
@@ -655,7 +657,7 @@ Pinned by: approval modes › scopes › invalid approval values skip with a war
 
 #### CF-7: Removed keys
 
-`autoDeny` (replaced by `mode: "noAutoDeny"`), `classifierMinConfidence` and `classifierFallbackConfidence` (both renamed `confidenceThreshold`) are ignored with a warning naming their replacement.
+`autoDeny` (replaced by `mode: "supervised"`), `classifierMinConfidence` and `classifierFallbackConfidence` (both renamed `confidenceThreshold`) are ignored with a warning naming their replacement.
 
 Why: clean cutover without aliases (breaking change of the approval-mode rework).
 Code: `loadUserRules`
@@ -681,7 +683,7 @@ Pinned by: audit verdict records (#54) › rule-layer verdicts stay unaudited; p
 
 #### AU-2: Top-level semantics
 
-A record's top-level `verdict`, `reason` and `source` are the first layer's; the verdict actually applied under `enforce` lives in `fallback.effective`. A headless ask of any origin, and a yolo `yolo-retry` block, are recorded as their effective deny (the headless one with `degraded: true`). A fired floor sets `demoted: true`; threshold re-mapping sets `thresholdVerdict`; the record carries the approval `mode`.
+A record's top-level `verdict`, `reason` and `source` are the first layer's; the verdict actually applied under `enforce` lives in `fallback.effective`. A headless ask of any origin, and an unattended `unattended-retry` block, are recorded as their effective deny (the headless one with `degraded: true`). A fired floor sets `demoted: true`; threshold re-mapping sets `thresholdVerdict`; the record carries the approval `mode`.
 
 Why: keeping first-layer semantics at the top level keeps shadow and enforce corpora comparable and old analysis scripts working; evaluators must read enforce rows through `fallback`.
 Code: `adjudicate`, `FallbackAudit`, `AuditRecord`
@@ -785,7 +787,7 @@ Pinned by: settings tool (ST-1–ST-5) › invalid value is rejected before the 
 
 Every change (`set`, `unset`, `add`, `remove`) opens a confirmation dialog in every approval mode, showing scope and file, key, action, the stored value before and after, notes and the agent's reason. Nothing is written unless the user approves; a decline, an aborted signal or a dialog error writes nothing and the tool reports the decline as a normal result.
 
-Why: agent-initiated policy changes weaken or tighten the gate the agent runs under, so the user decides every one (security principle 8); the dialog is the tool's own approval, not a gate ask, so yolo does not skip it.
+Why: agent-initiated policy changes weaken or tighten the gate the agent runs under, so the user decides every one (security principle 8); the dialog is the tool's own approval, not a gate ask, so unattended does not skip it.
 Code: the `execute` handler registered as `SETTINGS_TOOL_NAME` in `autoMode`
 Pinned by: settings tool (ST-1–ST-5) › approved set writes the global config; settings tool (ST-1–ST-5) › declined change writes nothing
 
@@ -825,19 +827,19 @@ Pinned by: permission grants (GR-1–GR-6) › GR-1: mode off answers NA to ever
 
 #### GR-2: Human approval
 
-In `default` and `noAutoDeny` a request opens the grant dialog with I approve, I reject and Ask for clarification or revision (the last is an inline text field; empty text leaves the dialog open). Approval creates grant `G<n>` (ids are never reused within a session) with `grantedBy: "user"`. Reject answers `Rejected by the user` and tells the agent not to repeat the request; clarify returns the user's text to the agent and grants nothing. Without a UI the request is rejected, and a dialog failure or abort grants nothing. Hosts without the rich dialog use a plain select (plus an input for the clarification). The dialog never offers Explain… (PP-9).
+In `auto` and `supervised` a request opens the grant dialog with I approve, I reject and Ask for clarification or revision (the last is an inline text field; empty text leaves the dialog open). Approval creates grant `G<n>` (ids are never reused within a session) with `grantedBy: "user"`. Reject answers `Rejected by the user` and tells the agent not to repeat the request; clarify returns the user's text to the agent and grants nothing. Without a UI the request is rejected, and a dialog failure or abort grants nothing. Hosts without the rich dialog use a plain select (plus an input for the clarification). The dialog never offers Explain… (PP-9).
 
-Why: a grant widens what the classifiers may allow, so only a human, or in yolo a model consensus (GR-3), may create one.
+Why: a grant widens what the classifiers may allow, so only a human, or in unattended a model consensus (GR-3), may create one.
 Code: `confirmGrant`, `buildApproveDialog` (variant `grant`)
 Pinned by: permission grants (GR-1–GR-6) › GR-2: reject, and clarify with text, grant nothing; permission grants (GR-1–GR-6) › GR-2: clarify with empty input returns to the choices; permission grants (GR-1–GR-6) › GR-2: rich dialog lists the three choices; an empty clarification row keeps it open until text is typed
 
-#### GR-3: Yolo consensus
+#### GR-3: Unattended consensus
 
-In `yolo` nothing prompts: the judge classifier reviews the request (the task paragraph `Grant review`, choices allow/deny; the request, its paths and its rule ids are the whole brief, and a grant that names built-in rules or paths needs the narrowest scope that serves the request), and a configured `classifierFallbackModel` must also allow, regardless of `classifierFallbackMode`. Both allow → the grant is created with `grantedBy: "classifier"`; any deny, error, a missing model or a missing allow → rejected with nothing granted. The existence hint of PP-7 is not sent: the request and the grants are the whole brief.
+In `unattended` nothing prompts: the judge classifier reviews the request (the task paragraph `Grant review`, choices allow/deny; the request, its paths and its rule ids are the whole brief, and a grant that names built-in rules or paths needs the narrowest scope that serves the request), and a configured `classifierFallbackModel` must also allow, regardless of `classifierFallbackMode`. Both allow → the grant is created with `grantedBy: "classifier"`; any deny, error, a missing model or a missing allow → rejected with nothing granted. The existence hint of PP-7 is not sent: the request and the grants are the whole brief.
 
-Why: yolo has no human, so a grant needs two independent agreements rather than the agent's say-so.
+Why: unattended has no human, so a grant needs two independent agreements rather than the agent's say-so.
 Code: `grantConsensus`, `GRANT_REVIEW_TASK`
-Pinned by: permission grants (GR-1–GR-6) › GR-3: yolo grants only when the judge allows; a configured fallback must allow as well
+Pinned by: permission grants (GR-1–GR-6) › GR-3: unattended grants only when the judge allows; a configured fallback must allow as well
 
 #### GR-4: Authority in classifier prompts
 
@@ -849,19 +851,27 @@ Pinned by: permission grants (GR-1–GR-6) › GR-2/GR-4/GR-6: approved grant is
 
 #### GR-5: Coverage check
 
-A grant may list protected-path access entries (`paths`) and danger-rule ids (`rules`). When a call would be a terminal ask because of `denyPaths` (PP-5) or the `.omp` gate (PP-8), or has built-in rule hits that make it a deny or an ask (RL-5, PG-3–PG-5), and at least one active grant could apply, the coverage check runs before the ask or deny (and before the yolo outcome of MD-4). A grant covers the call only if every protected path the call touches lies under one of its entries (segment boundary, base forms, PP-3/PP-4) and the access fits (a command tool accepts any access level, `write` and `edit` need `write` or `full`, every other file tool needs `read` or `full`), and every danger-rule hit's id is among its `rules`; a built-in path-tier hit is covered by a path entry that contains the path (the same entry rule). Several grants may cover different parts of one call (a command touching a `denyPaths` entry and a `.omp` directory needs both covered). If no grant covers every touch or hit the call asks or is denied as before (a built-in deny whose block text carries the grant hint) and no model is called. Otherwise the judge, and a configured fallback, are asked once each with the call, the covering grants and their paths and rule ids (task paragraph `Coverage check`, choices allow/ask); both must answer allow for the call to pass, any other outcome keeps the ask or deny. A passing call is allowed with reason `permission grant <ids> covers this gated access`, recorded in the audit log (AU-1) with source `protected-path` and silent outside debug (PR-3). A grant never lifts a user `deny` rule (RL-2 step 1).
+A grant may list protected-path access entries (`paths`) and danger-rule ids (`rules`). When a call would be a terminal ask because of `denyPaths` (PP-5) or the `.omp` gate (PP-8), or has built-in rule hits that make it a deny or an ask (RL-5, PG-3–PG-5), and at least one active grant could apply, the coverage check runs before the ask or deny (and before the unattended outcome of MD-4). A grant covers the call only if every protected path the call touches lies under one of its entries (segment boundary, base forms, PP-3/PP-4) and the access fits (a command tool accepts any access level, `write` and `edit` need `write` or `full`, every other file tool needs `read` or `full`), and every danger-rule hit's id is among its `rules`; a built-in path-tier hit is covered by a path entry that contains the path (the same entry rule). Several grants may cover different parts of one call (a command touching a `denyPaths` entry and a `.omp` directory needs both covered). If no grant covers every touch or hit the call asks or is denied as before (a built-in deny whose block text carries the grant hint) and no model is called. Otherwise the judge, and a configured fallback, are asked once each with the call, the covering grants and their paths and rule ids (task paragraph `Coverage check`, choices allow/ask); both must answer allow for the call to pass, any other outcome keeps the ask or deny. A passing call is allowed with reason `permission grant <ids> covers this gated access`, recorded in the audit log (AU-1) with source `protected-path` and silent outside debug (PR-3). A grant never lifts a user `deny` rule (RL-2 step 1).
 
 Why: a protected path is a user-declared boundary and a built-in rule is the gate's own claim, so lifting either for one call needs the user's own approval of the path or rule (GR-2) plus two checks that this call is within it; an uncovered call must not leak the path to a model.
 Code: `coveringGrants`, `denyPathHits`, `ompTouches`, `grantConsensus`, `GRANT_COVERAGE_TASK`, `adjudicate`
-Pinned by: permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › without a covering grant a protected-path read asks the user, with no model call; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a covering read grant lets the scope check allow the read without asking; the reason and notices carry no path; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › an access level that does not fit never reaches a model: write with a read grant asks; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a command touching a denyPath and a .omp path is not coverable when only the .omp path is granted; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › the scope check answering ask falls back to today's ask; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › headless, an uncovered or refused protected-path call still denies; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a grant naming the rule id lets the scope check lift the built-in deny; judge ask keeps the block with the hint; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a grant without the id does not cover the rule: deny with no model call; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a rule set to ask is liftable the same way (headless included); permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a path grant covers its built-in tier at a fitting access level only; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › yolo: a gate whose yolo action is allow still refuses a built-in ask underneath
+Pinned by: permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › without a covering grant a protected-path read asks the user, with no model call; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a covering read grant lets the scope check allow the read without asking; the reason and notices carry no path; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › an access level that does not fit never reaches a model: write with a read grant asks; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › a command touching a denyPath and a .omp path is not coverable when only the .omp path is granted; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › the scope check answering ask falls back to today's ask; permission grants (GR-1–GR-6) › protected-path coverage (GR-5) › headless, an uncovered or refused protected-path call still denies; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a grant naming the rule id lets the scope check lift the built-in deny; judge ask keeps the block with the hint; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a grant without the id does not cover the rule: deny with no model call; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a rule set to ask is liftable the same way (headless included); permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › a path grant covers its built-in tier at a fitting access level only; permission grants (GR-1–GR-6) › built-in rules and path tiers (GR-5) › unattended: a gate whose unattended action is allow still refuses a built-in ask underneath
 
 #### GR-6: Lifetime, revocation and visibility
 
-Grants live in the session scope (`grants` in the session file, CF-5), survive a restart of the same session and are absent in other sessions; malformed stored entries are dropped with one notice. The agent releases its own grants; the user lists and revokes them with `/grants` (`list`, `revoke <id>`, `revoke all`, or an interactive menu with a confirmation). A revocation sends the agent a `verdict-grant-revoked` message naming the ids. While grants exist the footer shows the count (`\uF084 n` full, `🔑 n` compact) and, on hosts with a status bar, an extra `🔑 n` entry; the `grantStatus` switch (default on, session-scopable) controls the latter. With no grants nothing is rendered, byte-identical to a build without the feature. A block of tag `classifier`, `yolo-retry` or `user-declined` tells the agent it may request a grant (PR-2).
+Grants live in the session scope (`grants` in the session file, CF-5), survive a restart of the same session and are absent in other sessions; malformed stored entries are dropped with one notice. The agent releases its own grants; the user lists and revokes them with `/grants` (`list`, `revoke <id>`, `revoke all`, or an interactive menu with a confirmation). A revocation sends the agent a `verdict-grant-revoked` message naming the ids. While grants exist the footer shows the count (`\uF084 n` full, `🔑 n` compact) and, on hosts with a status bar, an extra `🔑 n` entry; the `grantStatus` switch (default on, session-scopable) controls the latter. With no grants nothing is rendered, byte-identical to a build without the feature. A block of tag `classifier`, `unattended-retry` or `user-declined` tells the agent it may request a grant (PR-2).
 
 Why: a grant is as sensitive as a rule, so it is visible, revocable and bounded by the session; the agent must also learn when a grant disappears under it.
 Code: `setGrants`, `revokeGrants`, `renderFooter`, `refreshStatus`, `GRANT_STATUS_KEY`, the `grants` command
 Pinned by: permission grants (GR-1–GR-6) › GR-6: release removes the grant from the next prompt; an unknown id throws; ids are not reused; permission grants (GR-1–GR-6) › GR-6: /grants revoke removes the grant and tells the agent; /grants lists; permission grants (GR-1–GR-6) › GR-6: /grants menu revokes a picked grant after confirmation, and revoke all clears the rest; permission grants (GR-1–GR-6) › GR-6: grants survive a restart of the same session id and not a different one; malformed entries are dropped with a notice; permission grants (GR-1–GR-6) › status surfaces (GR-6) › full footer shows the grant count only while grants exist and is byte-identical to the featureless render at 0; permission grants (GR-1–GR-6) › status surfaces (GR-6) › compact footer shows the grant count only while grants exist and is byte-identical to the featureless render at 0; permission grants (GR-1–GR-6) › status surfaces (GR-6) › prompt status bar (omp): 🔑 N while grants exist; grantStatus:false, mode off and zero grants clear it
+
+#### GR-7: Gate briefing
+
+On every agent turn (`before_agent_start`, chained on both hosts: pi `systemPrompt` is a string, omp a list of sections) the gate appends a `## Permission gate (pi-verdict)` section to the acting agent's system prompt. It says that every tool call is checked and that a blocked call starts with `[auto-mode <tag> block] BLOCKED` and did not run; names the approval mode (a gated subagent in `subagentGate: "auto"` is also told a model decides its approvals); lists the effective danger rules with action `deny` and with action `ask` as `id (reason)` (built-in and custom, never the pattern); lists every path tier whose action is not `allow`; gives the number of `denyPaths` entries without any path (PP-6); mentions the `.omp` gate when `gateOmpDir` is on; and tells the agent not to retry, rephrase, split or encode a blocked call but to request a `verdict_grant` (main agent) or to report the need in its final output (subagent, which cannot call the tool). The main agent is also pointed to `verdict_settings get` before it claims a rule blocks something. The section is omitted (prompt untouched) when the mode is `off`, or for a subagent while `subagentGate` is `off`, the same conditions under which the `tool_call` gate is inert, and when `systemPrompt` has an unknown shape. It holds nothing that changes within a session besides mode and rules (no grant ids), so the prompt stays cacheable; there is no switch to turn it off.
+
+Why: the agent must learn the boundaries and the grant channel before it hits them, not after repeated blocks.
+Code: `gateBriefing`, `GATE_BRIEFING_HEADER`, the `before_agent_start` handler
+Pinned by: gate briefing (GR-7) › default rules: appends the briefing to a string system prompt, lists deny rules and tiers, names verdict_grant; gate briefing (GR-7) › omp array system prompt gets one appended section; gate briefing (GR-7) › dangerRules action ask moves the rule to the approval line; gate briefing (GR-7) › mode off and an ungated subagent get no briefing; gate briefing (GR-7) › a gated subagent is told to report instead of requesting a grant
 
 ## Decision tables
 
@@ -869,28 +879,28 @@ Pinned by: permission grants (GR-1–GR-6) › GR-6: release removes the grant f
 
 Each cell is interactive / headless. `off` evaluates nothing (MD-2).
 
-| Row | `default` | `yolo` | `noAutoDeny` |
+| Row | `auto` | `unattended` | `supervised` |
 |---|---|---|---|
 | floor or user deny (RL-2, RL-5) | deny / deny | deny / deny | ask / deny |
-| `.omp` gate hit (PP-8) | ask / deny | `yoloOmpDir` (MD-4) | ask / deny |
-| denyPaths hit (PP-5) | ask / deny | `yoloDenyPaths` (MD-4) | ask / deny |
+| `.omp` gate hit (PP-8) | ask / deny | `unattendedOmpDir` (MD-4) | ask / deny |
+| denyPaths hit (PP-5) | ask / deny | `unattendedDenyPaths` (MD-4) | ask / deny |
 | `.omp` or denyPaths hit covered by a grant, judge and fallback both allow (GR-5) | allow | allow | allow |
 | rule allow: user allow, path-grading allow, `tools`, empty command (RL-2) | allow | allow | allow |
 | classifier allow | allow | allow | allow |
-| classifier ask | ask / deny | `yolo-retry` block (after the yolo-ask cascade, CS-3) | ask / deny |
+| classifier ask | ask / deny | `unattended-retry` block (after the unattended-ask cascade, CS-3) | ask / deny |
 | classifier deny | deny | deny | ask / deny |
 | fail-closed, no fallback (CS-4) | deny | deny | ask / deny |
-| demotion, no fallback (CS-4) | ask / deny | `yolo-retry` block | ask / deny |
+| demotion, no fallback (CS-4) | ask / deny | `unattended-retry` block | ask / deny |
 
 ### Table B: cascade outcome by trigger and fallback mode
 
-Outcome applied to the triggered call; an ask result degrades to deny headless (PR-1) and to a `yolo-retry` block in yolo (MD-4).
+Outcome applied to the triggered call; an ask result degrades to deny headless (PR-1) and to a `unattended-retry` block in unattended (MD-4).
 
 | Trigger | `shadow` (CS-6) | `enforce` (CS-7) | `enforce`, fallback failure (CS-8) |
 |---|---|---|---|
 | demotion (CS-1) | ask; opinion recorded | the fallback verdict; a fallback allow over a demoted first-layer deny becomes ask | ask (`fallback classifier unavailable …`) |
 | fail-closed (CS-3) | deny stands; opinion recorded | the fallback verdict de novo, including allow | ask (`fallback classifier unavailable …`) |
-| yolo-ask (CS-3) | ask stands → `yolo-retry` block | the fallback verdict (ask → `yolo-retry` block) | ask → `yolo-retry` block |
+| unattended-ask (CS-3) | ask stands → `unattended-retry` block | the fallback verdict (ask → `unattended-retry` block) | ask → `unattended-retry` block |
 
 With no fallback configured every cell reads as CS-4. In `shadow`, a fallback failure leaves the outcome unchanged and is recorded as an error.
 
@@ -901,6 +911,6 @@ Rows are the origin of the ask (SG-4, SG-5); `consult` means the fallback model 
 | Ask origin | `normal`, answered | `normal`, timeout or no root UI | `auto` |
 |---|---|---|---|
 | protected-path or `.omp` gate ask | human decides | deny | deny |
-| rule or fail-closed ask; ask created by `noAutoDeny` from a deny | human decides | deny | deny |
+| rule or fail-closed ask; ask created by `supervised` from a deny | human decides | deny | deny |
 | classifier ask, no fallback consulted yet | human decides | consult | consult |
 | classifier-origin ask, cascade already consulted the fallback | human decides | the fallback's `allow` allows; anything else denies; a demoted first-layer deny never allows (CS-7) | same as timeout |

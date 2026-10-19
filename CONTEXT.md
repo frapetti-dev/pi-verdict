@@ -13,7 +13,7 @@ Rules: [RL-2](docs/adjudication-rules.md#rl-2-evaluation-order), [CL-1](docs/adj
 
 **Auto Mode**:
 The allow-unless-intercepted posture: a tool call passes unless the rule layer or the classifier intercepts it, the reverse of Claude Code's prompt-unless-approved default.
-_Avoid_: YOLO (for the posture; `yolo` names one approval mode)
+_Avoid_: YOLO; "auto mode" for the `auto` approval mode (say "the `auto` mode")
 Rules: [MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets)
 
 **Tool call**:
@@ -43,9 +43,9 @@ _Avoid_: verdict pipeline, judgment pipeline
 Rules: [RL-2](docs/adjudication-rules.md#rl-2-evaluation-order), [CL-1](docs/adjudication-rules.md#cl-1-gray-zone), [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers), [MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets)
 
 **Approval mode**:
-The overall posture of the gate for a session: `default`, `yolo`, `noAutoDeny` or `off`.
-_Avoid_: master switch, autoDeny
-Rules: [MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets), [MD-2](docs/adjudication-rules.md#md-2-off), [MD-3](docs/adjudication-rules.md#md-3-default), [MD-4](docs/adjudication-rules.md#md-4-yolo), [MD-5](docs/adjudication-rules.md#md-5-noautodeny), [MD-6](docs/adjudication-rules.md#md-6-setting-a-mode)
+The overall posture of the gate for a session: `auto`, `unattended`, `supervised` or `off`.
+_Avoid_: master switch, autoDeny, default, yolo, noAutoDeny (former mode names)
+Rules: [MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets), [MD-2](docs/adjudication-rules.md#md-2-off), [MD-3](docs/adjudication-rules.md#md-3-auto), [MD-4](docs/adjudication-rules.md#md-4-unattended), [MD-5](docs/adjudication-rules.md#md-5-supervised), [MD-6](docs/adjudication-rules.md#md-6-setting-a-mode)
 
 ### Rule layer
 
@@ -67,7 +67,7 @@ One of the built-in grades of the path-grading part of the built-in rules (`s0-s
 Rules: [PG-3](docs/adjudication-rules.md#pg-3-s0-secrets), [PG-4](docs/adjudication-rules.md#pg-4-reads), [PG-5](docs/adjudication-rules.md#pg-5-writes)
 
 **Rule action**:
-What a matching built-in rule does: `deny` blocks, `ask` asks the user (a deny headless or in `yolo`), `allow` passes no judgment so the call goes to the classifier.
+What a matching built-in rule does: `deny` blocks, `ask` asks the user (a deny headless or in `unattended`), `allow` passes no judgment so the call goes to the classifier.
 _Avoid_: verdict (that is the final allow/ask/deny of the pipeline)
 Rules: [RL-5](docs/adjudication-rules.md#rl-5-danger-rules), [RL-6](docs/adjudication-rules.md#rl-6-builtindenyfloor)
 
@@ -201,7 +201,7 @@ The escalation of a triggered call from the first layer to the fallback classifi
 Rules: [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers), [CS-4](docs/adjudication-rules.md#cs-4-no-fallback)
 
 **Cascade trigger**:
-One of the three events that start the cascade: a demotion, a fail-closed first layer, a yolo-ask slip.
+One of the three events that start the cascade: a demotion, a fail-closed first layer, an unattended-ask slip.
 Rules: [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers)
 
 **Shadow fallback mode**:
@@ -212,9 +212,9 @@ Rules: [CS-6](docs/adjudication-rules.md#cs-6-shadow-mode)
 The fallback mode in which the fallback classifier's verdict applies to the triggered call, with one carve-out for a demoted deny.
 Rules: [CS-7](docs/adjudication-rules.md#cs-7-enforce-mode), [CS-8](docs/adjudication-rules.md#cs-8-fallback-failure)
 
-**yolo-ask slip**:
-A first-layer ask in `yolo` mode, where no human exists to receive it.
-Rules: [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers), [MD-4](docs/adjudication-rules.md#md-4-yolo)
+**unattended-ask slip**:
+A first-layer ask in `unattended` mode, where no human exists to receive it.
+Rules: [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers), [MD-4](docs/adjudication-rules.md#md-4-unattended)
 
 ### Outcomes
 
@@ -227,15 +227,15 @@ The default outcome when the gate cannot establish an answer: the call is blocke
 Rules: [CL-7](docs/adjudication-rules.md#cl-7-attempts-timeouts-fail-closed), [JV-4](docs/adjudication-rules.md#jv-4-confidence-is-required), [CS-4](docs/adjudication-rules.md#cs-4-no-fallback), [CS-8](docs/adjudication-rules.md#cs-8-fallback-failure)
 
 **Explain-or-rewrite block**:
-The block `yolo` returns in place of an ask, asking the agent to justify the action or rewrite it more narrowly.
-Rules: [MD-4](docs/adjudication-rules.md#md-4-yolo)
+The block `unattended` returns in place of an ask, asking the agent to justify the action or rewrite it more narrowly.
+Rules: [MD-4](docs/adjudication-rules.md#md-4-unattended)
 
 **Block reason**:
 The agent-facing text of a blocked call: a tag, a fixed statement that the action did not run, and the detail.
 Rules: [PR-2](docs/adjudication-rules.md#pr-2-block-reason)
 
 **Block tag**:
-The label in a block reason that names the kind of block, such as `rule` or `yolo-retry`.
+The label in a block reason that names the kind of block, such as `rule` or `unattended-retry`.
 Rules: [PR-2](docs/adjudication-rules.md#pr-2-block-reason)
 
 **Ask dialog**:
@@ -340,7 +340,7 @@ Rules: [RG-1](docs/adjudication-rules.md#rg-1-transcript-only), [RG-2](docs/adju
 ### Permission grants
 
 **Permission grant**:
-A session-long, natural-language authorization the agent requests through `verdict_grant`, optionally naming protected-path access entries and danger-rule ids, and the user approves (in `yolo`, the judge and fallback classifiers both allow); classifiers treat it as authoritative within its literal scope, it is the only thing that lifts a built-in deny, and it is revocable at any time.
+A session-long, natural-language authorization the agent requests through `verdict_grant`, optionally naming protected-path access entries and danger-rule ids, and the user approves (in `unattended`, the judge and fallback classifiers both allow); classifiers treat it as authoritative within its literal scope, it is the only thing that lifts a built-in deny, and it is revocable at any time.
 _Avoid_: approval (that is a human answer to an ask), permission, allowlist entry
 Rules: [GR-1](docs/adjudication-rules.md#gr-1-request-tool), [GR-2](docs/adjudication-rules.md#gr-2-human-approval), [GR-4](docs/adjudication-rules.md#gr-4-authority-in-classifier-prompts), [GR-6](docs/adjudication-rules.md#gr-6-lifetime-revocation-and-visibility)
 
@@ -353,8 +353,8 @@ The step before a gated ask or a built-in rule deny/ask that allows the call wit
 Rules: [GR-5](docs/adjudication-rules.md#gr-5-coverage-check), [PP-6](docs/adjudication-rules.md#pp-6-plaintext-confinement)
 
 **Grant review**:
-The yolo-mode consensus in which the judge and a configured fallback classifier both must allow a grant request before it is created.
-Rules: [GR-3](docs/adjudication-rules.md#gr-3-yolo-consensus)
+The unattended-mode consensus in which the judge and a configured fallback classifier both must allow a grant request before it is created.
+Rules: [GR-3](docs/adjudication-rules.md#gr-3-unattended-consensus)
 
 ### Subagents
 

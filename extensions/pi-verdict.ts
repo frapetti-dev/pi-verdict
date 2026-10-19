@@ -43,7 +43,7 @@
  * non-interactive modes (no UI) ask → deny.
  *
  * Configuration:
- *   --verdict-mode default|yolo|noAutoDeny|off   approval mode for this session
+ *   --verdict-mode auto|unattended|supervised|off   approval mode for this session
  *   ctrl+shift+y                   approval-mode cycle shortcut (default; silent
  *                                   cycle, footer/mode chip is the only feedback;
  *                                   config toggleShortcut rebinds/null disables,
@@ -84,7 +84,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type * as PiAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { BeforeAgentStartEventResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
 import { activeTransport, type JevReason, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER, VERDICT_CHOICES_PREFIX } from "./jev-adapter";
 
@@ -103,6 +103,14 @@ export const PATH_TIER_DEFAULTS: Readonly<Record<PathTierId, RuleAction>> = {
 	"s1-system-write": "deny",
 	"s2-user-rc-write": "allow",
 	"s3-git-meta-write": "deny",
+};
+/** One-line meaning of each path tier (settings-menu info row, GR-7 gate briefing). */
+const PATH_TIER_DESC: Record<PathTierId, string> = {
+	"s0-secret": "credential and secret files, read or write",
+	"s1-system-read": "reads under system prefixes (/etc, /usr, /var, /System, authorized_keys)",
+	"s1-system-write": "writes under those system prefixes",
+	"s2-user-rc-write": "writes to shell rc, .gitconfig, crontab, LaunchAgents, systemd user units",
+	"s3-git-meta-write": "writes to .git/hooks, .git/config, .git/modules, .gitmodules",
 };
 const isRuleAction = (v: unknown): v is RuleAction => typeof v === "string" && (RULE_ACTIONS as readonly string[]).includes(v);
 const isPathTierId = (v: unknown): v is PathTierId => typeof v === "string" && (PATH_TIER_IDS as readonly string[]).includes(v);
@@ -149,7 +157,7 @@ interface RuleResult {
 	 *  context: block reasons and notifications travel back to the model, so only the
 	 *  local confirm dialog may show it (PP-6: zero path plaintext leaves the machine). */
 	detail?: string;
-	/** Which forced gate produced an ask: the `.omp` directory gate or a denyPaths hit (yolo picks its action per gate). */
+	/** Which forced gate produced an ask: the `.omp` directory gate or a denyPaths hit (unattended picks its action per gate). */
 	gate?: "omp-dir" | "deny-paths";
 	/** Built-in rule hits behind a deny/ask (also attached to a gate ask when the built-in rules would have asked or denied too). */
 	builtin?: BuiltinHit[];
@@ -375,23 +383,41 @@ function resolveToggleShortcut(raw: unknown): { key: string | null; warning: str
 }
 
 // ============================================================================
-// Approval modes: one switch (default | yolo | noAutoDeny | off) plus per-mode
+// Approval modes: one switch (auto | unattended | supervised | off) plus per-mode
 // jev probability thresholds. Every approval key resolves session > project >
 // user > default; "off" is session-only.
 // ============================================================================
 
-export const APPROVAL_MODES = ["default", "yolo", "noAutoDeny", "off"] as const;
+export const APPROVAL_MODES = ["auto", "unattended", "supervised", "off"] as const;
 export type ApprovalMode = (typeof APPROVAL_MODES)[number];
 
-/** Case-insensitive mode argument (`/automode noautodeny`, `--verdict-mode YOLO`); null = not a mode. */
+/** Case-insensitive mode argument (`/automode supervised`, `--verdict-mode UNATTENDED`); null = not a mode. */
 export function parseModeArg(s: string): ApprovalMode | null {
 	const t = s.trim().toLowerCase();
 	return APPROVAL_MODES.find((m) => m.toLowerCase() === t) ?? null;
 }
 
-export const PERCENT_KEYS = ["confidenceThreshold", "defaultDenyThreshold", "defaultAllowThreshold", "yoloDenyThreshold", "noAutoDenyAllowThreshold"] as const;
+/** Approval-mode values renamed in the mode rename (MD-1); an old value is reported and ignored, never mapped. */
+export const RENAMED_MODES: Readonly<Record<string, ApprovalMode>> = { default: "auto", yolo: "unattended", noAutoDeny: "supervised" };
+/** Approval keys renamed with the modes; an old key is reported and ignored, never mapped. */
+const RENAMED_APPROVAL_KEYS: Readonly<Record<string, string>> = {
+	defaultDenyThreshold: "autoDenyThreshold",
+	defaultAllowThreshold: "autoAllowThreshold",
+	yoloDenyThreshold: "unattendedDenyThreshold",
+	noAutoDenyAllowThreshold: "supervisedAllowThreshold",
+	yoloDenyPaths: "unattendedDenyPaths",
+	yoloOmpDir: "unattendedOmpDir",
+};
+/** Case-insensitive lookup of an old mode name (`--verdict-mode`, `/automode`); null = not an old name. */
+export function renamedMode(s: string): { from: string; to: ApprovalMode } | null {
+	const t = s.trim().toLowerCase();
+	const from = Object.keys(RENAMED_MODES).find((k) => k.toLowerCase() === t);
+	return from === undefined ? null : { from, to: RENAMED_MODES[from] };
+}
+
+export const PERCENT_KEYS = ["confidenceThreshold", "autoDenyThreshold", "autoAllowThreshold", "unattendedDenyThreshold", "supervisedAllowThreshold"] as const;
 export type PercentKey = (typeof PERCENT_KEYS)[number];
-export const APPROVAL_KEYS = ["mode", ...PERCENT_KEYS, "yoloDenyPaths", "yoloOmpDir", "classifierFallbackMode"] as const;
+export const APPROVAL_KEYS = ["mode", ...PERCENT_KEYS, "unattendedDenyPaths", "unattendedOmpDir", "classifierFallbackMode"] as const;
 export type ApprovalKey = (typeof APPROVAL_KEYS)[number];
 export type SettingSource = "session" | "local" | "global" | "default";
 /** Keys a session override may carry: the approval keys plus the three switches the `/verdict` menu edits per session. */
@@ -442,17 +468,17 @@ interface UserRules {
 	pathRules: Record<PathTierId, RuleAction>;
 	/** Forced gate on `.omp` directories: any file-tool path or bash token that resolves into a `.omp` path segment (lexical or realpath form) is a terminal ask (non-interactive → deny). Default true; checked after the built-in floor and user deny, before denyPaths/user allow. Config key: "gateOmpDir". */
 	gateOmpDir: boolean;
-	/** Approval mode: "default" = deny/ask/allow; "yolo" = deny/allow, never prompts (uncertain calls are blocked with an explain-or-rewrite request); "noAutoDeny" = ask/allow (every auto-review deny becomes an ask); "off" = ungated (session-only, never read from a config file). */
+	/** Approval mode: "auto" = deny/ask/allow; "unattended" = deny/allow, never prompts (uncertain calls are blocked with an explain-or-rewrite request); "supervised" = ask/allow (every auto-review deny becomes an ask); "off" = ungated (session-only, never read from a config file). */
 	mode: ApprovalMode;
-	/** yolo only: what a denyPaths hit does. "deny" (default) blocks, "allow" lets it through silently. */
-	yoloDenyPaths: "deny" | "allow";
-	/** yolo only: what a `.omp` gate hit does. */
-	yoloOmpDir: "deny" | "allow";
-	/** Per-mode jev probability thresholds (percent, null = use jev's own choice): default mode deny / allow, yolo deny, noAutoDeny allow. */
-	defaultDenyThreshold: number | null;
-	defaultAllowThreshold: number | null;
-	yoloDenyThreshold: number | null;
-	noAutoDenyAllowThreshold: number | null;
+	/** unattended only: what a denyPaths hit does. "deny" (default) blocks, "allow" lets it through silently. */
+	unattendedDenyPaths: "deny" | "allow";
+	/** unattended only: what a `.omp` gate hit does. */
+	unattendedOmpDir: "deny" | "allow";
+	/** Per-mode jev probability thresholds (percent, null = use jev's own choice): auto mode deny / allow, unattended deny, supervised allow. */
+	autoDenyThreshold: number | null;
+	autoAllowThreshold: number | null;
+	unattendedDenyThreshold: number | null;
+	supervisedAllowThreshold: number | null;
 	/** [pi-verdict local patch: rules] user-authored free-text rules appended to every classifier prompt (LLM + jev). Config key: "rules". */
 	classifierRules: string[];
 	/** Classifier model spec (provider/id); null = not configured (introspection inherits the session model) */
@@ -491,7 +517,7 @@ interface UserRules {
 	rootRule: RootRuleConfig | null;
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, dangerRules: DEFAULT_DANGER_RULES(), pathRules: { ...PATH_TIER_DEFAULTS }, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", modeStatus: true, grantStatus: true, confidenceThreshold: null, defaultDenyThreshold: null, defaultAllowThreshold: null, yoloDenyThreshold: null, noAutoDenyAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierRules: [], rootRule: null };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, dangerRules: DEFAULT_DANGER_RULES(), pathRules: { ...PATH_TIER_DEFAULTS }, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", modeStatus: true, grantStatus: true, confidenceThreshold: null, autoDenyThreshold: null, autoAllowThreshold: null, unattendedDenyThreshold: null, supervisedAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, mode: "auto", unattendedDenyPaths: "deny", unattendedOmpDir: "deny", classifierRules: [], rootRule: null };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -726,7 +752,7 @@ function pruneSessionOverrides(): void {
 const DEFAULT_ALLOWED_TOOLS = ["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"];
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. dangerRules: per-id action for built-in danger rules (\"deny\" | \"ask\" | \"allow\" = classifier decides), false removes a rule, {\"pattern\",\"action\",\"reason\",\"flags\"} adds a custom rule; pathRules: action per path tier (s0-secret, s1-system-read, s1-system-write, s2-user-rc-write, s3-git-meta-write); entries merge per id across global, project and session. builtinDenyFloor=false sets every built-in rule to allow (classifier decides) at your own risk; custom rules stay active. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: default (deny/ask/allow) | yolo (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | noAutoDeny (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. defaultDenyThreshold/defaultAllowThreshold, yoloDenyThreshold, noAutoDenyAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). yoloDenyPaths/yoloOmpDir (deny|allow): what yolo does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status). modeStatus (default true): approval-mode chip (🛡 AUTO/YOLO/…) in the prompt status bar — on omp it appears in the status line's \"status\" segment; hidden on pi while the footer is on (the footer already shows the mode). grantStatus (default true): active permission-grant count (🔑 N) in the prompt status bar; hidden when there are none, and on pi while the footer is on. rootRule: the root rule — one baseline policy for the classifier, drafted with /automode-setup ({text, strictness: relaxed|balanced|strict, history, codebase, clarifications}); the highest scope that sets it wins as a whole; classification rules apply on top of it.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. dangerRules: per-id action for built-in danger rules (\"deny\" | \"ask\" | \"allow\" = classifier decides), false removes a rule, {\"pattern\",\"action\",\"reason\",\"flags\"} adds a custom rule; pathRules: action per path tier (s0-secret, s1-system-read, s1-system-write, s2-user-rc-write, s3-git-meta-write); entries merge per id across global, project and session. builtinDenyFloor=false sets every built-in rule to allow (classifier decides) at your own risk; custom rules stay active. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: auto (deny/ask/allow) | unattended (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | supervised (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. autoDenyThreshold/autoAllowThreshold, unattendedDenyThreshold, supervisedAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). unattendedDenyPaths/unattendedOmpDir (deny|allow): what unattended does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status). modeStatus (default true): approval-mode chip (🛡 AUTO / 🌙 UNATT / 👁 SUPV / ⚠ OFF) in the prompt status bar — on omp it appears in the status line's \"status\" segment; hidden on pi while the footer is on (the footer already shows the mode). grantStatus (default true): active permission-grant count (🔑 N) in the prompt status bar; hidden when there are none, and on pi while the footer is on. rootRule: the root rule — one baseline policy for the classifier, drafted with /automode-setup ({text, strictness: relaxed|balanced|strict, history, codebase, clarifications}); the highest scope that sets it wins as a whole; classification rules apply on top of it.",
 	allow: ["^ls\\b"],
 	deny: [],
 	tools: DEFAULT_ALLOWED_TOOLS,
@@ -742,7 +768,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	dangerRules: {},
 	pathRules: {},
 	gateOmpDir: true,
-	mode: "default",
+	mode: "auto",
 	classifierModel: null,
 	explainGateModel: null,
 	explainGatePrompt: null,
@@ -753,12 +779,12 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	modeStatus: true,
 	grantStatus: true,
 	confidenceThreshold: null,
-	defaultDenyThreshold: null,
-	defaultAllowThreshold: null,
-	yoloDenyThreshold: null,
-	noAutoDenyAllowThreshold: null,
-	yoloDenyPaths: "deny",
-	yoloOmpDir: "deny",
+	autoDenyThreshold: null,
+	autoAllowThreshold: null,
+	unattendedDenyThreshold: null,
+	supervisedAllowThreshold: null,
+	unattendedDenyPaths: "deny",
+	unattendedOmpDir: "deny",
 	classifierFallbackModel: null,
 	classifierFallbackMode: "shadow",
 	subagentGate: "off",
@@ -809,8 +835,8 @@ export function parseRootRule(v: unknown, skipped: string[]): RootRuleConfig | n
 	return out;
 }
 
-/** Percent / mode / yolo-action keys of a merged raw config. Invalid values skip into the warning channel and fall back to their defaults. */
-function parseApprovalKeys(raw: Record<string, unknown>, skipped: string[]): Pick<UserRules, "mode" | PercentKey | "yoloDenyPaths" | "yoloOmpDir"> {
+/** Percent / mode / unattended-action keys of a merged raw config. Invalid values skip into the warning channel and fall back to their defaults. */
+function parseApprovalKeys(raw: Record<string, unknown>, skipped: string[]): Pick<UserRules, "mode" | PercentKey | "unattendedDenyPaths" | "unattendedOmpDir"> {
 	const pct = (key: PercentKey): number | null => {
 		const v = raw[key];
 		if (v === undefined || v === null) return null;
@@ -818,27 +844,28 @@ function parseApprovalKeys(raw: Record<string, unknown>, skipped: string[]): Pic
 		skipped.push(`${key}: ${JSON.stringify(v)}`);
 		return null;
 	};
-	const action = (key: "yoloDenyPaths" | "yoloOmpDir"): "deny" | "allow" => {
+	const action = (key: "unattendedDenyPaths" | "unattendedOmpDir"): "deny" | "allow" => {
 		const v = raw[key];
 		if (v === undefined || v === "deny") return "deny";
 		if (v === "allow") return "allow";
 		skipped.push(`${key}: ${JSON.stringify(v)}`);
 		return "deny";
 	};
-	let mode: ApprovalMode = "default";
+	let mode: ApprovalMode = "auto";
 	if (raw.mode !== undefined) {
-		if (typeof raw.mode === "string" && (APPROVAL_MODES as readonly string[]).includes(raw.mode)) mode = raw.mode as ApprovalMode;
+		if (typeof raw.mode === "string" && Object.hasOwn(RENAMED_MODES, raw.mode)) skipped.push(`mode: "${raw.mode}" renamed to "${RENAMED_MODES[raw.mode]}" — ignored`);
+		else if (typeof raw.mode === "string" && (APPROVAL_MODES as readonly string[]).includes(raw.mode)) mode = raw.mode as ApprovalMode;
 		else skipped.push(`mode: ${JSON.stringify(raw.mode)}`);
 	}
 	return {
 		mode,
 		confidenceThreshold: pct("confidenceThreshold"),
-		defaultDenyThreshold: pct("defaultDenyThreshold"),
-		defaultAllowThreshold: pct("defaultAllowThreshold"),
-		yoloDenyThreshold: pct("yoloDenyThreshold"),
-		noAutoDenyAllowThreshold: pct("noAutoDenyAllowThreshold"),
-		yoloDenyPaths: action("yoloDenyPaths"),
-		yoloOmpDir: action("yoloOmpDir"),
+		autoDenyThreshold: pct("autoDenyThreshold"),
+		autoAllowThreshold: pct("autoAllowThreshold"),
+		unattendedDenyThreshold: pct("unattendedDenyThreshold"),
+		supervisedAllowThreshold: pct("supervisedAllowThreshold"),
+		unattendedDenyPaths: action("unattendedDenyPaths"),
+		unattendedOmpDir: action("unattendedOmpDir"),
 	};
 }
 
@@ -954,7 +981,8 @@ function sanitizeSessionRaw(sessionRaw: Record<string, unknown>, skipped: string
 		else if (k === "ruleAdditions") {
 			if (typeof v === "object" && v !== null && !Array.isArray(v)) out[k] = v;
 			else skipped.push("session override ruleAdditions: must be an object — ignored");
-		} else skipped.push(`session override ${k}: not session-scopable — ignored`);
+		} else if (Object.hasOwn(RENAMED_APPROVAL_KEYS, k)) skipped.push(`session override ${k}: renamed to ${RENAMED_APPROVAL_KEYS[k]} — ignored`);
+		else skipped.push(`session override ${k}: not session-scopable — ignored`);
 	}
 	return out;
 }
@@ -1103,7 +1131,8 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 		const dangerRules = parseDangerRules(mergeRuleMaps("dangerRules", dangerLayers, skipped), floorOn, skipped);
 		const pathRules = parsePathRules(mergeRuleMaps("pathRules", pathLayers, skipped), floorOn, skipped);
 		applyRuleAdditions(raw, skipped);
-		if (raw.autoDeny !== undefined) skipped.push('autoDeny: replaced by mode ("noAutoDeny") — key ignored');
+		if (raw.autoDeny !== undefined) skipped.push('autoDeny: replaced by mode ("supervised") — key ignored');
+		for (const [from, to] of Object.entries(RENAMED_APPROVAL_KEYS)) if (raw[from] !== undefined) skipped.push(`${from}: renamed to ${to} — key ignored`);
 		if (raw.classifierMinConfidence !== undefined) skipped.push("classifierMinConfidence: renamed to confidenceThreshold — key ignored");
 		const compile = (list: unknown): RegExp[] =>
 			(Array.isArray(list) ? list : []).filter((x): x is string => typeof x === "string").flatMap((src) => {
@@ -1447,7 +1476,7 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 		// RL-8: the tool confirms every change with the user itself; no target, so user rules/denyPaths never apply
 		base = { verdict: "allow", reason: "pi-verdict settings tool (confirms every change with the user)" };
 	} else if (toolName === GRANT_TOOL_NAME) {
-		// RL-9: the tool is itself the approval channel (the user, or both models in yolo, approve every grant); no target, so user rules/denyPaths never apply
+		// RL-9: the tool is itself the approval channel (the user, or both models in unattended, approve every grant); no target, so user rules/denyPaths never apply
 		base = { verdict: "allow", reason: "pi-verdict permission grant tool (the user or both models approve every grant)" };
 	} else if (user.tools.includes(toolName)) {
 		base = { verdict: "allow", reason: "user tools allow rule" };
@@ -1464,7 +1493,7 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 	if (base.verdict === "deny") return base; // built-in deny: terminal; no user allow, gate or grant-free path overrides it
 
 	if (target !== null) {
-		// A built-in ask the gate ask supersedes stays attached, so a grant can still cover it and yolo can still refuse it
+		// A built-in ask the gate ask supersedes stays attached, so a grant can still cover it and unattended can still refuse it
 		const underneath: Pick<RuleResult, "builtin" | "builtinReason"> = base.verdict === "ask" && base.builtin ? { builtin: base.builtin, builtinReason: base.reason } : {};
 		// Forced .omp gate: terminal ask, after user deny and built-in deny, before denyPaths/user allow.
 		// Reason carries no path (it travels back into agent context); the path is UI-only detail.
@@ -1491,9 +1520,9 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 
 type VerdictChoice = "allow" | "ask" | "deny";
 
-/** Verdicts the classifier may answer in each approval mode: yolo never asks (no human), noAutoDeny never denies (a human decides). */
+/** Verdicts the classifier may answer in each approval mode: unattended never asks (no human), supervised never denies (a human decides). */
 export function modeChoices(mode: ApprovalMode): VerdictChoice[] {
-	return mode === "yolo" ? ["allow", "deny"] : mode === "noAutoDeny" ? ["allow", "ask"] : ["allow", "ask", "deny"];
+	return mode === "unattended" ? ["allow", "deny"] : mode === "supervised" ? ["allow", "ask"] : ["allow", "ask", "deny"];
 }
 
 /** Classifier system prompt for a verdict set. All three verdicts → the canonical prompt (no marker line); a restricted set lists
@@ -2092,7 +2121,7 @@ const AUDIT_KEEP_SESSIONS = 20;
 export interface FallbackAudit {
 	model: string;
 	mode: "shadow" | "enforce";
-	triggeredBy: "confidence" | "fail-closed" | "subagent-ask" | "yolo-ask";
+	triggeredBy: "confidence" | "fail-closed" | "subagent-ask" | "unattended-ask";
 	/** jev confidence that fired the floor; null unless triggeredBy = "confidence" */
 	confidence: number | null;
 	/** null = the fallback call itself failed (unresolvable model, timeout, parse) */
@@ -2412,7 +2441,7 @@ export interface Verdict {
 	pendingAudit?: AuditRecord;
 	/** Set on every ask: how the ask resolves without a human (subagent auto/timeout). "consult" = ask the second model; "allow"/"deny" = already decided by the cascade or not model-resolvable. */
 	autoResolve?: "consult" | "allow" | "deny";
-	/** yolo only: this block stands in for an ask — the agent is told to explain or rewrite and retry. */
+	/** unattended only: this block stands in for an ask — the agent is told to explain or rewrite and retry. */
 	retry?: true;
 	/** The verdict stems from a built-in rule hit: the block reason names the rule/tier id and points at the permission-grant channel (GR-5). */
 	grantable?: true;
@@ -2451,20 +2480,20 @@ function confidenceDemotion(outcome: ClassifierOutcome, rules: UserRules): { con
 
 /** Per-mode jev probability thresholds applied to a first-layer jev verdict. A threshold set → the verdict's own
  *  probability must reach it; unset → jev's own choice decides. null when the mode has no threshold set (verdict
- *  stays as jev chose). default: deny, else allow, else ask; yolo: deny else allow; noAutoDeny: allow else ask. */
+ *  stays as jev chose). default: deny, else allow, else ask; unattended: deny else allow; supervised: allow else ask. */
 export function applyModeThresholds(mode: ApprovalMode, jev: JevReason, rules: UserRules): VerdictChoice | null {
 	const reaches = (threshold: number | null, v: VerdictChoice): boolean => (threshold === null ? jev.choice === v : jev.probabilities[v] >= threshold);
-	if (mode === "default") {
-		if (rules.defaultDenyThreshold === null && rules.defaultAllowThreshold === null) return null;
-		return reaches(rules.defaultDenyThreshold, "deny") ? "deny" : reaches(rules.defaultAllowThreshold, "allow") ? "allow" : "ask";
+	if (mode === "auto") {
+		if (rules.autoDenyThreshold === null && rules.autoAllowThreshold === null) return null;
+		return reaches(rules.autoDenyThreshold, "deny") ? "deny" : reaches(rules.autoAllowThreshold, "allow") ? "allow" : "ask";
 	}
-	if (mode === "yolo") {
-		if (rules.yoloDenyThreshold === null) return null;
-		return reaches(rules.yoloDenyThreshold, "deny") ? "deny" : "allow";
+	if (mode === "unattended") {
+		if (rules.unattendedDenyThreshold === null) return null;
+		return reaches(rules.unattendedDenyThreshold, "deny") ? "deny" : "allow";
 	}
-	if (mode === "noAutoDeny") {
-		if (rules.noAutoDenyAllowThreshold === null) return null;
-		return reaches(rules.noAutoDenyAllowThreshold, "allow") ? "allow" : "ask";
+	if (mode === "supervised") {
+		if (rules.supervisedAllowThreshold === null) return null;
+		return reaches(rules.supervisedAllowThreshold, "allow") ? "allow" : "ask";
 	}
 	return null;
 }
@@ -2492,7 +2521,7 @@ async function runConfidenceCascade(
 	state: SessionState,
 	env: AdjudicateEnv,
 	first: { verdict: "allow" | "ask" | "deny"; reason: string } | null,
-	trigger: { kind: "demotion"; confidence: number } | { kind: "fail-closed" } | { kind: "yolo-ask" },
+	trigger: { kind: "demotion"; confidence: number } | { kind: "fail-closed" } | { kind: "unattended-ask" },
 	denyPathsActive: boolean,
 	actionLine: string,
 ): Promise<CascadeResult> {
@@ -2509,7 +2538,7 @@ async function runConfidenceCascade(
 	}
 	const mode = rules.classifierFallbackMode;
 	const start = Date.now();
-	const base = { mode, triggeredBy: trigger.kind === "demotion" ? ("confidence" as const) : trigger.kind === "yolo-ask" ? ("yolo-ask" as const) : ("fail-closed" as const), confidence: trigger.kind === "demotion" ? trigger.confidence : null };
+	const base = { mode, triggeredBy: trigger.kind === "demotion" ? ("confidence" as const) : trigger.kind === "unattended-ask" ? ("unattended-ask" as const) : ("fail-closed" as const), confidence: trigger.kind === "demotion" ? trigger.confidence : null };
 	const demotedMark = trigger.kind === "demotion" ? ({ demoted: true } as const) : {};
 	const shadowApplied = trigger.kind === "demotion" ? { effective: demotionAsk() } : {};
 	const failed = (model: string, error: string): CascadeResult => {
@@ -2537,7 +2566,7 @@ async function runConfidenceCascade(
 /** Subagent gate: resolve an ask with no human answer. The UI-free counterpart of the
  *  cascade. Only an explicit second-model allow permits the call; every other outcome denies.
  *  Asks that did not come from the classifier (protected path, rule/fail-closed asks that
- *  exist only under noAutoDeny) never reach the model: `autoResolve` is "deny" there. */
+ *  exist only under supervised) never reach the model: `autoResolve` is "deny" there. */
 export async function resolveAskWithoutHuman(
 	state: SessionState,
 	env: AdjudicateEnv,
@@ -2669,10 +2698,10 @@ function coveringGrants(state: SessionState, call: { toolName: string; input: Re
  * are built in here, the two duplicated downgrade implementations are now unique. Zero UI: presentation (notify/confirm) is rendered by the extension
  * handler via the source x degraded template. Exported only for tests (test surface of the internal seam, existing pattern from #35).
  */
-/** noAutoDeny: reason suffix on asks that would have been auto-denies */
-const NO_AUTO_DENY_SUFFIX = " (noAutoDeny: this would have been denied — your call)";
-/** yolo: reason suffix on the block that stands in for an ask (no human can confirm) */
-const YOLO_RETRY_SUFFIX = " (yolo: no human can confirm this — explain why the action is needed or rewrite it as a narrower, safer command, then retry)";
+/** supervised: reason suffix on asks that would have been auto-denies */
+const SUPERVISED_SUFFIX = " (supervised: this would have been denied — your call)";
+/** unattended: reason suffix on the block that stands in for an ask (no human can confirm) */
+const UNATTENDED_RETRY_SUFFIX = " (unattended: no human can confirm this — explain why the action is needed or rewrite it as a narrower, safer command, then retry)";
 
 async function adjudicateRuled(
 	state: SessionState,
@@ -2724,22 +2753,22 @@ async function adjudicateRuled(
 
 	if (rule.verdict === "deny") {
 		const grantable = builtin.length > 0;
-		if (state.userRules.mode === "noAutoDeny" && env.hasUI) return { verdict: "ask", reason: (rule.reason ?? "") + NO_AUTO_DENY_SUFFIX, source: "rule", degraded: false, autoResolve: "deny", ...(grantable ? { grantable } : {}) };
+		if (state.userRules.mode === "supervised" && env.hasUI) return { verdict: "ask", reason: (rule.reason ?? "") + SUPERVISED_SUFFIX, source: "rule", degraded: false, autoResolve: "deny", ...(grantable ? { grantable } : {}) };
 		return { verdict: "deny", reason: rule.reason ?? "", source: "rule", degraded: false, ...(grantable ? { grantable } : {}) };
 	}
 
 	if (rule.verdict === "ask" && !rule.gate) {
-		// Built-in ask (a danger rule or path tier set to "ask"): like a denyPaths ask — dialog with a UI, deny headless or in yolo (no yolo key of its own)
+		// Built-in ask (a danger rule or path tier set to "ask"): like a denyPaths ask — dialog with a UI, deny headless or in unattended (no unattended key of its own)
 		const reason = rule.reason ?? "";
-		if (state.userRules.mode === "yolo") return { verdict: "deny", reason, source: "rule", degraded: false, grantable: true };
+		if (state.userRules.mode === "unattended") return { verdict: "deny", reason, source: "rule", degraded: false, grantable: true };
 		if (env.hasUI) return { verdict: "ask", reason, source: "rule", degraded: false, autoResolve: "deny", ...(builtin.some((b) => b.kind === "path") ? { noExplain: true as const } : {}) };
 		return { verdict: "deny", reason, source: "rule", degraded: true, grantable: true };
 	}
 
 	if (rule.verdict === "ask") {
-		// yolo never prompts: the gate's action setting decides (default deny; "allow" passes silently, except over a built-in ask/deny underneath, which yolo refuses)
-		if (state.userRules.mode === "yolo") {
-			const action = rule.gate === "omp-dir" ? state.userRules.yoloOmpDir : state.userRules.yoloDenyPaths;
+		// unattended never prompts: the gate's action setting decides (default deny; "allow" passes silently, except over a built-in ask/deny underneath, which unattended refuses)
+		if (state.userRules.mode === "unattended") {
+			const action = rule.gate === "omp-dir" ? state.userRules.unattendedOmpDir : state.userRules.unattendedDenyPaths;
 			if (action === "allow" && builtin.length > 0) return { verdict: "deny", reason: rule.builtinReason ?? "", source: "rule", degraded: false, grantable: true };
 			const ppRecord: AuditRecord = { ...buildRecord({ verdict: action, reason: rule.reason ?? "", source: "protected-path", degraded: false }, null, "-"), detail: rule.detail };
 			state.audit?.append(ppRecord);
@@ -2768,15 +2797,15 @@ async function adjudicateRuled(
 		const eff = cascade.effective;
 		const fcRecord = buildRecord({ verdict: "deny", reason, source: "fail-closed", degraded: false }, null, "-");
 		if (cascade.fb) fcRecord.fallback = cascade.fb;
-		if (mode === "yolo" && eff?.verdict === "ask") {
+		if (mode === "unattended" && eff?.verdict === "ask") {
 			state.audit?.append(fcRecord);
-			return { verdict: "deny", reason: eff.reason + YOLO_RETRY_SUFFIX, source: eff.source, degraded: false, retry: true };
+			return { verdict: "deny", reason: eff.reason + UNATTENDED_RETRY_SUFFIX, source: eff.source, degraded: false, retry: true };
 		}
 		if (eff?.verdict === "ask" && env.hasUI) {
 			return { verdict: "ask", reason: eff.reason, source: eff.source, degraded: false, autoResolve: "deny", ...(state.audit ? { pendingAudit: fcRecord } : {}) };
 		}
-		if (eff?.verdict !== "allow" && mode === "noAutoDeny" && env.hasUI) {
-			return { verdict: "ask", reason: (eff?.reason ?? reason) + NO_AUTO_DENY_SUFFIX, source: eff?.source ?? "fail-closed", degraded: false, autoResolve: "deny", ...(state.audit ? { pendingAudit: fcRecord } : {}) };
+		if (eff?.verdict !== "allow" && mode === "supervised" && env.hasUI) {
+			return { verdict: "ask", reason: (eff?.reason ?? reason) + SUPERVISED_SUFFIX, source: eff?.source ?? "fail-closed", degraded: false, autoResolve: "deny", ...(state.audit ? { pendingAudit: fcRecord } : {}) };
 		}
 		state.audit?.append(fcRecord);
 		if (eff?.verdict === "allow") return { verdict: "allow", reason: eff.reason, source: "classifier", degraded: false };
@@ -2815,14 +2844,14 @@ async function adjudicateRuled(
 		firstVerdict = mapped;
 		firstReason = `${outcome.reason} — ${mode} thresholds: ${outcome.verdict} → ${mapped}`;
 	}
-	// yolo contract slip: the first layer asked although no human exists — the fallback (if any) decides
-	const yoloAsk = !demotion && outcome.source === "model" && mode === "yolo" && firstVerdict === "ask";
-	const cascade = demotion || outcome.source === "fail-closed" || yoloAsk
+	// unattended contract slip: the first layer asked although no human exists — the fallback (if any) decides
+	const unattendedAsk = !demotion && outcome.source === "model" && mode === "unattended" && firstVerdict === "ask";
+	const cascade = demotion || outcome.source === "fail-closed" || unattendedAsk
 		? await runConfidenceCascade(
 				state,
 				env,
-				demotion || yoloAsk ? { verdict: firstVerdict, reason: firstReason } : null,
-				demotion ? { kind: "demotion", confidence: demotion.confidence } : yoloAsk ? { kind: "yolo-ask" } : { kind: "fail-closed" },
+				demotion || unattendedAsk ? { verdict: firstVerdict, reason: firstReason } : null,
+				demotion ? { kind: "demotion", confidence: demotion.confidence } : unattendedAsk ? { kind: "unattended-ask" } : { kind: "fail-closed" },
 				state.userRules.denyPaths.length > 0,
 				actionLine,
 			)
@@ -2834,21 +2863,21 @@ async function adjudicateRuled(
 	// #62/#67: top-level keeps first-layer semantics (corpus comparability); the applied
 	// verdict lives in fallback.effective (enforce rows). Non-interactive asks of any
 	// origin — native, demoted, escalated — record as their effective deny, the
-	// pre-existing ask-degradation convention; so does yolo's explain-or-rewrite block.
-	const yoloRetry = mode === "yolo" && effVerdict === "ask";
-	const appliedAskHeadless = !env.hasUI && effVerdict === "ask" && !yoloRetry;
-	const grayRecord = buildRecord({ verdict: appliedAskHeadless || yoloRetry ? "deny" : outcome.verdict, reason: outcome.reason, source: outcome.source, degraded: appliedAskHeadless }, outcome.auditRaw ?? null, shadow);
+	// pre-existing ask-degradation convention; so does unattended's explain-or-rewrite block.
+	const unattendedRetry = mode === "unattended" && effVerdict === "ask";
+	const appliedAskHeadless = !env.hasUI && effVerdict === "ask" && !unattendedRetry;
+	const grayRecord = buildRecord({ verdict: appliedAskHeadless || unattendedRetry ? "deny" : outcome.verdict, reason: outcome.reason, source: outcome.source, degraded: appliedAskHeadless }, outcome.auditRaw ?? null, shadow);
 	if (cascade.demoted) grayRecord.demoted = true;
 	if (cascade.fb) grayRecord.fallback = cascade.fb;
 	if (thresholdVerdict) grayRecord.thresholdVerdict = thresholdVerdict;
-	// yolo never asks: every ask-shaped outcome becomes a block that tells the agent to justify or rewrite
-	if (yoloRetry) {
+	// unattended never asks: every ask-shaped outcome becomes a block that tells the agent to justify or rewrite
+	if (unattendedRetry) {
 		state.audit?.append(grayRecord);
-		return { verdict: "deny", reason: effReason + YOLO_RETRY_SUFFIX, source: effSource, degraded: false, shadow, retry: true };
+		return { verdict: "deny", reason: effReason + UNATTENDED_RETRY_SUFFIX, source: effSource, degraded: false, shadow, retry: true };
 	}
 	// #62: an interactive ask defers the append to the handler finalize (ground truth);
 	// every other outcome appends immediately as before
-	const denyAsAsk = mode === "noAutoDeny" && effVerdict === "deny";
+	const denyAsAsk = mode === "supervised" && effVerdict === "deny";
 	if (env.hasUI && (effVerdict === "ask" || denyAsAsk)) {
 		// Subagent gate: how this ask resolves without a human. CS-7 carve-out: a demoted deny is never auto-allowed.
 		const autoResolve: NonNullable<Verdict["autoResolve"]> = effVerdict === "deny" || effSource !== "classifier"
@@ -2856,7 +2885,7 @@ async function adjudicateRuled(
 			: cascade.fb
 				? (cascade.fb.verdict === "allow" && !(cascade.demoted && outcome.verdict === "deny") ? "allow" : "deny")
 				: "consult";
-		return { verdict: "ask", reason: effVerdict === "deny" ? effReason + NO_AUTO_DENY_SUFFIX : effReason, source: effSource, degraded: false, shadow, autoResolve, ...(state.audit ? { pendingAudit: grayRecord } : {}) };
+		return { verdict: "ask", reason: effVerdict === "deny" ? effReason + SUPERVISED_SUFFIX : effReason, source: effSource, degraded: false, shadow, autoResolve, ...(state.audit ? { pendingAudit: grayRecord } : {}) };
 	}
 	state.audit?.append(grayRecord);
 	if (effVerdict === "allow") return { verdict: "allow", reason: effReason, source: effSource, degraded: false, shadow };
@@ -2872,7 +2901,7 @@ const REMEMBERED_APPROVAL_REASON = "remembered approval (this session)";
  * denyPaths ask -> user allow -> gray-area classifier; ask downgrade (no UI -> deny) and fail-closed
  * are built in here, the two duplicated downgrade implementations are now unique. Zero UI: presentation (notify/confirm) is rendered by the extension
  * handler via the source x degraded template. Exported only for tests (test surface of the internal seam, existing pattern from #35).
- * PR-9: a remembered approval for the exact call returns before GR-5 coverage, the gates and the classifier; a rule-layer deny is overridden only in noAutoDeny.
+ * PR-9: a remembered approval for the exact call returns before GR-5 coverage, the gates and the classifier; a rule-layer deny is overridden only in supervised.
  */
 export async function adjudicate(
 	state: SessionState,
@@ -2883,7 +2912,7 @@ export async function adjudicate(
 	if (rule.verdict === "allow") return adjudicateRuled(state, call, env, rule);
 	const origin: AskOrigin = rule.verdict === "deny" ? "rule-deny" : rule.verdict === "ask" ? (rule.gate ? "gate" : "builtin-ask") : "gray";
 	const key = approvalKey(origin, call.toolName, call.input, env.cwd);
-	const applies = origin !== "rule-deny" || (state.userRules.mode === "noAutoDeny" && env.hasUI);
+	const applies = origin !== "rule-deny" || (state.userRules.mode === "supervised" && env.hasUI);
 	if (applies && state.isApprovalRemembered(key)) {
 		return { verdict: "allow", reason: REMEMBERED_APPROVAL_REASON, source: origin === "gate" ? "protected-path" : "rule", degraded: false, remembered: true };
 	}
@@ -3016,25 +3045,25 @@ export interface MenuController {
 /** Enum values per key (the menu's choice rows); `mode` also lists `off`, which only the session scope offers. */
 const ENUM_VALUES: Partial<Record<SessionKey, readonly string[]>> = {
 	mode: APPROVAL_MODES,
-	yoloDenyPaths: ["deny", "allow"],
-	yoloOmpDir: ["deny", "allow"],
+	unattendedDenyPaths: ["deny", "allow"],
+	unattendedOmpDir: ["deny", "allow"],
 	classifierFallbackMode: ["shadow", "enforce"],
 	footer: ["full", "compact", "off"],
 };
 
 /** What a key means when no scope sets it (global scope shows these instead of `inherit`). */
-const MENU_DEFAULTS: Partial<Record<SessionKey, string>> = { mode: "default", yoloDenyPaths: "deny", yoloOmpDir: "deny", classifierFallbackMode: "shadow", gateOmpDir: "on", footer: "full", modeStatus: "on", grantStatus: "on" };
+const MENU_DEFAULTS: Partial<Record<SessionKey, string>> = { mode: "auto", unattendedDenyPaths: "deny", unattendedOmpDir: "deny", classifierFallbackMode: "shadow", gateOmpDir: "on", footer: "full", modeStatus: "on", grantStatus: "on" };
 
 /** One-line meaning of each enum value, shown under the selected row (`inherit` and percent values are composed by the controller). */
 const VALUE_MEANING: Record<string, Record<string, string>> = {
 	mode: {
-		default: "default — deny, ask or allow; the full gate",
-		yolo: "yolo — deny or allow, never prompts; uncertain calls are blocked",
-		noAutoDeny: "noAutoDeny — ask or allow; every auto-review deny becomes an ask",
+		auto: "auto — deny, ask or allow; the full gate",
+		unattended: "unattended — deny or allow, never prompts; uncertain calls are blocked",
+		supervised: "supervised — ask or allow; every auto-review deny becomes an ask",
 		off: "off — ungated: tool calls execute directly (session only)",
 	},
-	yoloDenyPaths: { deny: "deny — yolo blocks a denyPaths hit", allow: "allow — yolo lets a denyPaths hit through silently" },
-	yoloOmpDir: { deny: "deny — yolo blocks a .omp directory access", allow: "allow — yolo lets a .omp directory access through silently" },
+	unattendedDenyPaths: { deny: "deny — unattended blocks a denyPaths hit", allow: "allow — unattended lets a denyPaths hit through silently" },
+	unattendedOmpDir: { deny: "deny — unattended blocks a .omp directory access", allow: "allow — unattended lets a .omp directory access through silently" },
 	classifierFallbackMode: { shadow: "shadow — the second model only records its opinion", enforce: "enforce — the second model decides" },
 	gateOmpDir: { on: "on — ask before any .omp directory access (default)", off: "off — no forced gate on .omp directories" },
 	footer: { full: "full — Nerd Font powerline blocks (default)", compact: "compact — plain one-line text", off: "off — no footer status" },
@@ -3045,10 +3074,10 @@ const VALUE_MEANING: Record<string, Record<string, string>> = {
 /** What each percent key does when set (the value `off` disables it). */
 const PERCENT_MEANING: Record<PercentKey, string> = {
 	confidenceThreshold: "jev confidence below this cascades to the fallback model, else asks",
-	defaultDenyThreshold: "default mode: jev deny probability needed to deny",
-	defaultAllowThreshold: "default mode: jev allow probability needed to allow",
-	yoloDenyThreshold: "yolo mode: jev deny probability needed to deny (otherwise allow)",
-	noAutoDenyAllowThreshold: "noAutoDeny mode: jev allow probability needed to allow (otherwise ask)",
+	autoDenyThreshold: "auto mode: jev deny probability needed to deny",
+	autoAllowThreshold: "auto mode: jev allow probability needed to allow",
+	unattendedDenyThreshold: "unattended mode: jev deny probability needed to deny (otherwise allow)",
+	supervisedAllowThreshold: "supervised mode: jev allow probability needed to allow (otherwise ask)",
 };
 
 /** Percent keys store a number, `null` = off; enum keys store their string; gateOmpDir/modeStatus/grantStatus store a boolean. Parse a menu value back; `undefined` = inherit (drop the key), `"invalid"` = not a value. */
@@ -3558,8 +3587,8 @@ export const SETTINGS_TOOL_NAME = "verdict_settings";
 export const SETTINGS_TOOL_KEYS = [
 	"dangerRules", "pathRules",
 	"allow", "deny", "denyPaths", "tools", "rules",
-	"builtinDenyFloor", "gateOmpDir", "mode", "yoloDenyPaths", "yoloOmpDir",
-	"confidenceThreshold", "defaultDenyThreshold", "defaultAllowThreshold", "yoloDenyThreshold", "noAutoDenyAllowThreshold",
+	"builtinDenyFloor", "gateOmpDir", "mode", "unattendedDenyPaths", "unattendedOmpDir",
+	"confidenceThreshold", "autoDenyThreshold", "autoAllowThreshold", "unattendedDenyThreshold", "supervisedAllowThreshold",
 	"classifierModel", "classifierFallbackModel", "classifierFallbackMode", "explainGateModel", "explainGatePrompt",
 	"toggleShortcut", "audit", "notifyAllows", "subagentGate", "subagentAskTimeoutMs", "footer", "modeStatus", "grantStatus", "rootRule",
 ] as const;
@@ -3570,8 +3599,8 @@ const isListKey = (k: string): k is EditableListKey => (EDITABLE_LIST_KEYS as re
 const SETTINGS_BOOLEAN_KEYS: readonly string[] = ["builtinDenyFloor", "gateOmpDir", "audit", "notifyAllows", "modeStatus", "grantStatus"];
 const SETTINGS_ENUMS: Record<string, readonly string[]> = {
 	mode: APPROVAL_MODES,
-	yoloDenyPaths: ["deny", "allow"],
-	yoloOmpDir: ["deny", "allow"],
+	unattendedDenyPaths: ["deny", "allow"],
+	unattendedOmpDir: ["deny", "allow"],
 	classifierFallbackMode: ["shadow", "enforce"],
 	footer: ["full", "compact", "off"],
 	subagentGate: ["off", "normal", "auto"],
@@ -4939,12 +4968,55 @@ function serializeDialog<T>(fn: () => Promise<T>): Promise<T> {
  * reasons can be empty or too terse for the acting model to recognize as a block. */
 function blockedReason(tag: string, detail: string, grantable = false): string {
 	const clean = detail.trim().replace(/\.+$/, "");
-	const grantHint = grantable || tag === "classifier" || tag === "yolo-retry" || tag === "user-declined" ? ` ${GRANT_BLOCK_HINT}` : "";
+	const grantHint = grantable || tag === "classifier" || tag === "unattended-retry" || tag === "user-declined" ? ` ${GRANT_BLOCK_HINT}` : "";
 	return `[auto-mode ${tag} block] BLOCKED — this action did NOT run. Reason: ${clean || "(no further reason given)"}. Report the block to the user; never claim it succeeded or completed.${grantHint}`;
 }
 
-/** GR-1: appended to classifier / yolo-retry / user-declined block reasons so the agent learns the authorization channel exists. */
+/** GR-1: appended to classifier / unattended-retry / user-declined block reasons so the agent learns the authorization channel exists. */
 const GRANT_BLOCK_HINT = `If this action is required, request a permission grant with ${GRANT_TOOL_NAME} (describe the exact operation and scope).`;
+
+// ============================================================================
+// Gate briefing (GR-7)
+// ============================================================================
+
+export const GATE_BRIEFING_HEADER = "## Permission gate (pi-verdict)";
+
+const BRIEFING_MODE_TEXT: Record<Exclude<ApprovalMode, "off">, string> = {
+	auto: "calls the gate is unsure about ask the user; dangerous ones are blocked.",
+	unattended: "no human is watching: nothing asks the user, calls that would need approval are blocked, and grant requests are reviewed by models.",
+	supervised: "a human decides: calls that would be blocked are sent to the user for approval instead.",
+};
+
+/** GR-7: system-prompt section telling the acting agent what the gate blocks, what needs approval, and how to request a grant. null = gate inert for this agent. No protected-path text (PP-6); no per-session volatile data besides mode and rules (prompt-cache stability). */
+export function gateBriefing(rules: UserRules, subagent: boolean): string | null {
+	if (rules.mode === "off" || (subagent && rules.subagentGate === "off")) return null;
+	const lines: string[] = [
+		GATE_BRIEFING_HEADER,
+		'Every tool call you make is checked by the pi-verdict permission gate before it runs: it is allowed, sent to the user for approval, or blocked. A blocked call returns a result starting with "[auto-mode <tag> block] BLOCKED" and did NOT run.',
+		`Approval mode: ${rules.mode} — ${BRIEFING_MODE_TEXT[rules.mode]}${subagent && rules.subagentGate === "auto" ? " Your approvals are decided by a model, not a human." : ""}`,
+	];
+	const ruleList = (action: RuleAction): string => rules.dangerRules.filter((r) => r.action === action).map((r) => `${r.id} (${r.reason})`).join("; ");
+	const denied = ruleList("deny");
+	if (denied) lines.push(`- Blocked commands (danger rules, action deny): ${denied}`);
+	const asked = ruleList("ask");
+	if (asked) lines.push(`- Commands needing the user's approval (danger rules, action ask): ${asked}`);
+	const tiers = PATH_TIER_IDS.filter((t) => rules.pathRules[t] !== "allow").map((t) => `${t} (${PATH_TIER_DESC[t]}): ${rules.pathRules[t]}`);
+	if (tiers.length > 0) lines.push(`- Path tiers: ${tiers.join("; ")}`);
+	const n = rules.denyPaths.length;
+	if (n > 0) lines.push(`- ${n} user-protected ${n === 1 ? "path" : "paths"} (denyPaths): any access needs the user's approval; the paths are not disclosed.`);
+	if (rules.gateOmpDir) lines.push("- Any access to a .omp directory needs the user's approval.");
+	lines.push("- Everything else is judged by a classifier model against the user's requests in this conversation.");
+	lines.push("When a call is blocked, or an operation you need falls under a rule above:");
+	lines.push("- Do not retry it, and do not rephrase, split, encode or route it through another tool to get past the gate.");
+	lines.push(
+		subagent
+			? `- ${GRANT_TOOL_NAME} is not available to subagents: if the operation is required, report it and why in your final output so the main agent can request the grant.`
+			: `- If the operation is required, request a session-long permission grant with ${GRANT_TOOL_NAME} (action "request"): describe the exact operation and scope, list the danger-rule ids in rules and protected paths in paths, then run it once the grant is approved.`,
+	);
+	lines.push("- Otherwise use a safer alternative, or tell the user what was blocked and why.");
+	if (!subagent) lines.push("- Check current rule actions with verdict_settings get (key dangerRules or pathRules) before telling the user a rule blocks something.");
+	return lines.join("\n");
+}
 
 /** Optional dependency injection for tests (#35): fake the compat fallback loader. */
 export interface AutoModeDeps {
@@ -4971,11 +5043,11 @@ export interface FooterInfo {
 	ompGateOff: boolean;
 	/** confidenceThreshold: jev confidence floor, null = off */
 	confidenceThreshold: number | null;
-	/** the active mode's jev probability thresholds (yolo has no allow threshold, noAutoDeny no deny threshold) */
+	/** the active mode's jev probability thresholds (unattended has no allow threshold, supervised no deny threshold) */
 	thresholds: { deny: number | null; allow: number | null };
-	/** yolo only: protected-path / .omp hits are let through instead of blocked */
-	yoloDenyPathsAllow: boolean;
-	yoloOmpDirAllow: boolean;
+	/** unattended only: protected-path / .omp hits are let through instead of blocked */
+	unattendedDenyPathsAllow: boolean;
+	unattendedOmpDirAllow: boolean;
 	subagentGate: "off" | "normal" | "auto";
 	/** active permission grants (GR-6); the footer segment shows only when > 0 */
 	grants: number;
@@ -5002,6 +5074,8 @@ const NF_CAP_R = "\uE0B4"; // powerline right half-circle: probability bar cap
 const NF_GAVEL = "\uF0E3"; // rule verdict
 const NF_USER = "\uF007"; // user-approved verdict
 const NF_KEY = "\uF084"; // permission grants count
+const NF_MOON = "\uF186"; // unattended mode
+const NF_EYE = "\uF06E"; // supervised mode
 
 export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full" | "compact"): string {
 	const { classifier, fallback } = info;
@@ -5019,13 +5093,13 @@ export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full"
 	const risks: { text: string; color: "error" | "warning" }[] = [];
 	if (info.floorOff) risks.push({ text: "floor off", color: "error" });
 	if (info.ompGateOff) risks.push({ text: ".omp gate off", color: "warning" });
-	if (info.mode === "yolo" && info.yoloDenyPathsAllow) risks.push({ text: "denyPaths allow", color: "error" });
-	if (info.mode === "yolo" && info.yoloOmpDirAllow) risks.push({ text: ".omp allow", color: "error" });
+	if (info.mode === "unattended" && info.unattendedDenyPathsAllow) risks.push({ text: "denyPaths allow", color: "error" });
+	if (info.mode === "unattended" && info.unattendedOmpDirAllow) risks.push({ text: ".omp allow", color: "error" });
 	const lead = {
-		default: { color: "success", bg: "toolSuccessBg", full: `${NF_SHIELD} AUTO`, compact: "● auto" },
-		yolo: { color: "error", bg: "toolErrorBg", full: `${NF_WARN} YOLO`, compact: "● yolo" },
-		noAutoDeny: { color: "warning", bg: "toolPendingBg", full: `${NF_SHIELD} NO-AUTODENY`, compact: "● no-autodeny" },
-		off: { color: "warning", bg: "toolPendingBg", full: `${NF_WARN} AUTO OFF · ungated`, compact: "○ auto off · ungated" },
+		auto: { color: "success", bg: "toolSuccessBg", full: `${NF_SHIELD} AUTO`, compact: "🛡 auto" },
+		unattended: { color: "error", bg: "toolErrorBg", full: `${NF_MOON} UNATTENDED`, compact: "🌙 unattended" },
+		supervised: { color: "warning", bg: "toolPendingBg", full: `${NF_EYE} SUPERVISED`, compact: "👁 supervised" },
+		off: { color: "warning", bg: "toolPendingBg", full: `${NF_WARN} AUTO OFF · ungated`, compact: "⚠ auto off · ungated" },
 	} as const satisfies Record<ApprovalMode, { color: "success" | "warning" | "error"; bg: ThemeBg; full: string; compact: string }>;
 	const chipSpec = lead[info.mode];
 
@@ -5102,10 +5176,10 @@ export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full"
 /** Prompt status-bar chip of the approval mode, published by `refreshStatus` unless `modeStatus` is off (omp strips ANSI from setStatus; the text stays readable). */
 export function modeStatusText(mode: ApprovalMode, theme: Pick<Theme, "fg">): string {
 	const chip = {
-		default: { color: "success", text: "🛡 AUTO" },
-		yolo: { color: "error", text: "🛡 YOLO" },
-		noAutoDeny: { color: "warning", text: "🛡 NO-AUTODENY" },
-		off: { color: "warning", text: "🛡 OFF · ungated" },
+		auto: { color: "success", text: "🛡 AUTO" },
+		unattended: { color: "error", text: "🌙 UNATT" },
+		supervised: { color: "warning", text: "👁 SUPV" },
+		off: { color: "warning", text: "⚠ OFF · ungated" },
 	} as const satisfies Record<ApprovalMode, { color: "success" | "warning" | "error"; text: string }>;
 	return theme.fg(chip[mode].color, chip[mode].text);
 }
@@ -5208,7 +5282,7 @@ export function writeOmpConfig(file: string, raw: Record<string, unknown>, yaml:
 }
 
 export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
-	pi.registerFlag("verdict-mode", { description: "Session approval mode: default|yolo|noAutoDeny|off", type: "string" });
+	pi.registerFlag("verdict-mode", { description: "Session approval mode: auto|unattended|supervised|off", type: "string" });
 	pi.registerFlag("auto-mode-model", { description: "Classifier model as provider/id[:thinking] (pi --model syntax; default: inherit session model)", type: "string" });
 	pi.registerFlag("auto-mode-debug", { description: "Notify every verdict incl. allows, with shadow-cache annotation", type: "boolean", default: false });
 
@@ -5250,13 +5324,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		}
 		if (v.verdict === "deny") {
 			if (v.retry) {
-				note(`🛡️ Auto Mode (yolo) blocked — needs justification: ${v.reason}\n  ${action}${debug && v.shadow ? " " + v.shadow : ""}`, "warning");
-				return { block: true, reason: blockedReason("yolo-retry", v.reason) };
+				note(`🛡️ Auto Mode (unattended) blocked — needs justification: ${v.reason}\n  ${action}${debug && v.shadow ? " " + v.shadow : ""}`, "warning");
+				return { block: true, reason: blockedReason("unattended-retry", v.reason) };
 			}
 			if (v.source === "protected-path" && !v.degraded) {
-				// yolo: no action line and no detail — the path plaintext must not reach notifications or the agent (PP-6)
-				note(`🛡️ Auto Mode (yolo) blocked protected-path access: ${v.reason}`, "warning");
-				return { block: true, reason: blockedReason("protected-path", `yolo mode denies protected-path access: ${v.reason}`) };
+				// unattended: no action line and no detail — the path plaintext must not reach notifications or the agent (PP-6)
+				note(`🛡️ Auto Mode (unattended) blocked protected-path access: ${v.reason}`, "warning");
+				return { block: true, reason: blockedReason("protected-path", `unattended mode denies protected-path access: ${v.reason}`) };
 			}
 			if (v.source === "protected-path") {
 				// No action line: the action string may embed the touched path, notifications must not carry protected-path plaintext
@@ -5347,15 +5421,15 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			ompGateOff: !rules.gateOmpDir,
 			confidenceThreshold: rules.confidenceThreshold,
 			thresholds:
-				rules.mode === "default"
-					? { deny: rules.defaultDenyThreshold, allow: rules.defaultAllowThreshold }
-					: rules.mode === "yolo"
-						? { deny: rules.yoloDenyThreshold, allow: null }
-						: rules.mode === "noAutoDeny"
-							? { deny: null, allow: rules.noAutoDenyAllowThreshold }
+				rules.mode === "auto"
+					? { deny: rules.autoDenyThreshold, allow: rules.autoAllowThreshold }
+					: rules.mode === "unattended"
+						? { deny: rules.unattendedDenyThreshold, allow: null }
+						: rules.mode === "supervised"
+							? { deny: null, allow: rules.supervisedAllowThreshold }
 							: { deny: null, allow: null },
-			yoloDenyPathsAllow: rules.yoloDenyPaths === "allow",
-			yoloOmpDirAllow: rules.yoloOmpDir === "allow",
+			unattendedDenyPathsAllow: rules.unattendedDenyPaths === "allow",
+			unattendedOmpDirAllow: rules.unattendedOmpDir === "allow",
 			subagentGate: rules.subagentGate,
 			grants: rules.mode === "off" ? 0 : state.grants.length,
 			remembered: rules.mode === "off" ? 0 : state.rememberedApprovals,
@@ -5478,7 +5552,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if (typeof flagMode === "string" && flagMode.trim() !== "") {
 			const m = parseModeArg(flagMode);
 			if (m) sessionRaw.mode = m;
-			else ctx.ui.notify(`pi-verdict: --verdict-mode "${flagMode}" is not one of default|yolo|noAutoDeny|off — ignored`, "warning");
+			else {
+				const hit = renamedMode(flagMode);
+				if (hit) ctx.ui.notify(`pi-verdict: --verdict-mode "${flagMode}" was renamed to "${hit.to}" — ignored`, "warning");
+				else ctx.ui.notify(`pi-verdict: --verdict-mode "${flagMode}" is not one of auto|unattended|supervised|off — ignored`, "warning");
+			}
 		}
 		const report = state.reset(ctx.cwd, sessionTrustedRoot, sessionRaw);
 		if (sessionError) ctx.ui.notify(`pi-verdict: ${sessionError}`, "warning");
@@ -5508,7 +5586,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		pi.registerShortcut(registeredToggleKey as PiShortcutKey, {
 			description: "Cycle approval mode (pi-verdict)",
 			handler: (ctx) => {
-				const order: readonly ApprovalMode[] = ["default", "yolo", "noAutoDeny", "off"];
+				const order: readonly ApprovalMode[] = ["auto", "unattended", "supervised", "off"];
 				setSessionSetting("mode", order[(order.indexOf(state.userRules.mode) + 1) % order.length], ctx);
 			},
 		});
@@ -5604,7 +5682,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	async function openQuickPanel(ctx: ExtensionContext): Promise<void> {
 		const mods = typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
 		if (!mods) {
-			ctx.ui.notify("pi-verdict: the settings panel needs an interactive TUI — use /automode status|default|yolo|noautodeny|off|forget", "warning");
+			ctx.ui.notify("pi-verdict: the settings panel needs an interactive TUI — use /automode status|auto|unattended|supervised|off|forget", "warning");
 			return;
 		}
 		const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
@@ -5614,9 +5692,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		let openRoot = false;
 		const sections: Array<{ label: string; mode: ApprovalMode | null; items: Array<{ key: SessionKey; label: string }> }> = [
 			{ label: "all modes", mode: null, items: [{ key: "confidenceThreshold", label: "confidence threshold" }, { key: "classifierFallbackMode", label: "fallback mode" }] },
-			{ label: "default", mode: "default", items: [{ key: "defaultDenyThreshold", label: "deny threshold" }, { key: "defaultAllowThreshold", label: "allow threshold" }] },
-			{ label: "yolo", mode: "yolo", items: [{ key: "yoloDenyThreshold", label: "deny threshold" }, { key: "yoloDenyPaths", label: "denyPaths hit" }, { key: "yoloOmpDir", label: ".omp gate hit" }] },
-			{ label: "noAutoDeny", mode: "noAutoDeny", items: [{ key: "noAutoDenyAllowThreshold", label: "allow threshold" }] },
+			{ label: "auto", mode: "auto", items: [{ key: "autoDenyThreshold", label: "deny threshold" }, { key: "autoAllowThreshold", label: "allow threshold" }] },
+			{ label: "unattended", mode: "unattended", items: [{ key: "unattendedDenyThreshold", label: "deny threshold" }, { key: "unattendedDenyPaths", label: "denyPaths hit" }, { key: "unattendedOmpDir", label: ".omp gate hit" }] },
+			{ label: "supervised", mode: "supervised", items: [{ key: "supervisedAllowThreshold", label: "allow threshold" }] },
 		];
 		const ctl: MenuController = {
 			title: "approval",
@@ -6091,13 +6169,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		};
 
 		const BUILTIN_PAGE = "builtin";
-		const PATH_TIER_DESC: Record<PathTierId, string> = {
-			"s0-secret": "credential and secret files, read or write",
-			"s1-system-read": "reads under system prefixes (/etc, /usr, /var, /System, authorized_keys)",
-			"s1-system-write": "writes under those system prefixes",
-			"s2-user-rc-write": "writes to shell rc, .gitconfig, crontab, LaunchAgents, systemd user units",
-			"s3-git-meta-write": "writes to .git/hooks, .git/config, .git/modules, .gitmodules",
-		};
 		const plainObject = (v: unknown): Record<string, unknown> | null => (typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
 		/** What `inherit` resolves to for one danger rule / path tier at `scope`: the nearest lower scope with a valid entry, else the built-in default. */
 		const inheritedBuiltin = (scope: MenuScope, mapKey: "dangerRules" | "pathRules", id: string, fallback: string): { source: MenuScope | "default"; text: string } => {
@@ -6329,25 +6400,25 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		ctx.ui.notify(n === 0 ? "🛡️ no remembered approvals" : `🛡️ forgot ${n} remembered approval${n === 1 ? "" : "s"} — identical calls ask again`, "info");
 	}
 
-	/** `/automode status` body: effective mode + source, thresholds, yolo protected actions, then the shadow/denyPaths/audit/fallback hints. */
+	/** `/automode status` body: effective mode + source, thresholds, unattended protected actions, then the shadow/denyPaths/audit/fallback hints. */
 	const statusText = (): string => {
 		const r = state.userRules;
 		const src = state.settingSources;
 		const pct = (v: number | null): string => (v === null ? "off" : `${v}%`);
 		const lines = [r.mode === "off" ? `Auto Mode: off (${src.mode})` : `🛡️ Approval mode: ${r.mode} (${src.mode})`];
 		lines.push(`confidence threshold: ${pct(r.confidenceThreshold)} (${src.confidenceThreshold})`);
-		if (r.mode === "default") lines.push(`thresholds: deny ${pct(r.defaultDenyThreshold)} (${src.defaultDenyThreshold}), allow ${pct(r.defaultAllowThreshold)} (${src.defaultAllowThreshold})`);
-		if (r.mode === "yolo") {
-			lines.push(`thresholds: deny ${pct(r.yoloDenyThreshold)} (${src.yoloDenyThreshold})`);
-			lines.push(`protected paths: denyPaths ${r.yoloDenyPaths} (${src.yoloDenyPaths}), .omp ${r.yoloOmpDir} (${src.yoloOmpDir})`);
+		if (r.mode === "auto") lines.push(`thresholds: deny ${pct(r.autoDenyThreshold)} (${src.autoDenyThreshold}), allow ${pct(r.autoAllowThreshold)} (${src.autoAllowThreshold})`);
+		if (r.mode === "unattended") {
+			lines.push(`thresholds: deny ${pct(r.unattendedDenyThreshold)} (${src.unattendedDenyThreshold})`);
+			lines.push(`protected paths: denyPaths ${r.unattendedDenyPaths} (${src.unattendedDenyPaths}), .omp ${r.unattendedOmpDir} (${src.unattendedOmpDir})`);
 		}
-		if (r.mode === "noAutoDeny") lines.push(`thresholds: allow ${pct(r.noAutoDenyAllowThreshold)} (${src.noAutoDenyAllowThreshold})`);
+		if (r.mode === "supervised") lines.push(`thresholds: allow ${pct(r.supervisedAllowThreshold)} (${src.supervisedAllowThreshold})`);
 		const remembered = state.rememberedApprovals > 0 ? `\nremembered approvals: ${state.rememberedApprovals} (this session)` : "";
-		return `${lines.join("\n")}\n${state.shadow.summary()}${denyPathsHint()}${auditHint()}${fallbackHint()}${remembered}\nUsage: /automode [status|default|yolo|noautodeny|off|forget]${toggleHint()}`;
+		return `${lines.join("\n")}\n${state.shadow.summary()}${denyPathsHint()}${auditHint()}${fallbackHint()}${remembered}\nUsage: /automode [status|auto|unattended|supervised|off|forget]${toggleHint()}`;
 	};
 
 	pi.registerCommand("automode", {
-		description: "Approval mode: open the quick settings panel, or /automode status|default|yolo|noautodeny|off|forget",
+		description: "Approval mode: open the quick settings panel, or /automode status|auto|unattended|supervised|off|forget",
 		handler: async (args, ctx) => {
 			const arg = args.trim().toLowerCase();
 			if (arg === "forget") {
@@ -6364,12 +6435,17 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			if (m) {
 				const changed = m !== state.userRules.mode;
 				setSessionSetting("mode", m, ctx);
-				const tail = m === "yolo" ? " — no prompts: uncertain calls are blocked with an explain/rewrite request" : m === "off" ? " — tool calls execute directly" : "";
+				const tail = m === "unattended" ? " — no prompts: uncertain calls are blocked with an explain/rewrite request" : m === "off" ? " — tool calls execute directly" : "";
 				ctx.ui.notify(`🛡️ Approval mode: ${m} (${changed ? "session" : "unchanged"})${tail}\n${state.shadow.summary()}${fallbackHint()}`, "info");
 				return;
 			}
 			// unknown argument: reject strictly and list the usage (case already normalized)
-			ctx.ui.notify(`unknown argument: ${arg}\nUsage: /automode [status|default|yolo|noautodeny|off|forget]${toggleHint()}`, "warning");
+			const old = renamedMode(arg);
+			if (old) {
+				ctx.ui.notify(`"${old.from}" was renamed to "${old.to}"\nUsage: /automode [status|auto|unattended|supervised|off|forget]${toggleHint()}`, "warning");
+				return;
+			}
+			ctx.ui.notify(`unknown argument: ${arg}\nUsage: /automode [status|auto|unattended|supervised|off|forget]${toggleHint()}`, "warning");
 		},
 	});
 
@@ -6591,7 +6667,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		"Before saying a built-in rule blocks an operation, call get with key \"dangerRules\" (danger rules such as gh-release, sudo, rm-recursive) or \"pathRules\" (path tiers) to see the current action of each rule (deny, ask, allow); get needs no approval. " +
 		"Actions: get (read effective and per-scope values; no approval), set (replace a key's whole value), unset (drop a key at one scope), add/remove (one entry of a list key: allow, deny, denyPaths, tools, rules). " +
 		"Scopes: global = the user config; local = the project config (applied only when the project is trusted); session = this session only, highest precedence. " +
-		"Session scope takes only the approval keys (mode, thresholds, yoloDenyPaths, yoloOmpDir, classifierFallbackMode), gateOmpDir, footer, modeStatus, grantStatus, rootRule, dangerRules and pathRules; on list keys it appends to the effective list. " +
+		"Session scope takes only the approval keys (mode, thresholds, unattendedDenyPaths, unattendedOmpDir, classifierFallbackMode), gateOmpDir, footer, modeStatus, grantStatus, rootRule, dangerRules and pathRules; on list keys it appends to the effective list. " +
 		"dangerRules (per-id map: action \"deny\"|\"ask\"|\"allow\" for a built-in or custom danger rule, false removes a rule, {pattern, action?, reason?, flags?} adds a custom rule) and pathRules (path tier → action) merge per id with the entries already stored at the scope on set: a null id is dropped at that scope, and unset drops the whole map. " +
 		"Every change opens a confirmation dialog for the user, so always give a clear `reason`; nothing is saved unless the user approves. denyPaths values are never returned (only a count). Not available in subagents.";
 
@@ -6829,7 +6905,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				return id;
 			};
 
-			if (rules.mode === "yolo") {
+			if (rules.mode === "unattended") {
 				const actionLine = toolCallLine(GRANT_TOOL_NAME, { request, paths: paths.map(({ path: p, access }) => ({ path: p, access })), ...(ruleIds.length ? { rules: ruleIds } : {}) });
 				const widgetUi = ctx.hasUI && typeof ctx.ui.setWidget === "function" ? ctx.ui : null;
 				widgetUi?.setWidget(STATUS_WIDGET_KEY, ["🛡️ verdict: reviewing permission grant…"]);
@@ -6841,11 +6917,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				}
 				if (review.allowed) {
 					const id = addGrant("classifier");
-					ctx.ui.notify(`🛡️ Permission grant ${id} approved by the classifier (yolo): ${displaySafe(request).replace(/\s+/g, " ").slice(0, 120)}`, "info");
-					return settingsToolText(grantedText(id, "the classifier (yolo mode, no human)"));
+					ctx.ui.notify(`🛡️ Permission grant ${id} approved by the classifier (unattended): ${displaySafe(request).replace(/\s+/g, " ").slice(0, 120)}`, "info");
+					return settingsToolText(grantedText(id, "the classifier (unattended mode, no human)"));
 				}
-				ctx.ui.notify(`🛡️ Permission grant request rejected by the classifier (yolo): ${review.reason}`, "warning");
-				return settingsToolText(`Rejected (yolo mode, no human): ${review.reason}. Nothing was granted.`);
+				ctx.ui.notify(`🛡️ Permission grant request rejected by the classifier (unattended): ${review.reason}`, "warning");
+				return settingsToolText(`Rejected (unattended mode, no human): ${review.reason}. Nothing was granted.`);
 			}
 
 			if (!ctx.hasUI) return settingsToolText("Rejected: no interactive UI to ask the user, so the grant cannot be approved. Nothing was granted.");
@@ -7190,6 +7266,21 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	pi.on("tool_result", (event) => {
 		const l = typeof event.toolCallId === "string" ? state.takeLabel(event.toolCallId) : undefined;
 		if (l && labelSink) labelSink(l);
+		return undefined;
+	});
+
+	// GR-7: brief the acting agent on the gate every turn (pi: systemPrompt string; omp: string[] of sections, chained).
+	pi.on("before_agent_start", (event, ctx) => {
+		const section = gateBriefing(state.userRules, subagentIdentity(ctx) !== null);
+		if (section === null) return undefined;
+		// pi types systemPrompt as string, omp passes string[]: widen to unknown and narrow at runtime.
+		const sp: unknown = event.systemPrompt;
+		if (Array.isArray(sp)) {
+			// omp's result is { systemPrompt: string[] }; pi's type says string, so the cast bridges the host type difference only.
+			const ompResult = { systemPrompt: [...sp, section] } as unknown as BeforeAgentStartEventResult;
+			return ompResult;
+		}
+		if (typeof sp === "string") return { systemPrompt: `${sp}\n\n${section}` };
 		return undefined;
 	});
 

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+
+- **Gate briefing** ([GR-7](docs/adjudication-rules.md#gr-7-gate-briefing)): every agent turn the `before_agent_start` hook appends a `## Permission gate (pi-verdict)` section to the system prompt (pi string and omp section list both supported) that names the approval mode, lists the effective `deny` and `ask` danger rules, the non-`allow` path tiers, the `denyPaths` count (never the paths, PP-6) and the `.omp` gate, and tells the agent not to retry or rephrase a blocked call but to request a `verdict_grant` (subagents report the need instead). Omitted when the mode is `off` or for a subagent while `subagentGate` is `off`; no config switch, and it holds no per-session data besides mode and rules so the prompt stays cacheable.
+
+### Changed
+
+- **BREAKING**: the approval modes are renamed — `default` → `auto`, `yolo` → `unattended`, `noAutoDeny` → `supervised` (`off` is unchanged; `/automode` and `--verdict-mode` take `auto|unattended|supervised|off`, and the cycle shortcut order is `auto → unattended → supervised → off → auto`) — and so are the derived config and session keys: `defaultDenyThreshold` → `autoDenyThreshold`, `defaultAllowThreshold` → `autoAllowThreshold`, `yoloDenyThreshold` → `unattendedDenyThreshold`, `noAutoDenyAllowThreshold` → `supervisedAllowThreshold`, `yoloDenyPaths` → `unattendedDenyPaths`, `yoloOmpDir` → `unattendedOmpDir` ([MD-1](docs/adjudication-rules.md#md-1-modes-and-verdict-sets), [MD-6](docs/adjudication-rules.md#md-6-setting-a-mode)). A former mode value or key in a config or session override file is reported at start-up (`mode: "yolo" renamed to "unattended" — ignored`, `yoloOmpDir: renamed to unattendedOmpDir — key ignored`) and ignored, never mapped, so the mode falls back to `auto`, which is stricter than `unattended` and `supervised`; a former mode name given to `--verdict-mode` or `/automode` warns `renamed to <new>` and changes nothing. Migration: edit `pi-verdict.json` and any per-session override files by hand. The block tag `yolo-retry` is now `unattended-retry`, the reason suffixes read ` (unattended: no human can confirm this — …)` and ` (supervised: this would have been denied — your call)`, the audit `mode` field and the cascade trigger `yolo-ask` carry the new names (`unattended-ask`), and the glossary term "yolo-ask slip" is now "unattended-ask slip" ([PR-2](docs/adjudication-rules.md#pr-2-block-reason)).
+- Mode chips: the footer shows `🛡 AUTO`/`auto`, `🌙 UNATTENDED`, `👁 SUPERVISED` and `⚠ AUTO OFF · ungated` (compact style `🛡 auto`, `🌙 unattended`, `👁 supervised`, `⚠ auto off · ungated`, replacing the `●`/`○` bullets; Nerd Font style uses `\uF186` and `\uF06E` for the moon and eye), and the prompt status-bar chip shows `🛡 AUTO`, `🌙 UNATT`, `👁 SUPV` and `⚠ OFF · ungated`.
+
 ## [0.21.1] - 2026-10-17
 
 ### Changed

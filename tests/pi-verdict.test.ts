@@ -159,7 +159,7 @@ const clearAudit = () => fs.rmSync(VERDICTS(), { recursive: true, force: true })
 beforeAll(() => { process.env.PI_CODING_AGENT_DIR = TMP_AGENT; });
 afterAll(() => { delete process.env.PI_CODING_AGENT_DIR; });
 
-function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; dangerRules?: unknown; pathRules?: unknown; gateOmpDir?: unknown; classifierModel?: string | null; explainGateModel?: string | null; explainGatePrompt?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; footer?: unknown; modeStatus?: unknown; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; confidenceThreshold?: unknown; classifierFallbackMode?: unknown; mode?: unknown; autoDeny?: unknown; defaultDenyThreshold?: unknown; defaultAllowThreshold?: unknown; yoloDenyThreshold?: unknown; noAutoDenyAllowThreshold?: unknown; yoloDenyPaths?: unknown; yoloOmpDir?: unknown; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
+function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown[]; builtinDenyFloor?: boolean; dangerRules?: unknown; pathRules?: unknown; gateOmpDir?: unknown; classifierModel?: string | null; explainGateModel?: string | null; explainGatePrompt?: string | null; toggleShortcut?: string | null; audit?: boolean; notifyAllows?: boolean; footer?: unknown; modeStatus?: unknown; classifierFallbackModel?: string | null; classifierFallbackConfidence?: unknown; confidenceThreshold?: unknown; classifierFallbackMode?: unknown; mode?: unknown; autoDeny?: unknown; autoDenyThreshold?: unknown; autoAllowThreshold?: unknown; unattendedDenyThreshold?: unknown; supervisedAllowThreshold?: unknown; unattendedDenyPaths?: unknown; unattendedOmpDir?: unknown; subagentGate?: unknown; subagentAskTimeoutMs?: unknown }, invalid?: string[]): void {
 	fs.rmSync(path.join(TMP_AGENT, "config", "pi-verdict-sessions"), { recursive: true, force: true }); // session overrides never leak between tests
 	config = { allow: cfg.allow ?? [], deny: cfg.deny ?? [] };
 	const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
@@ -177,7 +177,7 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 	if (cfg.classifierFallbackConfidence !== undefined) raw.classifierFallbackConfidence = cfg.classifierFallbackConfidence;
 	if (cfg.confidenceThreshold !== undefined) raw.confidenceThreshold = cfg.confidenceThreshold;
 	if (cfg.classifierFallbackMode !== undefined) raw.classifierFallbackMode = cfg.classifierFallbackMode;
-	for (const k of ["mode", "autoDeny", "defaultDenyThreshold", "defaultAllowThreshold", "yoloDenyThreshold", "noAutoDenyAllowThreshold", "yoloDenyPaths", "yoloOmpDir"] as const) if (cfg[k] !== undefined) raw[k] = cfg[k];
+	for (const k of ["mode", "autoDeny", "autoDenyThreshold", "autoAllowThreshold", "unattendedDenyThreshold", "supervisedAllowThreshold", "unattendedDenyPaths", "unattendedOmpDir"] as const) if (cfg[k] !== undefined) raw[k] = cfg[k];
 	if (cfg.footer !== undefined) raw.footer = cfg.footer;
 	if (cfg.modeStatus !== undefined) raw.modeStatus = cfg.modeStatus;
 	if (cfg.subagentGate !== undefined) raw.subagentGate = cfg.subagentGate;
@@ -310,7 +310,7 @@ describe("built-in rules (RL-5, RL-6, PG)", () => {
 			await h.handlers.session_start({}, h.ctx);
 			return h.notifies.filter(([, l]) => l === "warning").map(([m]) => m).join("\n");
 		};
-		test("danger rule set to ask: dialog with a UI, block with the grant hint headless, block in yolo without a dialog", async () => {
+		test("danger rule set to ask: dialog with a UI, block with the grant hint headless, block in unattended without a dialog", async () => {
 			const h = session({ dangerRules: { sudo: "ask" } });
 			expect(await toolCall(h, "bash", { command: "sudo ls" })).toBeUndefined(); // confirmAnswer defaults to yes
 			expect(h.confirms).toBe(1);
@@ -321,12 +321,12 @@ describe("built-in rules (RL-5, RL-6, PG)", () => {
 			expect(r?.reason).toContain("[auto-mode rule block]");
 			expect(r?.reason).toContain("request a permission grant with verdict_grant");
 			expect(headless.confirms).toBe(0);
-			const yolo = session({ mode: "yolo", dangerRules: { sudo: "ask" } });
-			const ry = await toolCall(yolo, "bash", { command: "sudo ls" });
+			const unattended = session({ mode: "unattended", dangerRules: { sudo: "ask" } });
+			const ry = await toolCall(unattended, "bash", { command: "sudo ls" });
 			expect(ry?.block).toBe(true);
 			expect(ry?.reason).toContain("[auto-mode rule block]");
-			expect(yolo.confirms).toBe(0);
-			expect(yolo.calls).toHaveLength(0);
+			expect(unattended.confirms).toBe(0);
+			expect(unattended.calls).toHaveLength(0);
 		});
 		test("action allow (or removal with false) passes no judgment: the call goes to the classifier", async () => {
 			for (const entry of ["allow", false]) {
@@ -1004,14 +1004,14 @@ describe("/automode command", () => {
 	test("status is read-only with mode, source, stats and usage", async () => {
 		const h = session({});
 		h.commands.automode.handler("status", h.ctx);
-		expect(h.notifies[0][0]).toContain("Approval mode: default (default)");
+		expect(h.notifies[0][0]).toContain("Approval mode: auto (default)");
 		expect(h.notifies[0][0]).toContain("shadow cache");
 		expect(h.notifies[0][0]).toContain("Usage");
 	});
 	test("mode args are idempotent, annotated (unchanged) when same, case-insensitive", async () => {
 		const h = session({});
-		await h.commands.automode.handler("default", h.ctx);
-		expect(h.notifies.at(-1)![0]).toContain("default (unchanged)");
+		await h.commands.automode.handler("auto", h.ctx);
+		expect(h.notifies.at(-1)![0]).toContain("auto (unchanged)");
 		await h.commands.automode.handler("off", h.ctx);
 		expect(h.notifies.at(-1)![0]).toContain("off (session)");
 		await h.commands.automode.handler("OFF", h.ctx);
@@ -1060,7 +1060,7 @@ describe("toggle shortcut", () => {
 		const h2 = session({ toggleShortcut: "a" }); // bare printable character: would hijack text input, rejected
 		expect(Object.keys(h2.shortcuts)).toEqual([]);
 	});
-	test("handler cycles default → yolo → noAutoDeny → off → default silently", async () => {
+	test("handler cycles auto → unattended → supervised → off → auto silently", async () => {
 		const h = session({});
 		const pressKey = () => h.shortcuts["ctrl+shift+y"].handler(h.ctx);
 		const press = () => {
@@ -1068,38 +1068,38 @@ describe("toggle shortcut", () => {
 			pressKey();
 			expect(h.notifies.length).toBe(n); // the shortcut itself never notifies
 		};
-		expect((await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }))?.block).toBe(true); // default: floor blocks
+		expect((await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }))?.block).toBe(true); // auto: floor blocks
 		const modeOf = async () => {
 			h.notifies.length = 0;
 			await h.commands.automode.handler("status", h.ctx);
 			return /Approval mode: (\w+)|Auto Mode: (off)/.exec(h.notifies[0][0])!.slice(1).find(Boolean);
 		};
 		press();
-		expect(await modeOf()).toBe("yolo");
+		expect(await modeOf()).toBe("unattended");
 		press();
-		expect(await modeOf()).toBe("noAutoDeny");
+		expect(await modeOf()).toBe("supervised");
 		press();
 		expect(await modeOf()).toBe("off");
 		expect(await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" })).toBeUndefined(); // off: ungated
 		press();
-		expect(await modeOf()).toBe("default");
+		expect(await modeOf()).toBe("auto");
 		expect((await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }))?.block).toBe(true);
 	});
-	test("footer chip per mode: default success, yolo error, noAutoDeny warning, off warning", async () => {
+	test("footer chip per mode: auto success, unattended error, supervised warning, off warning", async () => {
 		const h = session({});
 		await h.handlers.session_start({}, h.ctx);
-		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "● auto · ↺ mock/glm"]);
-		expect(h.fgCalls).toContainEqual(["success", "● auto"]);
-		h.shortcuts["ctrl+shift+y"].handler(h.ctx); // yolo
-		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "● yolo · ↺ mock/glm"]);
+		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "🛡 auto · ↺ mock/glm"]);
+		expect(h.fgCalls).toContainEqual(["success", "🛡 auto"]);
+		h.shortcuts["ctrl+shift+y"].handler(h.ctx); // unattended
+		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "🌙 unattended · ↺ mock/glm"]);
 		expect(h.fgCalls.at(-1)![0]).not.toBe("success");
-		expect(h.fgCalls).toContainEqual(["error", "● yolo"]);
-		h.shortcuts["ctrl+shift+y"].handler(h.ctx); // noAutoDeny
-		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "● no-autodeny · ↺ mock/glm"]);
-		expect(h.fgCalls).toContainEqual(["warning", "● no-autodeny"]);
+		expect(h.fgCalls).toContainEqual(["error", "🌙 unattended"]);
+		h.shortcuts["ctrl+shift+y"].handler(h.ctx); // supervised
+		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "👁 supervised · ↺ mock/glm"]);
+		expect(h.fgCalls).toContainEqual(["warning", "👁 supervised"]);
 		h.shortcuts["ctrl+shift+y"].handler(h.ctx); // off
-		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "○ auto off · ungated"]);
-		expect(h.fgCalls.at(-1)).toEqual(["warning", "○ auto off · ungated"]); // yellow: a note, not a fault
+		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "⚠ auto off · ungated"]);
+		expect(h.fgCalls.at(-1)).toEqual(["warning", "⚠ auto off · ungated"]); // yellow: a note, not a fault
 	});
 	test("/automode status shows toggle hint; hidden when disabled", () => {
 		const h = session({});
@@ -1116,7 +1116,7 @@ describe("toggle shortcut", () => {
 		expect(raw).toContain("toggleShortcut");
 		expect(raw).toContain("ctrl+shift+y");
 		expect(raw).toContain("toggleShortcut sets the key that cycles the session approval mode"); // _hint text
-		expect(JSON.parse(raw)).toMatchObject({ mode: "default", confidenceThreshold: null, yoloDenyPaths: "deny", yoloOmpDir: "deny" });
+		expect(JSON.parse(raw)).toMatchObject({ mode: "auto", confidenceThreshold: null, unattendedDenyPaths: "deny", unattendedOmpDir: "deny" });
 		expect("autoDeny" in JSON.parse(raw)).toBe(false);
 	});
 });
@@ -3231,7 +3231,7 @@ describe("footer status", () => {
 		const h = session({ footer: "bogus" });
 		await h.handlers.session_start({}, h.ctx);
 		expect(h.notifies.some(([m]) => m.includes('footer: "bogus"'))).toBe(true);
-		expect(lastStatus(h)).toBe("● auto · ↺ mock/glm");
+		expect(lastStatus(h)).toBe("🛡 auto · ↺ mock/glm");
 	});
 
 	test("full style: powerline blocks, per-session counters reset on session start", async () => {
@@ -3252,7 +3252,7 @@ describe("footer status", () => {
 	});
 
 	describe("status bar styling", () => {
-		const info = { mode: "default" as const, classifier: { id: "m", thinking: "off", state: "inherited" as const }, fallback: null, counts: { allow: 0, ask: 2, deny: 0 }, floorOff: true, ompGateOff: false, confidenceThreshold: null, thresholds: { deny: null, allow: null }, yoloDenyPathsAllow: false, yoloOmpDirAllow: false, subagentGate: "off" as const };
+		const info = { mode: "auto" as const, classifier: { id: "m", thinking: "off", state: "inherited" as const }, fallback: null, counts: { allow: 0, ask: 2, deny: 0 }, floorOff: true, ompGateOff: false, confidenceThreshold: null, thresholds: { deny: null, allow: null }, unattendedDenyPathsAllow: false, unattendedOmpDirAllow: false, subagentGate: "off" as const };
 		const rgb: Record<string, string> = { success: "0;255;136", warning: "255;179;71", error: "255;71;87", accent: "0;180;255", muted: "1;1;1", dim: "2;2;2" };
 		/** omp-like theme: statusLine* names resolve; `hostNames:false` mimics pi, whose theme throws on them */
 		const theme = (hostNames: boolean) => ({
@@ -3286,7 +3286,7 @@ describe("footer status", () => {
 		});
 
 		test("a transparent bar (no bg escape) degrades to the compact line", () => {
-			expect(renderFooter(info, { ...theme(true), getBgAnsi: () => "\x1b[49m" }, "full").replace(/\x1b\[[0-9;]*m/g, "")).toBe("● auto · ⚠ floor off · ↺ m");
+			expect(renderFooter(info, { ...theme(true), getBgAnsi: () => "\x1b[49m" }, "full").replace(/\x1b\[[0-9;]*m/g, "")).toBe("🛡 auto · ⚠ floor off · ↺ m");
 		});
 	});
 
@@ -3314,7 +3314,7 @@ describe("footer status", () => {
 		const h = session({ classifierModel: "zai/flash:low" });
 		h.findMap = { "zai/flash": { id: "glm-4-flash" } };
 		await h.handlers.session_start({}, h.ctx);
-		expect(lastStatus(h)).toBe("● auto · glm-4-flash:low");
+		expect(lastStatus(h)).toBe("🛡 auto · glm-4-flash:low");
 	});
 
 	test("fallback model + mode and the confidence floor show as badges", async () => {
@@ -3359,12 +3359,12 @@ describe("footer status", () => {
 		expect(opts).toEqual({ placement: "belowEditor" });
 		expect(omp.statusSets.filter(([k]) => k === "auto-mode").every(([, t]) => t === undefined)).toBe(true); // no duplicate plain line
 		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 AUTO"); // omp: the footer is a below-editor widget, so the powerbar chip is shown (modeStatus on)
-		await omp.commands.automode.handler("yolo", omp.ctx);
-		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("YOLO");
-		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 YOLO");
+		await omp.commands.automode.handler("unattended", omp.ctx);
+		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("UNATTENDED");
+		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🌙 UNATT");
 		await omp.commands.automode.handler("off", omp.ctx);
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("AUTO OFF");
-		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 OFF · ungated");
+		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("⚠ OFF · ungated");
 
 		const pi = session({});
 		await pi.handlers.session_start({}, pi.ctx);
@@ -3434,7 +3434,7 @@ describe("footer status", () => {
 		driveMenu(h, [...times(6, MENU.DOWN), MENU.LEFT]); // footer row: off → compact
 		await h.commands.verdict.handler("", h.ctx);
 		expect(JSON.parse(fs.readFileSync(path.join(TMP_AGENT, "config", "pi-verdict.json"), "utf8")).footer).toBe("compact");
-		expect(lastStatus(h)).toMatch(/^● auto/);
+		expect(lastStatus(h)).toMatch(/^🛡 auto/);
 	});
 });
 
@@ -3998,7 +3998,7 @@ describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 		});
 	});
 
-	test("asks that did not come from the classifier never auto-allow (protected path, .omp, noAutoDeny)", async () => {
+	test("asks that did not come from the classifier never auto-allow (protected path, .omp, supervised)", async () => {
 		await withBridge({ subagentGate: "auto", denyPaths: [SENS], classifierFallbackModel: "mock/fb" }, async (root, sub) => {
 			sub.responses = [ALLOW];
 			const r = await toolCall(sub, "read", { path: path.join(SENS, "secret.md") });
@@ -4010,7 +4010,7 @@ describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 			expect(omp?.block).toBe(true);
 			expect(sub.calls.length).toBe(0);
 		});
-		await withBridge({ subagentGate: "auto", mode: "noAutoDeny", classifierFallbackModel: "mock/fb" }, async (_root, sub) => {
+		await withBridge({ subagentGate: "auto", mode: "supervised", classifierFallbackModel: "mock/fb" }, async (_root, sub) => {
 			sub.responses = [DENY, ALLOW];
 			const r = await toolCall(sub, "bash", { command: "cargo build" });
 			expect(r?.block).toBe(true);
@@ -4391,6 +4391,65 @@ describe("approve dialog code expansion and verdict label", () => {
 
 // ── Approval modes ──────────────────────────────────────
 
+describe("approval mode rename (MD-1, MD-6)", () => {
+	const CONFIG_FILE = path.join(TMP_AGENT, "config", "pi-verdict.json");
+	const warnings = (h: Harness) => h.notifies.filter(([, l]) => l === "warning").map(([m]) => m).join("\n");
+	const statusText = async (h: Harness) => {
+		h.notifies.length = 0;
+		await h.commands.automode.handler("status", h.ctx);
+		return h.notifies[0][0];
+	};
+
+	test('a former mode value in a config file is reported and ignored: the mode falls back to auto (full three-verdict prompt)', async () => {
+		const h = session({});
+		fs.writeFileSync(CONFIG_FILE, JSON.stringify({ allow: [], deny: [], mode: "yolo" }));
+		await h.handlers.session_start({}, h.ctx);
+		expect(warnings(h)).toContain('mode: "yolo" renamed to "unattended" — ignored');
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		await toolCall(h, "bash", { command: "cargo build" });
+		expect(String(h.calls[0].systemPrompt)).not.toContain("Allowed verdicts");
+	});
+
+	test("former threshold keys in a config file are reported and ignored", async () => {
+		const h = session({});
+		fs.writeFileSync(CONFIG_FILE, JSON.stringify({ allow: [], deny: [], yoloDenyThreshold: 40, noAutoDenyAllowThreshold: 60 }));
+		await h.handlers.session_start({}, h.ctx);
+		expect(warnings(h)).toContain("yoloDenyThreshold: renamed to unattendedDenyThreshold — key ignored");
+		expect(warnings(h)).toContain("noAutoDenyAllowThreshold: renamed to supervisedAllowThreshold — key ignored");
+	});
+
+	test("--verdict-mode with a former mode name warns 'renamed to' and the mode stays auto", async () => {
+		const h = session({}, { verdictMode: "noautodeny" });
+		await h.handlers.session_start({}, h.ctx);
+		expect(warnings(h)).toContain('--verdict-mode "noautodeny" was renamed to "supervised" — ignored');
+		expect(await statusText(h)).toContain("Approval mode: auto");
+	});
+
+	test("/automode with a former mode name warns 'renamed to' and leaves the mode unchanged", async () => {
+		const h = session({});
+		await h.handlers.session_start({}, h.ctx);
+		h.notifies.length = 0;
+		await h.commands.automode.handler("yolo", h.ctx);
+		const [msg, level] = h.notifies.at(-1)!;
+		expect(level).toBe("warning");
+		expect(msg.startsWith('"yolo" was renamed to "unattended"')).toBe(true);
+		expect(await statusText(h)).toContain("Approval mode: auto");
+	});
+
+	test("a former approval key in a session override file is reported and ignored", async () => {
+		const dir = path.join(TMP_AGENT, "config", "pi-verdict-sessions");
+		const h = session({});
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path.join(dir, "s1.json"), JSON.stringify({ yoloOmpDir: "allow" }));
+		try {
+			await h.handlers.session_start({}, h.ctx);
+			expect(warnings(h)).toContain("session override yoloOmpDir: renamed to unattendedOmpDir — ignored");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("approval modes", () => {
 	const SENS = path.join(TMP_AGENT, "sensitive-modes");
 	const OMP_FILE = "/proj/.omp/notes.md";
@@ -4404,19 +4463,19 @@ describe("approval modes", () => {
 	fs.mkdirSync(SENS, { recursive: true });
 
 	describe("jev probability thresholds", () => {
-		test("default: defaultDenyThreshold turns an allow with 35% deny probability into a deny, recorded in the audit", async () => {
+		test("auto: autoDenyThreshold turns an allow with 35% deny probability into a deny, recorded in the audit", async () => {
 			clearAudit();
-			const h = session({ defaultDenyThreshold: 30, audit: true });
+			const h = session({ autoDenyThreshold: 30, audit: true });
 			h.responses = [{ text: "<verdict>allow</verdict> jev: allow 60% (confidence 80%; ask 5%, deny 35%)" }];
 			const r = await toolCall(h, "bash", { command: "cargo build" });
 			expect(r?.block).toBe(true);
-			expect(r?.reason).toContain("default thresholds: allow → deny");
+			expect(r?.reason).toContain("auto thresholds: allow → deny");
 			const rec = readAudit()[0];
-			expect(rec).toMatchObject({ mode: "default", thresholdVerdict: "deny" });
+			expect(rec).toMatchObject({ mode: "auto", thresholdVerdict: "deny" });
 			clearAudit();
 		});
-		test("default: unset thresholds leave jev's own choice alone", async () => {
-			const h = session({ defaultAllowThreshold: 90 });
+		test("auto: unset thresholds leave jev's own choice alone", async () => {
+			const h = session({ autoAllowThreshold: 90 });
 			h.responses = [{ text: "<verdict>allow</verdict> jev: allow 60% (confidence 80%; ask 30%, deny 10%)" }];
 			await toolCall(h, "bash", { command: "cargo build" });
 			expect(h.confirms).toBe(1); // allow 60% < 90% → ask
@@ -4424,90 +4483,90 @@ describe("approval modes", () => {
 			h2.responses = h.responses;
 			expect(await toolCall(h2, "bash", { command: "cargo build" })).toBeUndefined();
 		});
-		test("noAutoDeny: noAutoDenyAllowThreshold turns a 60% allow into an ask", async () => {
-			const h = session({ mode: "noAutoDeny", noAutoDenyAllowThreshold: 70 });
+		test("supervised: supervisedAllowThreshold turns a 60% allow into an ask", async () => {
+			const h = session({ mode: "supervised", supervisedAllowThreshold: 70 });
 			h.responses = [{ text: "<verdict>allow</verdict> jev: allow 60% (confidence 80%; ask 40%)" }];
 			const r = await toolCall(h, "bash", { command: "cargo build" });
 			expect(r).toBeUndefined(); // confirmed by the stub
 			expect(h.confirms).toBe(1);
 		});
-		test("yolo: yoloDenyThreshold maps an ask-shaped jev verdict to allow when deny stays below the threshold", async () => {
-			const h = session({ mode: "yolo", yoloDenyThreshold: 50 });
+		test("unattended: unattendedDenyThreshold maps an ask-shaped jev verdict to allow when deny stays below the threshold", async () => {
+			const h = session({ mode: "unattended", unattendedDenyThreshold: 50 });
 			h.responses = [{ text: "<verdict>ask</verdict> jev: ask 70% (confidence 80%; allow 10%, deny 20%)" }];
 			expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
 			expect(h.confirms).toBe(0);
-			const h2 = session({ mode: "yolo", yoloDenyThreshold: 50 });
+			const h2 = session({ mode: "unattended", unattendedDenyThreshold: 50 });
 			h2.responses = [{ text: "<verdict>allow</verdict> jev: allow 40% (confidence 80%; deny 60%)" }];
 			expect((await toolCall(h2, "bash", { command: "cargo build" }))?.block).toBe(true);
 		});
 	});
 
-	describe("yolo", () => {
+	describe("unattended", () => {
 		test("an ask from the classifier becomes an explain-or-rewrite block, never a prompt", async () => {
-			const h = session({ mode: "yolo" });
+			const h = session({ mode: "unattended" });
 			h.responses = [{ text: "<verdict>ask</verdict> not sure" }];
 			const r = await toolCall(h, "bash", { command: "cargo build" });
 			expect(r?.block).toBe(true);
-			expect(r?.reason).toContain("[auto-mode yolo-retry block]");
+			expect(r?.reason).toContain("[auto-mode unattended-retry block]");
 			expect(r?.reason).toContain("explain why");
 			expect(h.confirms).toBe(0);
 		});
 		test("enforce fallback resolves the contract slip: fallback allow runs the call (two model calls)", async () => {
-			const h = session({ mode: "yolo", classifierFallbackModel: "mock/fb", classifierFallbackMode: "enforce" });
+			const h = session({ mode: "unattended", classifierFallbackModel: "mock/fb", classifierFallbackMode: "enforce" });
 			h.findMap = { "mock/fb": { id: "fb-model" } };
 			h.responses = [{ text: "<verdict>ask</verdict> not sure" }, { text: "<verdict>allow</verdict> fine" }];
 			expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
 			expect(h.calls).toHaveLength(2);
 		});
 		test("rule denies stay denies; the floor is untouched", async () => {
-			const h = session({ mode: "yolo" });
+			const h = session({ mode: "unattended" });
 			expect((await toolCall(h, "bash", { command: RM }))?.reason).toContain("[auto-mode rule block]");
 		});
-		test("protected paths: denied by default with no path plaintext; yoloDenyPaths allow passes silently", async () => {
-			const h = session({ mode: "yolo", denyPaths: [SENS] });
+		test("protected paths: denied by default with no path plaintext; unattendedDenyPaths allow passes silently", async () => {
+			const h = session({ mode: "unattended", denyPaths: [SENS] });
 			const r = await toolCall(h, "read", { path: path.join(SENS, "secret.md") });
 			expect(r?.block).toBe(true);
 			expect(r?.reason).toContain("[auto-mode protected-path block]");
-			expect(r?.reason).toContain("yolo mode denies protected-path access");
+			expect(r?.reason).toContain("unattended mode denies protected-path access");
 			expect(String(r?.reason)).not.toContain(SENS);
 			expect(h.notifies.map(([m]) => m).join("\n")).not.toContain(SENS);
 			expect(h.confirms).toBe(0);
 			expect(h.calls).toHaveLength(0);
-			const allow = session({ mode: "yolo", denyPaths: [SENS], yoloDenyPaths: "allow" });
+			const allow = session({ mode: "unattended", denyPaths: [SENS], unattendedDenyPaths: "allow" });
 			expect(await toolCall(allow, "read", { path: path.join(SENS, "secret.md") })).toBeUndefined();
 			expect(allow.confirms).toBe(0);
 		});
-		test(".omp gate follows yoloOmpDir, independent of yoloDenyPaths", async () => {
-			const h = session({ mode: "yolo" });
+		test(".omp gate follows unattendedOmpDir, independent of unattendedDenyPaths", async () => {
+			const h = session({ mode: "unattended" });
 			expect((await toolCall(h, "read", { path: OMP_FILE }))?.block).toBe(true);
 			expect(h.confirms).toBe(0);
-			const allowOmp = session({ mode: "yolo", yoloOmpDir: "allow" });
+			const allowOmp = session({ mode: "unattended", unattendedOmpDir: "allow" });
 			expect(await toolCall(allowOmp, "read", { path: OMP_FILE })).toBeUndefined();
-			const allowPaths = session({ mode: "yolo", yoloDenyPaths: "allow" });
+			const allowPaths = session({ mode: "unattended", unattendedDenyPaths: "allow" });
 			expect((await toolCall(allowPaths, "read", { path: OMP_FILE }))?.block).toBe(true);
 		});
-		test("default mode keeps the terminal ask for protected paths", async () => {
-			const h = session({ denyPaths: [SENS], yoloDenyPaths: "allow" });
+		test("auto mode keeps the terminal ask for protected paths", async () => {
+			const h = session({ denyPaths: [SENS], unattendedDenyPaths: "allow" });
 			await toolCall(h, "read", { path: path.join(SENS, "secret.md") });
 			expect(h.confirms).toBe(1);
 		});
 	});
 
-	describe("noAutoDeny", () => {
+	describe("supervised", () => {
 		test("a rule deny becomes an ask carrying the suffix; declining blocks", async () => {
-			const h = session({ mode: "noAutoDeny" });
+			const h = session({ mode: "supervised" });
 			h.confirmAnswer = false;
 			const r = await toolCall(h, "bash", { command: RM });
 			expect(h.confirms).toBe(1);
-			expect(h.confirmMsgs[0]).toContain("(noAutoDeny: this would have been denied — your call)");
+			expect(h.confirmMsgs[0]).toContain("(supervised: this would have been denied — your call)");
 			expect(r?.block).toBe(true);
 		});
 		test("a classifier deny becomes an ask; headless still denies", async () => {
-			const h = session({ mode: "noAutoDeny" });
+			const h = session({ mode: "supervised" });
 			h.responses = [{ text: "<verdict>deny</verdict> nope" }];
 			expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
 			expect(h.confirms).toBe(1);
-			const headless = session({ mode: "noAutoDeny" });
+			const headless = session({ mode: "supervised" });
 			headless.ctx.hasUI = false;
 			expect((await toolCall(headless, "bash", { command: RM }))?.block).toBe(true);
 			expect(headless.confirms).toBe(0);
@@ -4515,18 +4574,18 @@ describe("approval modes", () => {
 	});
 
 	describe("classifier prompt", () => {
-		test("yolo lists only allow/deny with the marker line; noAutoDeny only allow/ask; default carries no marker", async () => {
+		test("unattended lists only allow/deny with the marker line; supervised only allow/ask; auto carries no marker", async () => {
 			const prompt = async (mode?: string) => {
 				const h = session(mode ? { mode } : {});
 				h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 				await toolCall(h, "bash", { command: "cargo build" });
 				return String(h.calls[0].systemPrompt);
 			};
-			const yolo = await prompt("yolo");
-			expect(yolo).toContain("\nAllowed verdicts: allow, deny\n");
-			expect(yolo).toContain("<verdict>allow|deny</verdict>");
-			expect(yolo).not.toContain("- ask:");
-			const noAuto = await prompt("noAutoDeny");
+			const unattended = await prompt("unattended");
+			expect(unattended).toContain("\nAllowed verdicts: allow, deny\n");
+			expect(unattended).toContain("<verdict>allow|deny</verdict>");
+			expect(unattended).not.toContain("- ask:");
+			const noAuto = await prompt("supervised");
 			expect(noAuto).toContain("\nAllowed verdicts: allow, ask\n");
 			expect(noAuto).toContain("<verdict>allow|ask</verdict>");
 			expect(noAuto).not.toContain("- deny:");
@@ -4539,23 +4598,23 @@ describe("approval modes", () => {
 
 	describe("scopes", () => {
 		test("session beats user config, persists per session id, and survives a session_start", async () => {
-			const h = session({ mode: "yolo" });
+			const h = session({ mode: "unattended" });
 			await h.handlers.session_start({}, h.ctx);
-			expect(await statusText(h)).toContain("Approval mode: yolo (global)");
-			await h.commands.automode.handler("noautodeny", h.ctx);
-			expect(await statusText(h)).toContain("Approval mode: noAutoDeny (session)");
-			expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8"))).toEqual({ mode: "noAutoDeny" });
+			expect(await statusText(h)).toContain("Approval mode: unattended (global)");
+			await h.commands.automode.handler("supervised", h.ctx);
+			expect(await statusText(h)).toContain("Approval mode: supervised (session)");
+			expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8"))).toEqual({ mode: "supervised" });
 			await h.handlers.session_start({}, h.ctx);
-			expect(await statusText(h)).toContain("Approval mode: noAutoDeny (session)");
+			expect(await statusText(h)).toContain("Approval mode: supervised (session)");
 		});
 		test("--verdict-mode seeds the session scope; an invalid value warns and is ignored", async () => {
-			const h = session({}, { verdictMode: "YOLO" });
+			const h = session({}, { verdictMode: "UNATTENDED" });
 			await h.handlers.session_start({}, h.ctx);
-			expect(await statusText(h)).toContain("Approval mode: yolo (session)");
+			expect(await statusText(h)).toContain("Approval mode: unattended (session)");
 			const bad = session({}, { verdictMode: "turbo" });
 			await bad.handlers.session_start({}, bad.ctx);
 			expect(bad.notifies.some(([m, l]) => l === "warning" && m.includes('--verdict-mode "turbo"'))).toBe(true);
-			expect(await statusText(bad)).toContain("Approval mode: default");
+			expect(await statusText(bad)).toContain("Approval mode: auto");
 		});
 		test('"off" in a config file is ignored with a warning (session-only); autoDeny reports its replacement', async () => {
 			const h = session({ mode: "off", autoDeny: false });
@@ -4564,35 +4623,35 @@ describe("approval modes", () => {
 			expect(warnings).toContain("session-only");
 			expect(warnings).toContain("autoDeny: replaced by mode");
 			expect((await toolCall(h, "bash", { command: RM }))?.block).toBe(true); // still gated
-			expect(await statusText(h)).toContain("Approval mode: default");
+			expect(await statusText(h)).toContain("Approval mode: auto");
 		});
 		test("a project config can set a mode; the session override still wins", async () => {
 			await withTempDir("pv-modes-proj-", async (dir) => {
 				fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
-				fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ mode: "noAutoDeny", confidenceThreshold: 40 }));
+				fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ mode: "supervised", confidenceThreshold: 40 }));
 				fs.mkdirSync(path.join(TMP_AGENT, "config"), { recursive: true });
 				fs.writeFileSync(path.join(TMP_AGENT, "config", "pi-verdict-trust.json"), JSON.stringify({ trusted: [dir], untrusted: [] }));
 				try {
 					const h = session({}, { cwd: dir });
 					await h.handlers.session_start({}, h.ctx);
 					const before = await statusText(h);
-					expect(before).toContain("Approval mode: noAutoDeny (local)");
+					expect(before).toContain("Approval mode: supervised (local)");
 					expect(before).toContain("confidence threshold: 40% (local)");
-					await h.commands.automode.handler("yolo", h.ctx);
-					expect(await statusText(h)).toContain("Approval mode: yolo (session)");
+					await h.commands.automode.handler("unattended", h.ctx);
+					expect(await statusText(h)).toContain("Approval mode: unattended (session)");
 				} finally {
 					fs.rmSync(path.join(TMP_AGENT, "config", "pi-verdict-trust.json"), { force: true });
 				}
 			});
 		});
 		test("invalid approval values skip with a warning and fall back to defaults", async () => {
-			const h = session({ mode: "turbo", yoloDenyThreshold: 150, yoloDenyPaths: "maybe" });
+			const h = session({ mode: "turbo", unattendedDenyThreshold: 150, unattendedDenyPaths: "maybe" });
 			await h.handlers.session_start({}, h.ctx);
 			const warnings = h.notifies.filter(([, l]) => l === "warning").map(([m]) => m).join("\n");
 			expect(warnings).toContain('mode: "turbo"');
-			expect(warnings).toContain("yoloDenyThreshold: 150");
-			expect(warnings).toContain('yoloDenyPaths: "maybe"');
-			expect(await statusText(h)).toContain("Approval mode: default");
+			expect(warnings).toContain("unattendedDenyThreshold: 150");
+			expect(warnings).toContain('unattendedDenyPaths: "maybe"');
+			expect(await statusText(h)).toContain("Approval mode: auto");
 		});
 	});
 
@@ -4604,13 +4663,13 @@ describe("approval modes", () => {
 		test("RIGHT on the mode row cycles the session scope from inherit, writes and applies; the last value is a dead end and Enter wraps", async () => {
 			const h = session({});
 			const rendered: string[] = [];
-			driveMenu(h, [RIGHT, RIGHT], rendered); // inherit → default → yolo
+			driveMenu(h, [RIGHT, RIGHT], rendered); // inherit → auto → unattended
 			await h.commands.automode.handler("", h.ctx);
 			expect(rendered[0]).toContain("pi-verdict · approval");
 			expect(rendered[0]).toContain("⟨ session ⟩");
-			expect(readSession().mode).toBe("yolo");
-			expect(await statusText(h)).toContain("Approval mode: yolo (session)");
-			driveMenu(h, [RIGHT, RIGHT, RIGHT]); // yolo → noAutoDeny → off, then no further value
+			expect(readSession().mode).toBe("unattended");
+			expect(await statusText(h)).toContain("Approval mode: unattended (session)");
+			driveMenu(h, [RIGHT, RIGHT, RIGHT]); // unattended → supervised → off, then no further value
 			await h.commands.automode.handler("", h.ctx);
 			expect(readSession().mode).toBe("off");
 			driveMenu(h, [ENTER]); // wraps to inherit, which drops the key
@@ -4624,20 +4683,20 @@ describe("approval modes", () => {
 			driveMenu(h, [RIGHT], [], after);
 			await h.commands.automode.handler("", h.ctx);
 			const lines = after[0]!.split("\n");
-			expect(lines.find((l) => l.startsWith("› mode"))).toContain("‹ default ›");
+			expect(lines.find((l) => l.startsWith("› mode"))).toContain("‹ auto ›");
 			const other = lines.find((l) => l.includes("confidence threshold"))!;
 			expect(other).not.toContain("‹");
 			expect(other).not.toContain("›");
 		});
 
 		test("inherit rows show the inherited value and its source in a right column; other values hide it", async () => {
-			const h = session({ mode: "yolo" });
+			const h = session({ mode: "unattended" });
 			const rendered: string[] = [];
 			const after: string[] = [];
 			driveMenu(h, [RIGHT], rendered, after);
 			await h.commands.automode.handler("", h.ctx);
 			const first = rendered[0]!.split("\n");
-			expect(first.find((l) => l.startsWith("› mode"))).toMatch(/inherit.*yolo · global  ctrl\+shift\+y$/);
+			expect(first.find((l) => l.startsWith("› mode"))).toMatch(/inherit.*unattended · global  ctrl\+shift\+y$/);
 			expect(first.find((l) => l.includes("confidence threshold"))).toMatch(/off · default$/);
 			expect(after[0]!.split("\n").find((l) => l.startsWith("› mode"))).not.toContain("· global");
 			fs.rmSync(SESSION_FILE(), { force: true });
@@ -4669,13 +4728,13 @@ describe("approval modes", () => {
 			const h = session({});
 			const rendered: string[] = [];
 			const after: string[] = [];
-			driveMenu(h, [TAB, RIGHT], rendered, after); // session → global; mode default → yolo
+			driveMenu(h, [TAB, RIGHT], rendered, after); // session → global; mode auto → unattended
 			await h.commands.automode.handler("", h.ctx);
 			expect(rendered[0]).toContain("⟨ session ⟩");
 			expect(after[0]).toContain("⟨ global ⟩");
-			expect(readUser().mode).toBe("yolo");
+			expect(readUser().mode).toBe("unattended");
 			expect(fs.existsSync(SESSION_FILE())).toBe(false);
-			expect(await statusText(h)).toContain("Approval mode: yolo (global)");
+			expect(await statusText(h)).toContain("Approval mode: unattended (global)");
 		});
 
 		test("the mode row shows the registered toggle shortcut; other rows and a disabled key stay bare", async () => {
@@ -4694,25 +4753,25 @@ describe("approval modes", () => {
 		});
 
 		test("only the effective mode's section renders until a lists every mode", async () => {
-			const h = session({ mode: "yolo" });
+			const h = session({ mode: "unattended" });
 			const rendered: string[] = [];
 			const after: string[] = [];
 			driveMenu(h, ["a"], rendered, after);
 			await h.commands.automode.handler("", h.ctx);
 			expect(rendered[0]).toContain("─ all modes");
-			expect(rendered[0]).toContain("─ yolo");
-			expect(rendered[0]).not.toContain("─ default ");
-			expect(rendered[0]).not.toContain("─ noAutoDeny");
+			expect(rendered[0]).toContain("─ unattended");
+			expect(rendered[0]).not.toContain("─ auto ");
+			expect(rendered[0]).not.toContain("─ supervised");
 			expect(rendered[0]).toContain("▸ show all modes");
-			expect(after[0]).toContain("─ default ");
-			expect(after[0]).toContain("─ noAutoDeny");
+			expect(after[0]).toContain("─ auto ");
+			expect(after[0]).toContain("─ supervised");
 			expect(after[0]).toContain("▾ current mode only");
 		});
 
 		test("the info line names a higher-precedence scope; an untrusted local scope is flagged", async () => {
 			await withTempDir("pv-panel-proj-", async (dir) => {
 				fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
-				fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ mode: "noAutoDeny" }));
+				fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ mode: "supervised" }));
 				const trust = path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
 				fs.mkdirSync(path.dirname(trust), { recursive: true });
 				fs.writeFileSync(trust, JSON.stringify({ trusted: [dir], untrusted: [] }));
@@ -5085,7 +5144,7 @@ describe("settings tool (ST-1–ST-5)", () => {
 
 	test("invalid value is rejected before the dialog", async () => {
 		const h = await open({});
-		await expect(call(h, { action: "set", key: "defaultDenyThreshold", value: 150, scope: "global", reason: "r" })).rejects.toThrow("defaultDenyThreshold");
+		await expect(call(h, { action: "set", key: "autoDenyThreshold", value: 150, scope: "global", reason: "r" })).rejects.toThrow("autoDenyThreshold");
 		expect(h.confirms).toBe(0);
 	});
 
@@ -5278,8 +5337,8 @@ describe("permission grants (GR-1–GR-6)", () => {
 		expect(h.selects).toBe(selects);
 	});
 
-	test("GR-3: yolo grants only when the judge allows; a configured fallback must allow as well", async () => {
-		const h = await open({ mode: "yolo" });
+	test("GR-3: unattended grants only when the judge allows; a configured fallback must allow as well", async () => {
+		const h = await open({ mode: "unattended" });
 		h.responses = [ALLOW];
 		expect((await text(h, { action: "request", request: "deploy build 42" })).startsWith("Approved by the classifier")).toBe(true);
 		expect(h.calls).toHaveLength(1);
@@ -5287,10 +5346,10 @@ describe("permission grants (GR-1–GR-6)", () => {
 		expect(JSON.parse(await text(h, { action: "list" })).grants[0]).toMatchObject({ id: "G1", grantedBy: "classifier" });
 		expect(h.confirms + h.selects).toBe(0);
 
-		const fb = await open({ mode: "yolo", classifierFallbackModel: "mock/fb" });
+		const fb = await open({ mode: "unattended", classifierFallbackModel: "mock/fb" });
 		fb.findMap = { "mock/fb": { id: "fb-model" } };
 		fb.responses = [ALLOW, DENY];
-		expect((await text(fb, { action: "request", request: "deploy build 42" })).startsWith("Rejected (yolo mode, no human)")).toBe(true);
+		expect((await text(fb, { action: "request", request: "deploy build 42" })).startsWith("Rejected (unattended mode, no human)")).toBe(true);
 		expect(fb.calls).toHaveLength(2);
 		expect(JSON.parse(await text(fb, { action: "list" })).grants).toEqual([]);
 		fb.responses = [ALLOW, ALLOW];
@@ -5298,10 +5357,10 @@ describe("permission grants (GR-1–GR-6)", () => {
 		expect((await text(fb, { action: "request", request: "deploy build 42" })).startsWith("Approved by the classifier")).toBe(true);
 		expect(fb.calls).toHaveLength(2);
 
-		const deny = await open({ mode: "yolo" });
+		const deny = await open({ mode: "unattended" });
 		deny.responses = [DENY];
-		expect((await text(deny, { action: "request", request: "deploy" })).startsWith("Rejected (yolo mode, no human)")).toBe(true);
-		const none = await open({ mode: "yolo" });
+		expect((await text(deny, { action: "request", request: "deploy" })).startsWith("Rejected (unattended mode, no human)")).toBe(true);
+		const none = await open({ mode: "unattended" });
 		none.ctx.model = null;
 		expect(await text(none, { action: "request", request: "deploy" })).toContain("no classifier model available");
 	});
@@ -5467,7 +5526,7 @@ describe("permission grants (GR-1–GR-6)", () => {
 			expect(key(h)).toBe("🔑 1");
 			await h.commands.automode.handler("off", h.ctx);
 			expect(key(h)).toBeUndefined();
-			await h.commands.automode.handler("default", h.ctx);
+			await h.commands.automode.handler("auto", h.ctx);
 			expect(key(h)).toBe("🔑 1");
 			await h.commands.grants.handler("revoke all", h.ctx);
 			expect(key(h)).toBeUndefined();
@@ -5537,14 +5596,14 @@ describe("permission grants (GR-1–GR-6)", () => {
 			await h.handlers.session_start({}, h.ctx);
 			expect(JSON.parse(await text(h, { action: "list" })).grants).toMatchObject([{ id: "G1", rules: [] }]);
 		});
-		test("yolo: a gate whose yolo action is allow still refuses a built-in ask underneath", async () => {
-			const h = await open({ mode: "yolo", denyPaths: [SENS], yoloDenyPaths: "allow", pathRules: { "s0-secret": "ask" } });
+		test("unattended: a gate whose unattended action is allow still refuses a built-in ask underneath", async () => {
+			const h = await open({ mode: "unattended", denyPaths: [SENS], unattendedDenyPaths: "allow", pathRules: { "s0-secret": "ask" } });
 			const r = await toolCall(h, "read", { path: path.join(SENS, ".env") });
 			expect(r?.block).toBe(true);
 			expect(r?.reason).toContain("tier s0-secret:");
 			expect(r?.reason).toContain("verdict_grant");
 			expect(h.calls).toHaveLength(0);
-			const plain = await open({ mode: "yolo", denyPaths: [SENS], yoloDenyPaths: "allow" });
+			const plain = await open({ mode: "unattended", denyPaths: [SENS], unattendedDenyPaths: "allow" });
 			expect(await toolCall(plain, "read", { path: path.join(SENS, "notes.md") })).toBeUndefined();
 		});
 	});
@@ -5627,14 +5686,14 @@ describe("remembered approval (PR-9)", () => {
 		expect(rendered[0]).not.toContain(LABEL);
 	});
 
-	test("applies in yolo: the identical call passes without a classifier call", async () => {
+	test("applies in unattended: the identical call passes without a classifier call", async () => {
 		const h = await remembered();
-		await h.commands.automode.handler("yolo", h.ctx);
+		await h.commands.automode.handler("unattended", h.ctx);
 		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
 		expect(h.calls).toHaveLength(1);
 	});
 
-	test("rule deny wins outside noAutoDeny; the key carries the ask origin", async () => {
+	test("rule deny wins outside supervised; the key carries the ask origin", async () => {
 		const call = { toolName: "bash", input: BUILD };
 		const run = (state: SessionState) => adjudicate(state, call, adjudicateEnv({ hasUI: true }));
 		setConfig({ deny: ["^cargo\\b"] });
@@ -5644,19 +5703,19 @@ describe("remembered approval (PR-9)", () => {
 		const denied = new SessionState(undefined, TMP_AGENT);
 		denied.rememberApproval(approvalKey("rule-deny", "bash", BUILD, "/proj"));
 		expect((await run(denied)).verdict).toBe("deny");
-		setConfig({ mode: "noAutoDeny", deny: ["^cargo\\b"] });
+		setConfig({ mode: "supervised", deny: ["^cargo\\b"] });
 		const relaxed = new SessionState(undefined, TMP_AGENT);
 		relaxed.rememberApproval(approvalKey("rule-deny", "bash", BUILD, "/proj"));
 		expect(await run(relaxed)).toMatchObject({ verdict: "allow", remembered: true });
 	});
 
-	test("built-in ask: remembered in default, still passes in yolo for the exact call only", async () => {
+	test("built-in ask: remembered in auto, still passes in unattended for the exact call only", async () => {
 		const cfg = { dangerRules: { "make-deploy": { pattern: "\\bmake\\s+deploy\\b", action: "ask" } } };
 		const h = session(cfg);
 		driveDialogs(h, [[DOWN, "\r"]], []);
 		expect(await toolCall(h, "bash", { command: "make deploy" })).toBeUndefined();
 		expect(h.calls).toHaveLength(0);
-		await h.commands.automode.handler("yolo", h.ctx);
+		await h.commands.automode.handler("unattended", h.ctx);
 		expect(await toolCall(h, "bash", { command: "make deploy" })).toBeUndefined();
 		const other = await toolCall(h, "bash", { command: "make deploy prod" });
 		expect(other?.block).toBe(true);
@@ -5687,5 +5746,66 @@ describe("remembered approval (PR-9)", () => {
 		driveDialogs(h, [["\r"]], rendered);
 		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
 		expect(rendered).toHaveLength(1);
+	});
+});
+
+describe("gate briefing (GR-7)", () => {
+	const BASE = "You are a coding agent.";
+	const HEADER = "## Permission gate (pi-verdict)";
+	const briefed = async (h: Harness, systemPrompt: string | string[] = BASE): Promise<{ systemPrompt: string | string[] } | undefined> => {
+		await h.handlers.session_start({}, h.ctx);
+		return h.handlers.before_agent_start({ type: "before_agent_start", prompt: "x", systemPrompt }, h.ctx);
+	};
+	const SUB = { kind: "sub", id: "Scout1", name: "scout" };
+
+	test("default rules: appends the briefing to a string system prompt, lists deny rules and tiers, names verdict_grant", async () => {
+		const secret = fs.mkdtempSync(path.join(os.homedir(), ".pv-gr7-"));
+		try {
+			const h = session({ denyPaths: [secret] });
+			const r = await briefed(h);
+			const sp = r?.systemPrompt as string;
+			expect(sp.startsWith(`${BASE}\n\n${HEADER}`)).toBe(true);
+			expect(sp).toContain("gh-release (GitHub release change)");
+			expect(sp).toContain("s0-secret");
+			expect(sp).toContain("1 user-protected path ");
+			expect(sp).toContain("verdict_grant");
+			expect(sp).not.toContain(secret);
+			expect(sp).not.toContain(path.basename(secret));
+		} finally {
+			fs.rmSync(secret, { recursive: true, force: true });
+		}
+	});
+
+	test("omp array system prompt gets one appended section", async () => {
+		const r = await briefed(session({}), ["a", "b"]);
+		const sp = r?.systemPrompt as string[];
+		expect(sp).toHaveLength(3);
+		expect(sp.slice(0, 2)).toEqual(["a", "b"]);
+		expect(sp[2].startsWith(HEADER)).toBe(true);
+	});
+
+	test("dangerRules action ask moves the rule to the approval line", async () => {
+		const sp = (await briefed(session({ dangerRules: { sudo: "ask" } })))?.systemPrompt as string;
+		const lines = sp.split("\n");
+		const ask = lines.find((l) => l.includes("action ask): "));
+		const deny = lines.find((l) => l.includes("action deny): "));
+		expect(ask).toContain("sudo (privilege escalation (sudo))");
+		expect(deny).toBeDefined();
+		expect(deny).not.toContain("sudo");
+	});
+
+	test("mode off and an ungated subagent get no briefing", async () => {
+		expect(await briefed(session({}, { verdictMode: "off" }))).toBeUndefined();
+		const h = session({});
+		h.ctx.agent = SUB;
+		expect(await briefed(h)).toBeUndefined();
+	});
+
+	test("a gated subagent is told to report instead of requesting a grant", async () => {
+		const h = session({ subagentGate: "normal" });
+		h.ctx.agent = SUB;
+		const sp = (await briefed(h))?.systemPrompt as string;
+		expect(sp).toContain("verdict_grant is not available to subagents");
+		expect(sp).not.toContain('action "request"');
 	});
 });

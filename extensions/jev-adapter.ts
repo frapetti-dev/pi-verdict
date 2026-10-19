@@ -172,7 +172,7 @@ export function extractState(context: { messages: unknown[] }): string {
 }
 
 /** Marker line the classifier system prompt carries when the approval mode restricts the
- *  verdict set (yolo: no ask, noAutoDeny: no deny). `streamDecisions` re-reads it so the
+ *  verdict set (unattended: no ask, supervised: no deny). `streamDecisions` re-reads it so the
  *  jev `choice` question offers only the allowed verdicts. */
 export const VERDICT_CHOICES_PREFIX = "Allowed verdicts: ";
 

@@ -153,7 +153,7 @@ describe("parseJevConfidence (#63)", () => {
 
 describe("verdict prefix contract (real adjudicate pipeline)", () => {
 	// Built in the test, not at collection time: the default rules come from PI_CODING_AGENT_DIR, which `beforeAll` points at TMP_AGENT
-	// (a describe-level `new SessionState()` would load the developer's live config, e.g. mode noAutoDeny turns every deny into an ask).
+	// (a describe-level `new SessionState()` would load the developer's live config, e.g. mode supervised turns every deny into an ask).
 	const envFor = (text: string) => ({
 		cwd: "/proj",
 		hasUI: true,
@@ -466,7 +466,7 @@ describe("restricted verdict sets (approval modes)", () => {
 		expect(parseVerdictChoices("Allowed verdicts: allow, bogus")).toEqual(["allow", "ask", "deny"]);
 	});
 
-	test("yolo (no ask): only allow/deny criteria; allow absorbs the ask criterion; no-human instruction replaces prefer-ask", () => {
+	test("unattended (no ask): only allow/deny criteria; allow absorbs the ask criterion; no-human instruction replaces prefer-ask", () => {
 		const body = buildDecisionsBody("state", "m", undefined, ["allow", "deny"]) as { questions: { verdict: { criteria: Record<string, string>; instructions: string } } };
 		const v = body.questions.verdict;
 		expect(Object.keys(v.criteria)).toEqual(["allow", "deny"]);
@@ -475,7 +475,7 @@ describe("restricted verdict sets (approval modes)", () => {
 		expect(v.instructions).not.toContain("prefer ask");
 	});
 
-	test("noAutoDeny (no deny): ask absorbs the deny criterion; instructions unchanged; extra rules still appended", () => {
+	test("supervised (no deny): ask absorbs the deny criterion; instructions unchanged; extra rules still appended", () => {
 		const body = buildDecisionsBody("state", "m", "RULES", ["allow", "ask"]) as { questions: { verdict: { criteria: Record<string, string>; instructions: string } } };
 		const v = body.questions.verdict;
 		expect(Object.keys(v.criteria)).toEqual(["allow", "ask"]);
