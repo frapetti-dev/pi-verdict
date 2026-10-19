@@ -149,3 +149,17 @@ Spawn a sub-instance that loads only the repo copy, against a throwaway agent di
 - Update CHANGELOG before merging to main.
 - Issues are GitHub issues managed via `gh` (`docs/agents/issue-tracker.md`); triage labels `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` (`docs/agents/triage-labels.md`). Single-context domain docs: root `CONTEXT.md` + `docs/adjudication-rules.md` (`docs/agents/domain.md`).
 - To inspect another GitHub project's source, use `gh api`. When temporarily cloning an open-source project, use `/Volumes/RamDisk` instead of `/tmp`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (`frapetti-dev/pi-verdict`), driven via the `gh` CLI; PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `CONTEXT.md` glossary + normative `docs/adjudication-rules.md`; no ADR directory (decisions are rule `Why:` edits + `CHANGELOG.md`). See `docs/agents/domain.md`.
