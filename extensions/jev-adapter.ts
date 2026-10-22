@@ -49,6 +49,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export const PROVIDER_ID = "typesafe";
 export const MODEL_ID = "jev-latest";
 export const API_ID = "jev-decisions";
+/** `api` of omp's own OpenRouter-hosted jev models (`openrouter/typesafe/jev-*`, kind `judge`); not registered by this adapter. */
+export const OMP_OPENROUTER_API_ID = "openrouter-decisions";
 
 export const TRANSPORTS = ["openrouter", "typesafe"] as const;
 export type Transport = (typeof TRANSPORTS)[number];
@@ -291,7 +293,7 @@ function mapUsage(u: unknown): AssistantMessage["usage"] {
 	};
 }
 
-export function streamDecisions(transport: Transport, model: Model<string>, context: Context, options: StreamOptions | SimpleStreamOptions | undefined, fetcher: typeof fetch = fetch): AssistantMessageEventStream {
+export function streamDecisions(transport: Transport, model: Model<string>, context: Context, options: StreamOptions | SimpleStreamOptions | undefined, fetcher: typeof fetch = fetch, wire: string = wireModel(transport)): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	void (async () => {
 		const output: AssistantMessage = {
@@ -315,7 +317,7 @@ export function streamDecisions(transport: Transport, model: Model<string>, cont
 			const response = await fetcher(decisionsUrl(transport), {
 				method: "POST",
 				headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-				body: JSON.stringify(buildDecisionsBody(extractState(context), wireModel(transport), extra, parseVerdictChoices(spJoined))),
+				body: JSON.stringify(buildDecisionsBody(extractState(context), wire, extra, parseVerdictChoices(spJoined))),
 				signal: options?.signal,
 			});
 			const text = await response.text();

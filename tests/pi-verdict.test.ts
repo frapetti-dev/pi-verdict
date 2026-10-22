@@ -89,7 +89,8 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 	const ctx: any = {
 		cwd, hasUI: true, signal: undefined, model: { id: "mock/glm" },
 		sessionManager: { getBranch: () => branch, getSessionId: () => "s1" },
-		models: { resolve: (s: string) => h.findMap?.[s.split(",")[0].trim().replace(/:[a-z]+$/, "")] },
+		// mirrors omp: `ctx.models.resolve` only searches chat models (`getAvailable()` defaults to kind chat)
+		models: { resolve: (s: string) => { const e = h.findMap?.[s.split(",")[0].trim().replace(/:[a-z]+$/, "")]; return !e?.kind || e.kind === "chat" ? e : undefined; } },
 		modelRegistry: {
 			// omp 18 shape (#35): no `complete` on the registry — the extension must
 			// resolve completion through the compat fallback instead
@@ -4886,6 +4887,46 @@ describe("omp model roles", () => {
 		h.roles = { judge: "r/jev" };
 		await toolCall(h, "bash", { command: "cargo fmt" });
 		expect(h.calls[2].model).toBe("jev-latest");
+	});
+
+	test("a judge-kind OpenRouter jev model on the judge role (invisible to ctx.models.resolve) is found in the registry and called over the openrouter decisions endpoint with its own id", async () => {
+		const saved = { fetch: globalThis.fetch, key: process.env.OPENROUTER_API_KEY, transport: process.env.PI_VERDICT_JEV_TRANSPORT, url: process.env.PI_VERDICT_JEV_URL };
+		const restore = (name: string, v: string | undefined) => (v === undefined ? delete process.env[name] : (process.env[name] = v));
+		const seen: Array<{ url: string; auth: string; body: any }> = [];
+		globalThis.fetch = (async (url: string, init: any) => {
+			seen.push({ url: String(url), auth: init.headers.authorization, body: JSON.parse(init.body) });
+			return new Response(JSON.stringify({ answers: { verdict: { type: "choice", choice: "allow", confidence: 0.9, probabilities: { allow: 0.9, ask: 0.08, deny: 0.02 } } } }));
+		}) as typeof fetch;
+		process.env.OPENROUTER_API_KEY = "or-test-key";
+		process.env.PI_VERDICT_JEV_TRANSPORT = "typesafe"; // selects only the adapter's own model; an openrouter-decisions model keeps its transport
+		delete process.env.PI_VERDICT_JEV_URL;
+		try {
+			const h = rolesSession({}, { judge: "openrouter/typesafe/jev-1.14" }, { ompRegistry: true });
+			h.findMap = { "openrouter/typesafe/jev-1.14": { id: "typesafe/jev-1.14", provider: "openrouter", api: "openrouter-decisions", kind: "judge" } };
+			const r = await toolCall(h, "bash", { command: "cargo build" });
+			expect(r).toBeUndefined();
+			expect(seen).toHaveLength(1);
+			expect(seen[0].url).toBe("https://openrouter.ai/api/alpha/decisions");
+			expect(seen[0].auth).toBe("Bearer or-test-key");
+			expect(seen[0].body.model).toBe("typesafe/jev-1.14");
+			expect(h.notifies.filter(([m]) => m.includes('model role "judge"'))).toHaveLength(0);
+		} finally {
+			globalThis.fetch = saved.fetch;
+			restore("OPENROUTER_API_KEY", saved.key);
+			restore("PI_VERDICT_JEV_TRANSPORT", saved.transport);
+			restore("PI_VERDICT_JEV_URL", saved.url);
+		}
+	});
+
+	test("a non-callable judge-kind model on the verdict-fallback role counts as unavailable: one warning, no fallback call", async () => {
+		const h = rolesSession({ confidenceThreshold: 50, classifierFallbackModel: "mock/fb" }, { "verdict-fallback": "r/native" });
+		h.findMap = { "mock/fb": { id: "fb-model" }, "r/native": { id: "native", kind: "judge", api: "typesafe" } };
+		h.responses = [{ text: JEV_ALLOW_49 }];
+		h.confirmAnswer = true;
+		await toolCall(h, "bash", { command: "ls -la /tmp" });
+		await toolCall(h, "bash", { command: "ls -la /var" });
+		expect(h.calls).toHaveLength(2);
+		expect(h.notifies.filter(([m]) => m.includes('model role "verdict-fallback"') && m.includes("unavailable"))).toHaveLength(1);
 	});
 
 	test("an unresolvable judge role warns once and falls back to the session model, not to classifierModel", async () => {

@@ -86,7 +86,7 @@ import type * as PiAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import type { BeforeAgentStartEventResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
-import { activeTransport, type JevReason, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER, VERDICT_CHOICES_PREFIX } from "./jev-adapter";
+import { activeTransport, type JevReason, OMP_OPENROUTER_API_ID, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER, VERDICT_CHOICES_PREFIX } from "./jev-adapter";
 
 // ============================================================================
 // Rules layer: bash
@@ -1798,20 +1798,26 @@ type ClassifierRegistry = { complete?: unknown; getApiKeyForProvider?: (provider
  * exists there, so `generic` already dispatches to jev's registered
  * `provider.api.streamSimple` (auth via `provider.auth.apiKey.resolve`)
  * unmodified.
+ *
+ * omp's own OpenRouter-hosted jev judge models (`openrouter/typesafe/jev-*`, api
+ * `openrouter-decisions`) take the same branch on the openrouter transport with the
+ * model's own id as the wire slug (the `judge` role, CL-2); the transport env var
+ * only selects the adapter's own `typesafe/jev-latest` model.
  */
 function completeForClassifier(registry: ClassifierRegistry, deps: AutoModeDeps): CompletionFn {
 	const generic = completionFor(registry, deps.compatLoader);
 	const isOmpCompat = typeof registry.complete !== "function";
 	return async (m, c, o) => {
-		if (!isOmpCompat || m.provider !== JEV_PROVIDER_ID) return generic(m, c, o);
-		const transport = activeTransport();
+		const ompOpenRouterJev = m.api === OMP_OPENROUTER_API_ID;
+		if (!isOmpCompat || (m.provider !== JEV_PROVIDER_ID && !ompOpenRouterJev)) return generic(m, c, o);
+		const transport = ompOpenRouterJev ? "openrouter" : activeTransport();
 		const jevConfig = TRANSPORT_DEFAULTS[transport];
 		let apiKey: string | undefined;
 		if (jevConfig.loginProvider && typeof registry.getApiKeyForProvider === "function") {
 			apiKey = await registry.getApiKeyForProvider(jevConfig.loginProvider).catch(() => undefined);
 		}
 		apiKey ||= process.env[jevConfig.keyEnv]?.trim();
-		const result = await streamDecisions(transport, m, c as Context, { ...o, apiKey }).result();
+		const result = await streamDecisions(transport, m, c as Context, { ...o, apiKey }, undefined, ompOpenRouterJev ? m.id : undefined).result();
 		return {
 			content: result.content.filter((part): part is { type: "text"; text: string } => part.type === "text"),
 			stopReason: result.stopReason,
@@ -7083,11 +7089,27 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		}
 	}
 
-	/** Resolve a role selector (provider/id, @role alias, comma list) against authenticated models via omp's `ctx.models`. */
+	/** Resolve a role selector (provider/id, @role alias, comma list) against authenticated models via omp's `ctx.models`.
+	 *  `ctx.models.resolve` searches chat models only (`getAvailable()` defaults to kind chat), so a judge-kind model such as
+	 *  the default `judge` role's `openrouter/typesafe/jev-1.14` never resolves there; `provider/id` entries are then looked up
+	 *  in the registry directly (same auth check as a `classifierModel` spec). */
 	function roleModel(ctx: ExtensionContext, raw: string): NonNullable<ExtensionContext["model"]> | null {
 		// `models` exists only on omp's ExtensionContext; pi's type has no such member, so the shape is asserted once here
 		const ompCtx = ctx as unknown as { models?: { resolve?: (s: string) => ExtensionContext["model"] } };
-		return ompCtx.models?.resolve?.(raw) ?? null;
+		const resolved = ompCtx.models?.resolve?.(raw);
+		if (resolved) return resolved;
+		for (const entry of raw.split(",")) {
+			const model = findAuthedModel(ctx, parseModelSpec(entry.trim(), () => {}).specPart);
+			if (model) return model;
+		}
+		return null;
+	}
+
+	/** The kind of a model pi-verdict cannot call, else undefined. Callable: chat or kind-less models and omp's OpenRouter-hosted
+	 *  jev judge models (`completeForClassifier`); every other non-chat kind (native judgment runner, tiny model) is not. */
+	function uncallableKind(model: NonNullable<ExtensionContext["model"]>): string | undefined {
+		const kind = "kind" in model && typeof model.kind === "string" ? model.kind : undefined;
+		return kind === undefined || kind === "chat" || model.api === OMP_OPENROUTER_API_ID ? undefined : kind;
 	}
 
 	/** Thinking level from the first comma-separated selector's suffix. omp-only suffixes (auto/inherit) get the invalid-suffix warning → off. */
@@ -7099,23 +7121,26 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	type ModelPick = { raw: string; via: "role" | "spec"; role?: string };
 
 	function resolvePick(ctx: ExtensionContext, pick: ModelPick, warnOnce: (m: string) => void): { model: NonNullable<ExtensionContext["model"]> | null; thinking: ThinkingLevel } {
-		if (pick.via === "role") return { model: roleModel(ctx, pick.raw), thinking: roleThinking(pick.raw, warnOnce) };
+		if (pick.via === "role") {
+			const model = roleModel(ctx, pick.raw);
+			return { model: model && !uncallableKind(model) ? model : null, thinking: roleThinking(pick.raw, warnOnce) };
+		}
 		const { specPart, level } = parseModelSpec(pick.raw, warnOnce);
 		return { model: findAuthedModel(ctx, specPart), thinking: (level ?? "off") as ThinkingLevel };
 	}
 
 	let warnedJudgeKind = false;
 	/** Classifier selection, first set source wins: flag > env > omp `judge` role > `classifierModel` > none (session model).
-	 *  A `judge` assignment resolving to a non-chat model (native judgment runner, tiny model) is not callable and is skipped
-	 *  (warning only when `warn`; the footer passes false to stay side-effect free). */
+	 *  A `judge` assignment resolving to a model pi-verdict cannot call (`uncallableKind`: native judgment runner, tiny model) is
+	 *  skipped (warning only when `warn`; the footer passes false to stay side-effect free). */
 	function classifierPick(ctx: ExtensionContext, warn: boolean): ModelPick | null {
 		const top = (pi.getFlag("auto-mode-model") as string | undefined) ?? process.env.PI_AUTO_MODE_MODEL;
 		if (top !== undefined) return top ? { raw: top, via: "spec" } : null;
 		const judge = roleSelector(VERDICT_MODEL_ROLES.classifier);
 		if (judge) {
 			const judgeModel = roleModel(ctx, judge);
-			const kind = judgeModel && "kind" in judgeModel && typeof judgeModel.kind === "string" ? judgeModel.kind : undefined;
-			if (kind === undefined || kind === "chat") return { raw: judge, via: "role", role: VERDICT_MODEL_ROLES.classifier };
+			const kind = judgeModel ? uncallableKind(judgeModel) : undefined;
+			if (kind === undefined) return { raw: judge, via: "role", role: VERDICT_MODEL_ROLES.classifier };
 			if (warn && !warnedJudgeKind) {
 				warnedJudgeKind = true;
 				ctx.ui.notify(`pi-verdict: model role "${VERDICT_MODEL_ROLES.classifier}" = "${judge}" is a ${kind} model pi-verdict cannot call — using classifierModel / session model for the gate`, "warning");
