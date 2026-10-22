@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-10-23
+
 ### Fixed
 
 - omp `judge` role assigned to a jev model never loaded (`model role "judge" = "…" unavailable`, gate fell back to the session model): the role selector was resolved through `ctx.models.resolve`, which searches chat models only, so no judge-kind model ever resolved (and the "judge model pi-verdict cannot call" skip never ran). Role selectors now fall back to a `provider/id` registry lookup with a configured-auth check, and omp's OpenRouter-hosted jev judge models (`openrouter/typesafe/jev-*`, api `openrouter-decisions`) are callable: `completeForClassifier` posts to the openrouter decisions endpoint with the model's own id as wire model (`streamDecisions` gained an optional `wire` argument). Other judge-kind models (native judgment runner, `typesafe/jev-*` direct) are still skipped with one warning, and on the `verdict-fallback` / `explain-gate` roles count as unavailable ([CL-2](docs/adjudication-rules.md#cl-2-classifier-model-resolution)).
