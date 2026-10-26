@@ -5199,6 +5199,15 @@ const GRANT_STATUS_KEY = "verdict-grants";
 /** omp model roles pi-verdict reads: `judge` is omp's built-in role (gray-zone classifier); the other two are custom chat roles (listed in `/model` → Roles when assigned or tagged via omp's `modelTags`). */
 export const VERDICT_MODEL_ROLES = { classifier: "judge", fallback: "verdict-fallback", explain: "explain-gate" } as const;
 
+/** Cross-extension probe (usage-bar): who pi-verdict would bill right now. */
+export const ACTIVE_MODELS_PROBE = Symbol.for("pi-verdict:active-models");
+export interface VerdictActiveModels {
+	enabled: boolean;
+	classifier: { provider: string; id: string } | null;
+	fallback: { provider: string; id: string } | null;
+}
+export type VerdictActiveModelsProbe = (ctx: ExtensionContext) => VerdictActiveModels;
+
 /** omp `modelTags` entries that list pi-verdict's custom model roles in `/model` → Roles while unassigned */
 export const VERDICT_ROLE_TAGS: Readonly<Record<string, { name: string }>> = {
 	[VERDICT_MODEL_ROLES.fallback]: { name: "VERDICT FALLBACK" },
@@ -5442,6 +5451,18 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		};
 	}
 
+	/** Models pi-verdict would bill right now (cross-extension probe, see ACTIVE_MODELS_PROBE). Same precedence as footerInfo, side-effect free. */
+	function activeModels(ctx: ExtensionContext): VerdictActiveModels {
+		const toRef = (m: { provider: string; id: string } | null | undefined) => (m ? { provider: m.provider, id: m.id } : null);
+		const pick = classifierPick(ctx, false);
+		const resolved = pick ? resolvePick(ctx, pick, () => {}).model : null;
+		const classifier = toRef(resolved ?? ctx.model);
+		const fbRole = roleSelector(VERDICT_MODEL_ROLES.fallback);
+		const fbPick: ModelPick | null = fbRole ? { raw: fbRole, via: "role", role: VERDICT_MODEL_ROLES.fallback } : state.userRules.classifierFallbackModel ? { raw: state.userRules.classifierFallbackModel, via: "spec" } : null;
+		const fallback = fbPick ? toRef(resolvePick(ctx, fbPick, () => {}).model) : null;
+		return { enabled: state.userRules.mode !== "off", classifier, fallback };
+	}
+
 	// Footer status: full = powerline blocks, compact = plain line, off = cleared; see renderFooter.
 	// omp strips every ANSI escape from setStatus text (sanitizeStatusText), which would reduce the colored blocks to plain
 	// text, so on omp the footer is a below-editor widget (rendered through Text, SGR preserved). pi keeps setStatus.
@@ -5470,6 +5491,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** UI this factory instance published as the root's (see the registry at module level);
 	 *  session_shutdown clears the registry only if it still holds this one. */
 	let ownRootUi: UiContext | null = null;
+
+	/** Probe this factory instance published (see ACTIVE_MODELS_PROBE); session_shutdown deletes the global only if it still holds this one. */
+	let ownProbe: VerdictActiveModelsProbe | null = null;
 
 	/** Surface skipped-value and shortcut warnings from a rules (re)load */
 	function reportLoadWarnings(report: RulesLoadReport, ctx: ExtensionContext): void {
@@ -5552,6 +5576,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if (subagentIdentity(ctx) === null) {
 			rootUi = ctx.hasUI ? ctx.ui : null;
 			ownRootUi = rootUi;
+			(globalThis as Record<symbol, unknown>)[ACTIVE_MODELS_PROBE] = ownProbe = activeModels;
 		}
 		const { raw: sessionRaw, error: sessionError } = readSessionOverrides(ctx.sessionManager.getSessionId());
 		const flagMode = pi.getFlag("verdict-mode");
@@ -5577,6 +5602,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	pi.on("session_shutdown", () => {
 		if (ownRootUi !== null && rootUi === ownRootUi) rootUi = null;
 		ownRootUi = null;
+		const globals = globalThis as Record<symbol, unknown>;
+		if (ownProbe !== null && globals[ACTIVE_MODELS_PROBE] === ownProbe) delete globals[ACTIVE_MODELS_PROBE];
+		ownProbe = null;
 	});
 
 	pi.on("model_select", (_e, ctx) => refreshStatus(ctx));
