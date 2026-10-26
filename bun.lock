@@ -9,6 +9,12 @@
         "@types/node": "^26.3.0",
         "typescript": "^7.0.2",
       },
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": ">=0.84.0",
+      },
+      "optionalPeers": [
+        "@earendil-works/pi-coding-agent",
+      ],
     },
   },
   "packages": {

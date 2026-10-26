@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-26
+
+### Added
+
+- Cross-extension active-models probe: a root session publishes `globalThis[Symbol.for("pi-verdict:active-models")]` (exported as `ACTIVE_MODELS_PROBE`), a side-effect-free function `(ctx) → {enabled, classifier, fallback}` returning the `{provider, id}` of the classifier and fallback models pi-verdict would bill right now, with the same precedence as the footer. `session_shutdown` removes the global only if it still holds this instance's probe. Lets usage-bar style extensions attribute gate spend.
+
+### Changed
+
+- `bun.lock` records the optional `@earendil-works/pi-coding-agent` peer dependency already declared in `package.json`.
+
 ## [0.22.1] - 2026-10-23
 
 ### Fixed

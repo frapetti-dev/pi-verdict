@@ -5850,3 +5850,81 @@ describe("gate briefing (GR-7)", () => {
 		expect(sp).not.toContain('action "request"');
 	});
 });
+
+describe("active-models probe", () => {
+	const PROBE = Symbol.for("pi-verdict:active-models");
+	const probe = (): ((ctx: unknown) => { enabled: boolean; classifier: { provider: string; id: string } | null; fallback: { provider: string; id: string } | null }) | undefined => (globalThis as Record<symbol, any>)[PROBE];
+
+	/** Root session started with a provider-qualified session model; always shut down so the global never leaks between tests */
+	async function withRoot(cfg: Parameters<typeof session>[0], fn: (h: Harness) => Promise<void> | void, opts: Parameters<typeof session>[1] = {}): Promise<void> {
+		const h = session(cfg, opts);
+		h.ctx.model = { provider: "mock", id: "glm" };
+		await h.handlers["session_start"]({}, h.ctx);
+		try {
+			await fn(h);
+		} finally {
+			await h.handlers["session_shutdown"]({}, h.ctx);
+		}
+	}
+
+	test("root session_start publishes a probe; the classifier inherits the session model", async () => {
+		await withRoot({}, (h) => {
+			expect(typeof probe()).toBe("function");
+			expect(probe()!(h.ctx)).toEqual({ enabled: true, classifier: { provider: "mock", id: "glm" }, fallback: null });
+		});
+	});
+
+	test("a configured classifierModel is the classifier", async () => {
+		const h = session({ classifierModel: "zai/flash" });
+		h.ctx.model = { provider: "mock", id: "glm" };
+		h.findMap = { "zai/flash": { provider: "zai", id: "glm-4-flash" } };
+		await h.handlers["session_start"]({}, h.ctx);
+		try {
+			expect(probe()!(h.ctx).classifier).toEqual({ provider: "zai", id: "glm-4-flash" });
+		} finally {
+			await h.handlers["session_shutdown"]({}, h.ctx);
+		}
+	});
+
+	test("mode off reports enabled: false", async () => {
+		await withRoot({}, (h) => {
+			expect(probe()!(h.ctx).enabled).toBe(false);
+		}, { verdictMode: "off" });
+	});
+
+	test("classifierFallbackModel is the fallback; unset is null", async () => {
+		const h = session({ classifierFallbackModel: "zai/fb" });
+		h.ctx.model = { provider: "mock", id: "glm" };
+		h.findMap = { "zai/fb": { provider: "zai", id: "fb-model" } };
+		await h.handlers["session_start"]({}, h.ctx);
+		try {
+			expect(probe()!(h.ctx).fallback).toEqual({ provider: "zai", id: "fb-model" });
+		} finally {
+			await h.handlers["session_shutdown"]({}, h.ctx);
+		}
+		await withRoot({}, (h2) => {
+			expect(probe()!(h2.ctx).fallback).toBeNull();
+		});
+	});
+
+	test("session_shutdown removes the probe", async () => {
+		await withRoot({}, () => {
+			expect(probe()).toBeDefined();
+		});
+		expect(probe()).toBeUndefined();
+	});
+
+	test("a subagent session_start does not replace the root's probe", async () => {
+		await withRoot({}, async () => {
+			const published = probe();
+			const sub = makeHarness();
+			sub.install();
+			sub.ctx.agent = { kind: "sub", id: "Scout1", name: "scout" };
+			sub.ctx.hasUI = false;
+			await sub.handlers["session_start"]({}, sub.ctx);
+			expect(probe()).toBe(published);
+			await sub.handlers["session_shutdown"]({}, sub.ctx);
+			expect(probe()).toBe(published); // a subagent shutdown must not delete it either
+		});
+	});
+});
