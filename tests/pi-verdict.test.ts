@@ -5851,6 +5851,51 @@ describe("gate briefing (GR-7)", () => {
 	});
 });
 
+describe("plan-mode grant planning (GR-8)", () => {
+	const BASE = "You are a coding agent.";
+	const MARK = "Plan mode is active.";
+	const briefed = async (h: Harness, systemPrompt: string | string[] = BASE): Promise<{ systemPrompt: string | string[] } | undefined> => {
+		await h.handlers.session_start({}, h.ctx);
+		return h.handlers.before_agent_start({ type: "before_agent_start", prompt: "x", systemPrompt }, h.ctx);
+	};
+	const planState = (status: string) => ({ getState: () => ({ plan: { status } }) });
+
+	test("active omp plan mode: the briefing requires a Permission grants section requested at execution start", async () => {
+		const h = session({});
+		h.ctx.sessionModes = planState("active");
+		const sp = (await briefed(h, ["a"]))?.systemPrompt as string[];
+		const last = sp[sp.length - 1];
+		expect(last).toContain(MARK);
+		expect(last).toContain("Permission grants");
+		expect(last).toContain("first execution step");
+	});
+
+	test("inactive or paused plan mode, pi without sessionModes, or a throwing getState add no plan-mode lines", async () => {
+		const variants: unknown[] = [
+			planState("inactive"),
+			planState("paused"),
+			undefined,
+			{ getState: () => { throw new Error("x"); } },
+		];
+		for (const modes of variants) {
+			const h = session({});
+			if (modes !== undefined) h.ctx.sessionModes = modes;
+			const sp = (await briefed(h))?.systemPrompt as string;
+			expect(sp).toContain("## Permission gate (pi-verdict)");
+			expect(sp).not.toContain(MARK);
+		}
+	});
+
+	test("a gated subagent in plan mode gets no plan-mode lines", async () => {
+		const h = session({ subagentGate: "normal" });
+		h.ctx.agent = { kind: "sub", id: "Scout1", name: "scout" };
+		h.ctx.sessionModes = planState("active");
+		const sp = (await briefed(h))?.systemPrompt as string;
+		expect(sp).toContain("## Permission gate (pi-verdict)");
+		expect(sp).not.toContain(MARK);
+	});
+});
+
 describe("active-models probe", () => {
 	const PROBE = Symbol.for("pi-verdict:active-models");
 	const probe = (): ((ctx: unknown) => { enabled: boolean; classifier: { provider: string; id: string } | null; fallback: { provider: string; id: string } | null }) | undefined => (globalThis as Record<symbol, any>)[PROBE];

@@ -4949,6 +4949,21 @@ export function subagentIdentity(ctx: ExtensionContext): { id: string; name: str
 	return { id: typeof a.id === "string" ? a.id : "?", name: typeof a.name === "string" ? a.name : "?" };
 }
 
+/** omp-only: `ctx.sessionModes.getState().plan.status` (omp `SessionModeState`). true only for "active"; pi, a missing API or a throwing getState → false. */
+export function planModeActive(ctx: ExtensionContext): boolean {
+	if (!("sessionModes" in ctx)) return false;
+	const modes: unknown = ctx.sessionModes;
+	if (typeof modes !== "object" || modes === null || !("getState" in modes) || typeof modes.getState !== "function") return false;
+	try {
+		const state: unknown = modes.getState();
+		if (typeof state !== "object" || state === null || !("plan" in state)) return false;
+		const plan: unknown = state.plan;
+		return typeof plan === "object" && plan !== null && "status" in plan && plan.status === "active";
+	} catch {
+		return false;
+	}
+}
+
 function subagentLabel(id: { id: string; name: string }): string {
 	return id.id === id.name ? `subagent ${id.id}` : `subagent ${id.id} (${id.name})`;
 }
@@ -4993,8 +5008,8 @@ const BRIEFING_MODE_TEXT: Record<Exclude<ApprovalMode, "off">, string> = {
 	supervised: "a human decides: calls that would be blocked are sent to the user for approval instead.",
 };
 
-/** GR-7: system-prompt section telling the acting agent what the gate blocks, what needs approval, and how to request a grant. null = gate inert for this agent. No protected-path text (PP-6); no per-session volatile data besides mode and rules (prompt-cache stability). */
-export function gateBriefing(rules: UserRules, subagent: boolean): string | null {
+/** GR-7: system-prompt section telling the acting agent what the gate blocks, what needs approval, and how to request a grant. null = gate inert for this agent. No protected-path text (PP-6); no per-session volatile data besides mode, rules and the plan-mode status (GR-8), which changes the prompt only when plan mode is toggled (prompt-cache stability). GR-8: with `planMode` (main agent only) it adds the lines that make a plan list and first request its grants. */
+export function gateBriefing(rules: UserRules, subagent: boolean, planMode: boolean): string | null {
 	if (rules.mode === "off" || (subagent && rules.subagentGate === "off")) return null;
 	const lines: string[] = [
 		GATE_BRIEFING_HEADER,
@@ -5021,6 +5036,12 @@ export function gateBriefing(rules: UserRules, subagent: boolean): string | null
 	);
 	lines.push("- Otherwise use a safer alternative, or tell the user what was blocked and why.");
 	if (!subagent) lines.push("- Check current rule actions with verdict_settings get (key dangerRules or pathRules) before telling the user a rule blocks something.");
+	if (planMode && !subagent) {
+		lines.push(`Plan mode is active. Approving the plan may start a new session, and permission grants do not carry over, so do not request grants for the planned work while planning:`);
+		lines.push(`- The plan MUST contain a "Permission grants" section and request those grants with ${GRANT_TOOL_NAME} as its first execution step, before any step that needs them.`);
+		lines.push("- List a grant for every planned operation that falls under a rule above (a danger rule with action deny or ask, a path tier that is not allow, a .omp directory), and for every planned operation the user did not explicitly request that the classifier may refuse (for example pushing, publishing, deploying, deleting outside the workspace).");
+		lines.push('- For each grant give the request text (the exact operation and scope), the danger-rule ids for rules, and the paths with access read, write or full for paths. If no planned operation needs a grant, the section says "None".');
+	}
 	return lines.join("\n");
 }
 
@@ -7324,7 +7345,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	// GR-7: brief the acting agent on the gate every turn (pi: systemPrompt string; omp: string[] of sections, chained).
 	pi.on("before_agent_start", (event, ctx) => {
-		const section = gateBriefing(state.userRules, subagentIdentity(ctx) !== null);
+		const section = gateBriefing(state.userRules, subagentIdentity(ctx) !== null, planModeActive(ctx));
 		if (section === null) return undefined;
 		// pi types systemPrompt as string, omp passes string[]: widen to unknown and narrow at runtime.
 		const sp: unknown = event.systemPrompt;
