@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-29
+
 ### Added
 
 - Plan-mode grant planning (GR-8): while omp is in plan mode (`ctx.sessionModes.getState().plan.status === "active"`; never on pi, never for `paused`/`inactive`, a missing API or a throwing `getState`), the main agent's gate briefing (GR-7) gains lines that require the plan to contain a `Permission grants` section and to request those grants with `verdict_grant` as its first execution step, because "Approve and execute" starts a new session and grants are session-scoped (GR-6). Covers operations under a danger rule or path tier, a `.omp` directory, and operations the user did not explicitly request that the classifier may refuse. Prompt guidance only: plan files are not parsed and plan proposals are not gated; subagent briefings are unchanged. New exports `planModeActive`; `gateBriefing` takes a third `planMode` argument.
