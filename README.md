@@ -92,7 +92,7 @@ pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi]
 |---|---|---|
 | `--verdict-mode auto\|unattended\|supervised\|off` | config `mode` | approval mode for this session (session scope) |
 | `--auto-mode-model provider/id` | session model | classifier model ("self-reflection" by default) |
-| `--auto-mode-debug` | off | full verdict notifications |
+| `--auto-mode-debug` | off | full verdict notifications; also enables `/verdict-debug` (preview every screen with sample data) |
 | `PI_AUTO_MODE_MODEL` | — | env form of the model flag |
 | `PI_AUTO_MODE_DEBUG=1` | off | env form of debug (flag wins) |
 
@@ -114,6 +114,8 @@ A minimal config (the first run writes a fuller starter template, including a st
 - There is no built-in **command** allowlist — every "always allow" claim for a command is yours ([why](docs/configuration.md#why-no-built-in-command-allowlist)); path grading does mechanically allow non-sensitive reads and in-project writes ([PG-4](docs/adjudication-rules.md#pg-4-reads), [PG-5](docs/adjudication-rules.md#pg-5-writes)).
 
 Every key with its default, the approval modes, scopes (`session` > `local` > `global`), project trust, thresholds, the fallback cascade, the subagent gate, audit and the settings menus are in [docs/configuration.md](docs/configuration.md); the normative rules are in [docs/adjudication-rules.md](docs/adjudication-rules.md).
+
+**Tern.** On oh-my-pi inside Tern with the Tern Surface Protocol live, every dialog, menu, status row and the footer is drawn natively (cards, lists, meters, a `prefs` sheet, clickable buttons); anywhere else — pi, other terminals, `PI_TUI_NATIVE=0` — the ANSI UI is unchanged. There is no config key.
 
 ### Jev decisions backend (experimental)
 

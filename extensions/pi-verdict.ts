@@ -3008,6 +3008,166 @@ async function projectListStart(ui: ExtensionContext["ui"], key: EditableListKey
 }
 
 // ============================================================================
+// Tern-native UI (TSP)
+//
+// When omp runs inside Tern with the Tern Surface Protocol live, every pi-verdict surface
+// describes itself as a native node tree (describe()) instead of ANSI rows. Everywhere else
+// (pi, omp in other terminals, PI_TUI_NATIVE=0, tests) the ANSI path is untouched. The types
+// below are a local structural mirror of omp's pi-wire/pi-tui types: the shipped type packages
+// are earendil's and carry no native hooks, and omp's modules are never value-imported.
+// ============================================================================
+
+export type TspTone = "neutral" | "accent" | "info" | "success" | "warning" | "error" | "pending" | "muted" | "user";
+export type TspSpan = { t: string; s?: string };
+export interface TspNode {
+	k: string;
+	p?: Record<string, unknown>;
+	c?: readonly (TspNode | object)[];
+	key?: string;
+}
+export interface DescribeCtx {
+	readonly cols: number;
+	readonly dark: boolean;
+	readonly reduceMotion: boolean;
+	supports(kind: string): boolean;
+	feature(name: string): boolean;
+}
+export type NativeEvent =
+	| { type: "toggle"; key: string; collapsed: boolean }
+	| { type: "select"; key: string; item: string }
+	| { type: "activate"; key: string; item: string }
+	| { type: "action"; key: string; act: string; value?: string; mods: readonly string[] }
+	| { type: "change"; key: string; item: string; value: boolean | number | string | readonly string[] | null }
+	| { type: "edit"; key: string; from: number; to: number; text: string; cursor: number; len: number }
+	| { type: "undo"; key: string }
+	| { type: "send"; key: string; text: string };
+export interface NativeHooks {
+	describe?(cx: DescribeCtx): TspNode | null;
+	handleNativeEvent?(event: NativeEvent): void;
+	nativeOverlay?: { role?: string; head?: string; size?: "sm" | "md" | "lg" | "full"; anchor?: "center" | "top" | "bottom" };
+	nativeSheet?(cx: DescribeCtx): boolean;
+}
+
+/** Node builder: `{k, p, c, key}` with absent parts omitted. */
+export function tn(k: string, p?: Record<string, unknown>, c?: readonly (TspNode | object)[], key?: string): TspNode {
+	const n: TspNode = { k };
+	if (p !== undefined) n.p = p;
+	if (c !== undefined) n.c = c;
+	if (key !== undefined) n.key = key;
+	return n;
+}
+/** Text node: a plain string, or styled spans. */
+export function tnText(t: string | readonly TspSpan[], p?: Record<string, unknown>, key?: string): TspNode {
+	return tn("text", typeof t === "string" ? { text: t, ...p } : { spans: t, ...p }, undefined, key);
+}
+/** Role whose Tern styling draws prose in the sans face: free-form `text` and `md` are monospace without a role. `omp.advisor.note` is one of Tern's own `omp.*` roles (omp's advisor notes): compact 13.5px sans, no box or padding. The roles `omp.plan.feedback`, `omp.plan.prompt` and `omp.plan.note` add padding, bold or a box. A renamed role degrades to monospace only. */
+const PROSE_ROLE = "omp.advisor.note";
+/** Body-prose text node: sans in a live Tern surface. */
+export function tnProse(t: string | readonly TspSpan[], p?: Record<string, unknown>, key?: string): TspNode {
+	return tnText(t, { role: PROSE_ROLE, ...p }, key);
+}
+/** Role for a short sans heading inside a dialog (Tern's `omp.sheet.head`: 14px, weight 600); replaces monospace `card`/`section` heads. */
+const HEADING_ROLE = "omp.sheet.head";
+/** Sans heading text node (a renamed role degrades to monospace only). */
+export function tnHeading(t: string, key?: string): TspNode {
+	return tnText(t, { role: HEADING_ROLE }, key);
+}
+/** Action button in omp's button style (`omp.btn`): a click sends `action{act}` to the component; `keys` is shown as a keycap. */
+export function tnButton(label: string, act: string, opts: { keys?: string; tone?: "accent" | "error" } = {}): TspNode {
+	const children: TspNode[] = [tnText(label)];
+	if (opts.keys) children.push(tn("kbd", { keys: opts.keys.split("+") }));
+	return tn(
+		"row",
+		{ role: "omp.btn", gap: "xs", align: "center", actions: { click: act }, title: label, ...(opts.tone ? { tone: opts.tone } : {}) },
+		children,
+		act,
+	);
+}
+/** Button bar (`omp.actions`); a `null` entry is a growing spacer. */
+export function tnBar(buttons: readonly (TspNode | null)[], key = "actions"): TspNode {
+	return tn("row", { role: "omp.actions", gap: "sm" }, buttons.map((b) => b ?? tn("spacer", { grow: 1 })), key);
+}
+/**
+ * Dialog content inset from the overlay frame without a box: a vertical `spacer` above and below, and an empty `spacer` with a minimum width on each side
+ * of the content column. TSP has no padding prop on `col`/`row`, an overlay role does not pad, and a head-less `card` draws a ring.
+ */
+export function tnFramed(kids: readonly (TspNode | object)[], gap: "sm" | "md" | "lg"): TspNode {
+	const side = (key: string): TspNode => tn("spacer", { min: { w: "2ch" } }, undefined, key);
+	return tn(
+		"col",
+		{ gap: "none" },
+		[tn("spacer", { size: "sm" }, undefined, "top"), tn("row", { align: "start" }, [side("left"), tn("col", { gap, grow: 1 }, kids, "content"), side("right")], "inset"), tn("spacer", { size: "sm" }, undefined, "bottom")],
+		"frame",
+	);
+}
+/** Overlay width that maps to an undeclared `md` on omp's TSP backend: a floating dialog at every pane width (a declared `md`/`lg` fills panes under 100 columns). */
+const NATIVE_MD_OVERLAY = { overlay: true, overlayOptions: { width: "60%" } } as const;
+interface RadioGlyphs {
+	on: string;
+	off: string;
+}
+/** The host theme's radio glyphs (omp `theme.radio`), else omp's defaults. */
+function radioGlyphs(theme: unknown): RadioGlyphs {
+	const radio = (theme as { radio?: { selected?: unknown; unselected?: unknown } } | undefined)?.radio;
+	const pick = (v: unknown, fallback: string): string => (typeof v === "string" && v !== "" ? v : fallback);
+	return { on: pick(radio?.selected, "◉"), off: pick(radio?.unselected, "○") };
+}
+/** A radio row label as spans, like omp's ask tool: filled glyph in accent when chosen, hollow in dim otherwise. */
+function radioLabel(g: RadioGlyphs, label: string, on: boolean): TspSpan[] {
+	return [{ t: `${on ? g.on : g.off} `, s: on ? "accent" : "dim" }, { t: label }];
+}
+/** Event `key` is a node key path; the component's own node is the segment after the last `/`. */
+export function leafKey(key: string): string {
+	return key.slice(key.lastIndexOf("/") + 1);
+}
+
+let nativeHost: { nativeRendering?: unknown } | undefined;
+/** Record the host TUI handed to any factory (ui.custom, setWidget). */
+function noteHostTui(tui: unknown): void {
+	if (tui && typeof tui === "object") nativeHost = tui as { nativeRendering?: unknown };
+}
+/** True only while omp renders through a live Tern surface. pi's TUI has no such getter, so this is always false on pi. */
+export function nativeLive(): boolean {
+	return nativeHost?.nativeRendering === true;
+}
+const TUI_PROBE_KEY = "pi-verdict-tui-probe";
+
+/**
+ * `ui.setWidget` that publishes a native node while TSP is live and the plain `lines` otherwise (`undefined` clears). The native
+ * factory's render reproduces exactly what omp draws for a string-array widget (one `Text` per line), so non-native consumers of
+ * the same component see no difference.
+ */
+function setWidgetNative(ui: UiContext, key: string, lines: string[] | undefined, node: () => TspNode, options?: Parameters<UiContext["setWidget"]>[2]): void {
+	const mods = dialogModulesReady;
+	if (lines === undefined || !nativeLive() || !mods) {
+		ui.setWidget(key, lines, options);
+		return;
+	}
+	ui.setWidget(
+		key,
+		(tui) => {
+			noteHostTui(tui);
+			return {
+				render: (w: number): string[] => lines.flatMap((l) => new mods.tui.Text(l, 1, 0).render(w)),
+				invalidate(): void {},
+				describe: node,
+			};
+		},
+		options,
+	);
+}
+
+/** Native classifier-status row: spinner while a model runs, a badge while waiting for the user. Phase, tool name and model id only (PP-6). */
+export function statusNode(text: string, busy: boolean): TspNode {
+	return tn("row", { gap: "sm", align: "center", role: "pi-verdict.status" }, [busy ? tn("spinner", { style: "dots" }) : tn("badge", { text: "verdict", tone: "warning" }), tnProse(text)]);
+}
+
+/** Show the classifier-status row (native node in a live Tern surface, ANSI line elsewhere). Phase, tool name and model id only (PP-6). */
+function showStatusRow(ui: UiContext, text: string, busy: boolean): void {
+	setWidgetNative(ui, STATUS_WIDGET_KEY, [ui.theme.fg("warning", `🛡️ verdict: ${text}`)], () => statusNode(text, busy));
+}
+
+// ============================================================================
 // Settings menu (/automode, /verdict): sections, ‹value› rows, Tab scope
 // ============================================================================
 
@@ -3129,7 +3289,7 @@ export function buildSettingsMenu(
 	theme: Pick<Theme, "fg" | "bold">,
 	ctl: MenuController,
 	done: () => void,
-): PiTui.Component & { handleInput(data: string): void; focused: boolean } {
+): PiTui.Component & { handleInput(data: string): void; focused: boolean } & NativeHooks {
 	const { CURSOR_MARKER, Input, getKeybindings, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } = mods.tui;
 	const { DynamicBorder } = mods.agent;
 	type ColorName = Parameters<Theme["fg"]>[0];
@@ -3356,10 +3516,259 @@ export function buildSettingsMenu(
 		index = parents.pop() ?? 0;
 	};
 
-	const component: PiTui.Component & { handleInput(data: string): void; focused: boolean } = {
+	/** Enter on a row (keyboard Enter and native `activate`): `prevPending` / `prevArmed` are the states before this key cleared them. */
+	const enter = (row: MenuRow, prevPending: typeof pending, prevArmed: typeof armed): void => {
+		switch (row.kind) {
+			case "choice":
+				if (row.locked !== undefined) break;
+				if (prevPending?.id === row.id) ctl.change(scope, row.id, prevPending.value);
+				else stepChoice(row, 1, true, row.value);
+				break;
+			case "page":
+				if (row.locked !== undefined) break;
+				parents.push(index);
+				page = row.id;
+				index = 0;
+				break;
+			case "action":
+				if (row.confirm && prevArmed !== row.id) armed = row.id;
+				else ctl.action(scope, row.id);
+				break;
+			case "add":
+				editing = { id: row.id, placeholder: row.placeholder, input: new Input() };
+				break;
+			case "entry": {
+				if (row.text.includes("\n")) break; // multi-line entries are removable only (the inline field is single-line)
+				const input = new Input();
+				input.setValue(row.text);
+				input.handleInput("\x05"); // setValue keeps the cursor at 0; ctrl+e (cursorLineEnd) moves it behind the prefilled text
+				editing = { id: row.id, placeholder: "", input };
+				break;
+			}
+			default:
+				break;
+		}
+	};
+
+	// ---- Tern prefs (native) ----
+	const percentNum = (v: string): number => (v === "inherit" ? -2 : v === "off" ? -1 : Number.parseFloat(v));
+	const percentText = (n: number, allowInherit: boolean): string => (n === -2 ? (allowInherit ? "inherit" : "off") : n === -1 ? "off" : `${n}%`);
+	const inheritPrefix = (r: { inherited?: { text: string; source: string } }, shown: string): string =>
+		shown === "inherit" && r.inherited ? `inherits ${r.inherited.text} · ${r.inherited.source}. ` : "";
+	/** The transient keyboard warnings, reworded for pointer use. */
+	const nativeWarning = (text: string): string => (text === WARN_APPLY ? "press Apply to commit" : text === WARN_CONFIRM ? "activate again to confirm" : text === WARN_REMOVE ? "clear the value again to remove" : text);
+	type PrefRow = Record<string, unknown>;
+	type PrefSection = { id: string; title: string; rows: PrefRow[] };
+	let prefsMemo: { sig: string; node: TspNode } | undefined;
+	const describePrefs = (cx: DescribeCtx): TspNode | null => {
+		if (!cx.supports("prefs")) return null;
+		const { rs, row: selected } = current();
+		const pages = [
+			{ id: "__main", label: ctl.title },
+			...ctl.rows(scope, null).flatMap((r) => (r.kind === "page" ? [{ id: r.id, label: r.label, ...(r.locked !== undefined ? { disabled: r.locked } : {}) }] : [])),
+		];
+		const badge = ctl.badge(scope);
+		const scopeSection: PrefSection = {
+			id: "__scope",
+			title: "Scope",
+			rows: [
+				{
+					id: "__scope",
+					label: "Saves to",
+					control: { k: "choice", value: scope, options: ctl.scopes.map((s) => ({ value: s, label: ctl.badge(s).label })), style: "segmented" },
+					...(badge.warn ? { warning: badge.label } : {}),
+				},
+			],
+		};
+		const body: PrefSection[] = [];
+		const target = (): PrefSection => {
+			if (body.length === 0) body.push({ id: "s-top", title: page === null ? ctl.title : ctl.pageTitle(page), rows: [] });
+			return body[body.length - 1]!;
+		};
+		rs.forEach((r, i) => {
+			if (r.kind === "section") {
+				body.push({ id: `s${i}`, title: r.label, rows: [] });
+				return;
+			}
+			if (r.kind === "page") return;
+			const info = infoOf(r);
+			const hintText = info.filter((l) => l.tone !== "warning").map((l) => l.text).join(" ");
+			const warnText = info.filter((l) => l.tone === "warning").map((l) => nativeWarning(l.text)).join(" ");
+			const common = (prefix: string, suffix = ""): PrefRow => {
+				const hint = `${prefix}${hintText}${suffix}`.trim();
+				return { ...(hint !== "" ? { hint } : {}), ...(warnText !== "" ? { warning: warnText } : {}) };
+			};
+			const rows = target().rows;
+			switch (r.kind) {
+				case "choice": {
+					const isPending = pending?.id === r.id;
+					const shown = isPending ? pending!.value : r.value;
+					rows.push({
+						id: r.id,
+						label: r.label,
+						control: { k: "choice", value: shown, options: r.values.map((v) => ({ value: v, label: v })) },
+						...common(inheritPrefix(r, shown)),
+						...(r.locked !== undefined ? { disabled: r.locked } : {}),
+					});
+					if (isPending) rows.push({ id: `${r.id}::apply`, label: `Apply ${pending!.value}`, control: { k: "action", label: "Apply", act: "apply" } });
+					break;
+				}
+				case "percent": {
+					const cur = percentNum(r.value);
+					const labels: Record<string, string> = { ...(r.allowInherit ? { "-2": "inherit" } : {}), "-1": "off" };
+					for (let n = 0; n <= 100; n += 5) labels[String(n)] = `${n}%`;
+					if (cur >= 0 && !(String(cur) in labels)) labels[String(cur)] = `${cur}%`;
+					rows.push({ id: r.id, label: r.label, control: { k: "number", value: cur, labels }, ...common(inheritPrefix(r, r.value)) });
+					break;
+				}
+				case "action":
+					rows.push({ id: r.id, label: r.label, control: { k: "action", label: r.label, act: "run" }, ...common("", r.key ? ` (key ${r.key})` : "") });
+					break;
+				case "add":
+					rows.push({ id: r.id, label: "Add", control: { k: "text", value: "", placeholder: r.placeholder, mono: true }, ...common("") });
+					break;
+				case "entry":
+					if (r.editable && r.text.includes("\n")) {
+						rows.push({ id: r.id, label: displaySafe(r.text.replace(/\r?\n/g, "⏎")), control: { k: "action", label: "Remove", act: "remove" }, ...common("") });
+					} else {
+						rows.push({
+							id: r.id,
+							label: r.tag ?? "",
+							control: { k: "text", value: displaySafe(r.text), mono: true },
+							...common(""),
+							...(r.editable ? {} : { disabled: r.tag ?? "inherited" }),
+						});
+					}
+					break;
+			}
+		});
+		// omp's Input exposes its cursor; earendil's Input has no such method.
+		const draft: (PiTui.Input & { getCursor?(): number }) | undefined = editing?.input;
+		const props = {
+			title: `pi-verdict · ${ctl.title}`,
+			pages,
+			page: page ?? "__main",
+			lead: [ctl.hotkeyHint ? `keys: ${ctl.hotkeyHint}` : null, "tab scope", "esc close"].filter((s) => s !== null).join(" · "),
+			sections: [scopeSection, ...body],
+			focus: selected && selected.kind !== "section" ? selected.id : null,
+			editing: editing && draft ? { row: editing.id, draft: draft.getValue(), cursor: draft.getCursor?.() } : null,
+		};
+		const sig = JSON.stringify(props);
+		if (prefsMemo?.sig === sig) return prefsMemo.node;
+		prefsMemo = { sig, node: tn("prefs", props) };
+		return prefsMemo.node;
+	};
+	/** Move the selection onto row `id` (when selectable); returns the row. */
+	const selectRow = (id: string): MenuRow | undefined => {
+		const rs = ctl.rows(scope, page);
+		const at = rs.findIndex((r) => "id" in r && r.id === id);
+		if (at < 0) return undefined;
+		if (selectable(rs[at]!)) index = at;
+		return rs[at];
+	};
+	/** Two-step removal of an entry row (`d` / delete key, native Remove, native clear). */
+	const removeStep = (row: MenuRow): void => {
+		if (row.kind !== "entry" || !row.editable || page === null) return;
+		if (armed === row.id) {
+			armed = undefined;
+			ctl.remove(scope, page, row.id);
+		} else armed = row.id;
+	};
+	const nativeEvent = (e: NativeEvent): void => {
+		if (e.type === "action") {
+			if (e.act === "close") {
+				done();
+				return;
+			}
+			if (e.act === "page" && e.value !== undefined) {
+				if (e.value === "__main") {
+					if (page !== null) back();
+				} else {
+					if (page !== null) back();
+					const target = ctl.rows(scope, null).find((r) => r.kind === "page" && r.id === e.value);
+					if (target?.kind === "page" && target.locked === undefined) {
+						parents.push(index);
+						page = target.id;
+						index = 0;
+					}
+				}
+			} else if (e.act === "apply" && e.value !== undefined) {
+				const id = e.value.replace(/::apply$/, "");
+				if (pending?.id === id) {
+					const value = pending.value;
+					pending = undefined;
+					ctl.change(scope, id, value);
+				}
+			} else if (e.act === "run" && e.value !== undefined) {
+				const row = selectRow(e.value);
+				if (row?.kind === "action") {
+					pending = undefined;
+					if (row.confirm && armed !== row.id) armed = row.id;
+					else {
+						armed = undefined;
+						ctl.action(scope, row.id);
+					}
+				}
+			} else if (e.act === "remove" && e.value !== undefined) {
+				const row = selectRow(e.value);
+				if (row) {
+					pending = undefined;
+					removeStep(row);
+				}
+			}
+		} else if (e.type === "select") {
+			if (e.item === "__scope") return;
+			if (selectRow(e.item)) {
+				pending = undefined;
+				armed = undefined;
+			}
+		} else if (e.type === "activate") {
+			const row = e.item === "__scope" ? undefined : selectRow(e.item);
+			if (!row || !selectable(row)) return;
+			const prevPending = pending;
+			const prevArmed = armed;
+			pending = undefined;
+			armed = undefined;
+			enter(row, prevPending, prevArmed);
+		} else if (e.type === "change") {
+			const v = e.value;
+			if (e.item === "__scope") {
+				const next = ctl.scopes.find((s) => s === v);
+				if (next !== undefined) {
+					scope = next;
+					pending = undefined;
+					armed = undefined;
+				}
+			} else {
+				const row = selectRow(e.item);
+				if (!row) return;
+				if (row.kind === "choice") {
+					if (row.locked !== undefined) return;
+					if (typeof v === "string") commit(row, v);
+					else if (v === null && row.values.includes("inherit")) commit(row, "inherit");
+				} else if (row.kind === "percent") {
+					if (typeof v === "number") commit(row, percentText(v, row.allowInherit));
+					else if (v === null) commit(row, row.allowInherit ? "inherit" : "off");
+				} else if (row.kind === "add") {
+					if (typeof v === "string" && v.trim() !== "" && page !== null) ctl.submit(scope, page, row.id, v);
+				} else if (row.kind === "entry" && row.editable) {
+					if (typeof v === "string" && v.trim() !== "" && v !== row.text && page !== null) ctl.submit(scope, page, row.id, v);
+					else if (v === null || v === "") removeStep(row);
+				}
+			}
+		} else return;
+		current();
+		tui.requestRender();
+	};
+
+	const component: PiTui.Component & { handleInput(data: string): void; focused: boolean } & NativeHooks = {
 		focused: false,
 		invalidate() {},
 		render,
+		nativeSheet: (cx) => cx.supports("prefs"),
+		nativeOverlay: { role: "pi-verdict.settings", head: `pi-verdict · ${ctl.title}`, size: "lg", anchor: "center" },
+		describe: describePrefs,
+		handleNativeEvent: nativeEvent,
 		handleInput(data: string): void {
 			if (data.startsWith("\x1b[<") || data.startsWith("\x1b[M")) return; // mouse reports are never keys
 			const kb = getKeybindings();
@@ -3409,36 +3818,7 @@ export function buildSettingsMenu(
 			} else if (data === "x" && row?.kind === "percent") commit(row, "off");
 			else if (data === "i" && row?.kind === "percent" && row.allowInherit) commit(row, "inherit");
 			else if (isEnter && row) {
-				switch (row.kind) {
-					case "choice":
-						if (row.locked !== undefined) break;
-						if (prevPending?.id === row.id) ctl.change(scope, row.id, prevPending.value);
-						else stepChoice(row, 1, true, row.value);
-						break;
-					case "page":
-						if (row.locked !== undefined) break;
-						parents.push(index);
-						page = row.id;
-						index = 0;
-						break;
-					case "action":
-						if (row.confirm && prevArmed !== row.id) armed = row.id;
-						else ctl.action(scope, row.id);
-						break;
-					case "add":
-						editing = { id: row.id, placeholder: row.placeholder, input: new Input() };
-						break;
-					case "entry": {
-						if (row.text.includes("\n")) break; // multi-line entries are removable only (the inline field is single-line)
-						const input = new Input();
-						input.setValue(row.text);
-						input.handleInput("\x05"); // setValue keeps the cursor at 0; ctrl+e (cursorLineEnd) moves it behind the prefilled text
-						editing = { id: row.id, placeholder: "", input };
-						break;
-					}
-					default:
-						break;
-				}
+				enter(row, prevPending, prevArmed);
 			} else if ((data === "d" || matchesKey(data, "delete")) && row?.kind === "entry" && page !== null) {
 				if (prevArmed === row.id) ctl.remove(scope, page, row.id);
 				else armed = row.id;
@@ -4300,6 +4680,15 @@ function paintJevCells(counts: readonly number[], theme: Pick<Theme, "fg">, nerd
 	return bar;
 }
 
+const JEV_METER_TOKENS = { allow: "success", ask: "warning", deny: "error" } as const;
+/** Native probability meter parts (allow/ask/deny order, zeros skipped); `value: null` and no parts when every probability is 0. Shared by the ask dialog and the verdict label. */
+export function jevMeterParts(p: JevReason["probabilities"]): { value: number | null; parts: { value: number; token: string; label: string }[] } {
+	const sum = p.allow + p.ask + p.deny;
+	if (sum === 0) return { value: null, parts: [] };
+	const parts = JEV_NAMES.filter((k) => p[k] > 0).map((k) => ({ value: p[k] / sum, token: JEV_METER_TOKENS[k], label: `${k} ${p[k]}%` }));
+	return { value: 1, parts };
+}
+
 /** Four lines: probability labels (icon + %, centered on each segment), probability bar (allow/ask/deny cells, largest-remainder rounding, min 1 cell per non-zero verdict, pill caps with Nerd Font), confidence labels (confidence % centered on the fill, floor % on the tick), and the confidence bar (fill to jev confidence, tick at the confidence floor). */
 export function renderJevBar(j: JevReason, minConfidence: number | null, width: number, theme: Pick<Theme, "fg" | "bold">, nerdFont: boolean): string[] {
 	const cells = Math.max(10, Math.min(48, width));
@@ -4358,6 +4747,22 @@ const LABEL_HOWS: readonly VerdictLabel["how"][] = ["rule", "classifier", "user"
 const LABEL_OUTCOME: Record<VerdictLabel["how"], string> = { rule: "allowed: rule", classifier: "allowed: classifier", user: "approved by user", "second-model": "allowed: second model (no human)", remembered: "allowed: remembered approval" };
 const LABEL_SHORT: Record<VerdictLabel["how"], string> = { rule: "rule", classifier: "classifier", user: "approved", "second-model": "2nd model", remembered: "remembered" };
 const LABEL_BAR_CELLS = 10;
+/** Max width of each transcript-label meter; Tern's bar meter otherwise grows to fill the row. */
+const LABEL_METER_MAX_W = "22ch";
+
+/** Native transcript label (TSP): tool name, how it was allowed, and, when present, the compact jev probability meter followed by the confidence meter. No reason text and no path (PP-6). */
+export function verdictLabelNode(l: VerdictLabel): TspNode {
+	const kids: TspNode[] = [
+		tnProse([{ t: displaySafe(l.tool), s: "strong" }]),
+		tn("badge", { text: LABEL_SHORT[l.how], tone: l.how === "user" || l.how === "remembered" ? "accent" : "muted" }),
+	];
+	if (l.jev) {
+		const { value, parts } = jevMeterParts(l.jev.probabilities);
+		kids.push(tn("meter", { value, ...(parts.length ? { parts } : {}), size: "sm", label: `${l.jev.choice} ${l.jev.probabilities[l.jev.choice]}%`, max: { w: LABEL_METER_MAX_W } }));
+		kids.push(tn("meter", { value: l.jev.confidence / 100, size: "sm", tone: "accent", label: `conf ${l.jev.confidence}%`, max: { w: LABEL_METER_MAX_W } }));
+	}
+	return tn("row", { gap: "sm", align: "center", role: "pi-verdict.label" }, kids);
+}
 
 function verdictLabelFor(tool: string, how: VerdictLabel["how"], reason: string): VerdictLabel {
 	const j = parseJevReason(reason);
@@ -4409,13 +4814,54 @@ export function renderVerdictLabel(l: VerdictLabel, theme: Pick<Theme, "fg" | "b
 
 type DialogModules = { tui: typeof PiTui; agent: typeof PiAgent };
 let dialogModules: Promise<DialogModules | null> | undefined;
+/** The resolved value of `dialogModules`, for synchronous widget code (undefined until loaded, null when unavailable). */
+let dialogModulesReady: DialogModules | null | undefined;
 /** Value imports are lazy so hosts and test mocks that never open the rich dialog do not load pi-tui / pi-coding-agent. */
 function loadDialogModules(): Promise<DialogModules | null> {
-	dialogModules ??= Promise.all([import("@earendil-works/pi-tui"), import("@earendil-works/pi-coding-agent")]).then(
-		([tui, agent]) => ({ tui, agent }),
-		() => null,
-	);
+	dialogModules ??= Promise.all([import("@earendil-works/pi-tui"), import("@earendil-works/pi-coding-agent")])
+		.then(
+			([tui, agent]): DialogModules | null => ({ tui, agent }),
+			() => null,
+		)
+		.then((m) => (dialogModulesReady = m));
 	return dialogModules;
+}
+
+/** What a permission grant covers, as shown in the grant dialog (GR-2). */
+interface GrantScope {
+	paths: readonly { path: string; access: GrantAccess }[];
+	rules: readonly { id: string; reason: string }[];
+}
+
+/** Plain lines for a grant scope: the ANSI dialog body and the confirm() fallback message. */
+function grantScopeLines(scope: GrantScope): string[] {
+	return [...scope.paths.map((p) => `Protected-path access: ${p.access} ${p.path}`), ...scope.rules.map((r) => `Danger rule: ${r.id} — ${r.reason}`)];
+}
+
+/** Native body sections for a grant: request, protected paths, danger rules (GR-2 grant dialog, GR-6 revoke confirmation). */
+function grantScopeNodes(request: string, scope: GrantScope): TspNode[] {
+	const nodes: TspNode[] = [tn("col", { gap: "xs" }, [tnHeading("Request"), tnProse(displaySafe(request))], "request")];
+	if (scope.paths.length > 0) {
+		nodes.push(
+			tn("col", { gap: "xs" }, [
+				tnHeading(scope.paths.length === 1 ? "Protected path" : "Protected paths"),
+				...scope.paths.map((p, i) =>
+					tn("row", { gap: "sm", align: "start" }, [tnProse([{ t: p.access, s: "muted" }], { min: { w: "6ch" }, shrink: 0 }), tnText([{ t: displaySafe(p.path), s: "code" }], { grow: 1 })], `p${i}`),
+				),
+			], "paths"),
+		);
+	}
+	if (scope.rules.length > 0) {
+		nodes.push(
+			tn("col", { gap: "xs" }, [
+				tnHeading(scope.rules.length === 1 ? "Danger rule" : "Danger rules"),
+				...scope.rules.map((r, i) =>
+					tn("row", { gap: "sm", align: "start" }, [tnText([{ t: r.id, s: "code" }], { shrink: 0 }), tnProse(displaySafe(r.reason), { grow: 1 })], `r${i}`),
+				),
+			], "rules"),
+		);
+	}
+	return nodes;
 }
 
 interface ApproveDialogSpec {
@@ -4446,8 +4892,8 @@ interface ApproveDialogSpec {
 	expansion?: { get(): boolean; toggle(): void };
 	/** "grant" = permission-grant dialog (GR-2): I approve / I reject / Ask for clarification or revision (text row; empty text keeps the dialog open). Default "ask". */
 	variant?: "ask" | "grant";
-	/** extra plain lines rendered after the reason line (protected-path access entries of a grant) */
-	extraLines?: string[];
+	/** grant variant only: what the permission grant covers (paths and danger rules) */
+	scope?: GrantScope;
 	/** offer "Yes, and don't ask again this session" (PR-9); never in the grant variant */
 	remember?: boolean;
 }
@@ -4474,6 +4920,20 @@ const GRANT_LABELS: Partial<Record<AskOption, string>> = {
 	yes: "I approve",
 	reject: "I reject",
 	no: "Ask for clarification or revision",
+};
+
+/** Second line of each native radio row (Tern): what the choice does. `explain` is a bar button there, never a row. */
+const ASK_DETAILS: Record<AskOption, string> = {
+	yes: "Run it this once",
+	always: "Same action, until the session ends",
+	no: "Block it and tell the agent why",
+	explain: "",
+	reject: "Refuse it",
+};
+const GRANT_DETAILS: Partial<Record<AskOption, string>> = {
+	yes: "Until the session ends",
+	reject: "Refuse the grant",
+	no: "Ask for details or a narrower scope",
 };
 
 /** Dim hint shown in the empty inline No field. */
@@ -4535,7 +4995,7 @@ export function buildApproveDialog(
 	const { Container, CURSOR_MARKER, Input, Markdown, Spacer, Text, getKeybindings, visibleWidth } = mods.tui;
 	const { DynamicBorder, getLanguageFromPath, getMarkdownTheme, keyHint, rawKeyHint } = mods.agent;
 	try {
-		const root = new Container() as PiTui.Container & { handleInput(data: string): void; focused: boolean };
+		const root = new Container() as PiTui.Container & { handleInput(data: string): void; focused: boolean } & NativeHooks;
 		root.focused = false; // pi's ui.custom sets this via tui.setFocus, so the hardware cursor follows CURSOR_MARKER
 		root.addChild(new DynamicBorder());
 		root.addChild(new Spacer(1));
@@ -4548,10 +5008,12 @@ export function buildApproveDialog(
 			else localExpanded = !localExpanded;
 		};
 		let expandable = false;
+		let fullCode: { header: string; markdown: string } | undefined;
 		const collapsed = approveCodeMarkdown(spec.toolName, spec.input, getLanguageFromPath);
 		if (collapsed) {
 			const full = approveCodeMarkdown(spec.toolName, spec.input, getLanguageFromPath, true)!;
 			expandable = full.markdown !== collapsed.markdown;
+			fullCode = full;
 			const collapsedMd = new Markdown(collapsed.markdown, 1, 0, getMarkdownTheme());
 			const fullMd = new Markdown(full.markdown, 1, 0, getMarkdownTheme());
 			root.addChild(new Text(theme.fg("toolTitle", theme.bold(collapsed.header)), 1, 0));
@@ -4576,7 +5038,7 @@ export function buildApproveDialog(
 			root.addChild(new Text(displaySafe(spec.reasonLine), 1, 0));
 		}
 		if (spec.detail !== undefined) root.addChild(new Text(displaySafe(`Protected path: ${spec.detail}`), 1, 0));
-		for (const line of spec.extraLines ?? []) root.addChild(new Text(displaySafe(line), 1, 0));
+		for (const line of spec.scope ? grantScopeLines(spec.scope) : []) root.addChild(new Text(displaySafe(line), 1, 0));
 		if (spec.explanation) {
 			root.addChild(new Spacer(1));
 			root.addChild(new Text(theme.fg("accent", theme.bold(`${EXPLAIN_GATE_ROLE} (model-generated, advisory)`)), 1, 0));
@@ -4589,6 +5051,8 @@ export function buildApproveDialog(
 		const labelOf = (c: AskOption): string => (grant ? GRANT_LABELS[c] : undefined) ?? ASK_LABELS[c];
 		const rowLabel = grant ? GRANT_LABELS.no! : "No";
 		const rowPrefix = grant ? `${GRANT_LABELS.no}: ` : "No, ";
+		const reasonLabel = grant ? "Clarification" : "Reason for No";
+		const radio = radioGlyphs(theme);
 		const rowPlaceholder = grant ? GRANT_CLARIFY_PLACEHOLDER : NO_PLACEHOLDER;
 		let index = 0;
 		// Single-line editor for the inline No reason (editing keys, bracketed paste, scrolling, fake cursor).
@@ -4730,6 +5194,127 @@ export function buildApproveDialog(
 				tui.requestRender();
 			}
 		};
+		// Tern-native card (used instead of render() while TSP is live): same content and order, pointer events take the key paths.
+		// omp's Input shows `placeholder` natively; earendil's Input has no such field and ignores it.
+		const placeholderInput: typeof noInput & { placeholder?: string } = noInput;
+		placeholderInput.placeholder = rowPlaceholder;
+		// The question is the overlay title (Tern draws it in its sans face); body prose carries `PROSE_ROLE` (sans), only code and paths stay monospace.
+		root.nativeOverlay = { role: "pi-verdict.ask", head: displaySafe(spec.question), anchor: "center" };
+		root.describe = (cx: DescribeCtx): TspNode => {
+			const kids: (TspNode | object)[] = [];
+			if (grant) {
+				kids.push(...grantScopeNodes(spec.action, spec.scope ?? { paths: [], rules: [] }));
+				kids.push(tnProse([{ t: displaySafe(spec.reasonLine), s: "muted" }], undefined, "lifetime"));
+			}
+			if (!grant) {
+				// Where the request stems from, as badges: the tool, and the reason line's label ("Rule", "Fail-closed", …) or the classifier.
+				const origin = jev ? null : /^([^:\n]{1,24}):\s+([\s\S]*)$/.exec(spec.reasonLine);
+				const originLabel = jev ? "Classifier" : (origin?.[1] ?? "Reason");
+				const originTone = /^fail/i.test(originLabel) ? "error" : /^rule$/i.test(originLabel) ? "warning" : "info";
+				kids.push(tn("row", { gap: "sm", align: "start" }, [tn("badge", { text: originLabel, tone: originTone }), ...(jev ? [] : [tnProse(displaySafe(origin?.[2] ?? spec.reasonLine), { grow: 1 })])], "origin"));
+				if (collapsed) {
+					kids.push(tnProse([{ t: collapsed.header, s: "strong" }], undefined, "head"));
+					kids.push(tn("md", { text: (isExpanded() && fullCode ? fullCode : collapsed).markdown }, undefined, "code"));
+				} else {
+					kids.push(tnProse(displaySafe(spec.action), undefined, "action"));
+				}
+				if (jev) {
+					const p = jev.probabilities;
+					if (cx.supports("meter")) {
+						const { value, parts } = jevMeterParts(p);
+						const min = spec.minConfidence;
+						kids.push(
+							tn("col", { gap: "xs" }, [
+								tn("row", { gap: "sm", align: "center" }, [
+									tnProse("verdict", { min: { w: "10ch" }, shrink: 0 }),
+									tn("meter", { value, ...(parts.length ? { parts } : {}), label: `${jev.choice} ${p[jev.choice]}%` }),
+								]),
+								tn("row", { gap: "sm", align: "center" }, [
+									tnProse("confidence", { min: { w: "10ch" }, shrink: 0 }),
+									tn("meter", {
+										value: jev.confidence / 100,
+										label: `${jev.confidence}%`,
+										tone: min === null ? "accent" : jev.confidence >= min ? "success" : "warning",
+										...(min !== null ? { marks: [{ at: min / 100, title: `min ${min}%` }] } : {}),
+									}),
+								]),
+							], "jev"),
+						);
+					} else {
+						kids.push(tnProse(`allow ${p.allow}% · ask ${p.ask}% · deny ${p.deny}% · confidence ${jev.confidence}%`, undefined, "jev"));
+					}
+					if (jev.concern) kids.push(tnProse([{ t: "concern: ", s: "muted" }, { t: displaySafe(jev.concern) }]));
+					if (jev.rest) kids.push(tnProse([{ t: displaySafe(jev.rest), s: "muted" }]));
+				}
+				if (spec.detail !== undefined) {
+					kids.push(tn("row", { gap: "sm", align: "start" }, [tn("badge", { text: "Protected path", tone: "warning" }), tnText([{ t: displaySafe(spec.detail), s: "code" }], { grow: 1 })], "detail"));
+				}
+			}
+			if (spec.explanation) {
+				kids.push(tn("card", { tone: "info" }, [tnHeading(`${EXPLAIN_GATE_ROLE} (model-generated, advisory)`), tn("md", { text: displaySafe(spec.explanation), role: "omp.plan.body" })], "explanation"));
+			}
+			kids.push(tn("rule", undefined, undefined, "divider"));
+			// Selectable rows; Explain is a bar button on the native surfaces, never a row.
+			const rows = choices.filter((c) => c !== "explain").map((c) => ({ id: c, label: labelOf(c), detail: (grant ? GRANT_DETAILS[c] : undefined) ?? ASK_DETAILS[c] }));
+			// Radio cards (a list item is one text line; a card gives each choice room and a selected state).
+			kids.push(
+				tn(
+					"col",
+					{ gap: "xs" },
+					rows.map((row) =>
+						tn(
+							"card",
+							{ selected: choices[index] === row.id, actions: { click: "select", dblclick: "activate" } },
+							[
+								tnProse(radioLabel(radio, row.label, choices[index] === row.id).map((s, i) => (i === 1 && choices[index] === row.id ? { ...s, s: "strong" } : s))),
+								tnProse([{ t: row.detail, s: "muted" }]),
+							],
+							row.id,
+						),
+					),
+					"choices",
+				),
+			);
+			if (choices[index] === "no") kids.push(tn("col", { gap: "xs" }, [tnProse([{ t: reasonLabel, s: "muted" }]), noInput], "reason"));
+			kids.push(
+				tnBar([
+					...(expandable ? [tnButton(isExpanded() ? "Less" : "Details", "expand", { keys: "ctrl+o" })] : []),
+					...(choices.includes("explain") ? [tnButton("Explain…", "explain")] : []),
+					null,
+					tnButton("Decline", "cancel", { tone: "error" }),
+					tnButton("Confirm", "confirm", { keys: "enter", tone: "accent" }),
+				]),
+			);
+			return tn("col", { role: "pi-verdict.ask", gap: "md" }, [tnFramed(kids, "md")]);
+		};
+		root.handleNativeEvent = (e: NativeEvent): void => {
+			if (e.type === "select" || e.type === "activate") {
+				// Cards are not list items: the host sends the clicked node's id (`r.choices/no`), not its key.
+				const picked = choices.includes(e.item as AskOption) ? e.item : leafKey(e.item);
+				const at = picked === "explain" ? -1 : choices.indexOf(picked as AskOption);
+				if (at < 0) return;
+				index = at;
+				armed = undefined;
+				if (e.type === "activate") {
+					resolve(choices[index]);
+					return;
+				}
+				updateList();
+				tui.requestRender();
+			} else if (e.type === "action") {
+				if (e.act === "confirm") resolve(choices[index]);
+				else if (e.act === "cancel") {
+					// Decline carries the reason typed under a selected No (a plain decline otherwise).
+					if (choices[index] === "no" && noReason() !== undefined) resolve("no");
+					else done({ allow: false });
+				} else if (e.act === "explain") {
+					if (choices.includes("explain")) resolve("explain");
+				} else if (e.act === "expand") {
+					toggle();
+					tui.requestRender();
+				}
+			}
+		};
 		return root;
 	} catch {
 		done(undefined);
@@ -4756,16 +5341,462 @@ async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSig
 	const shown: ApproveDialogSpec = canToggle ? { ...spec, expansion: { get: () => ui.getToolsExpanded(), toggle: () => ui.setToolsExpanded(!ui.getToolsExpanded()) } } : spec;
 	try {
 		const r = await ui.custom<AskPick | undefined>((tui, theme, _kb, done) => {
+			noteHostTui(tui);
 			finish = done;
 			const dialog = buildApproveDialog(mods, tui, theme, shown, done);
 			if (signal?.aborted) queueMicrotask(() => done(undefined));
 			return dialog;
-		});
+		}, nativeLive() ? NATIVE_MD_OVERLAY : undefined);
 		return isAskPick(r) ? r : undefined;
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
 		if (initialExpanded !== undefined && ui.getToolsExpanded() !== initialExpanded) ui.setToolsExpanded(initialExpanded);
 	}
+}
+
+// ============================================================================
+// Native choice screens (TSP): one generic list-and-buttons overlay behind five flows that
+// otherwise use the host's `ui.select` / `ui.confirm` (trust prompt, verdict_settings confirm,
+// /grants list + revoke, /rule review, root-rule review). Each flow keeps its host call as the
+// fallback, so nothing changes outside a live Tern surface.
+// ============================================================================
+
+export interface ChoiceScreenSpec {
+	/** "pi-verdict.trust" | "pi-verdict.settings-change" | "pi-verdict.grants" | "pi-verdict.grant-revoke" | "pi-verdict.rule-review" | "pi-verdict.rule-save" | "pi-verdict.root-rule-review" */
+	role: string;
+	head: string;
+	/** ANSI fallback body (shown only if TSP drops mid-dialog): the lines the host select title carried */
+	lines: string[];
+	body: TspNode[];
+	/** `short`: the label a native button shows when `label` is the long form the host `select` needs (the id is unchanged). */
+	choices: { id: string; label: string; short?: string; detail?: string; tone?: "accent" | "error"; action?: true }[];
+	/** choice id resolved by Escape / the Cancel button; undefined = resolve undefined */
+	cancelId?: string;
+	/** Native presentation: a centered dialog whose choices are buttons, or omp's picker sheet (radio list in an md dialog when the host lacks `picker`). On a picker, an `action` choice renders as an action-bar button instead of an item; `buttons` ignores it. */
+	presentation: { kind: "buttons"; size: "sm" | "md" } | { kind: "picker"; subtitle?: string | readonly TspSpan[]; layout?: "rows" | "cards" };
+}
+
+export function buildChoiceScreen(
+	mods: DialogModules,
+	tui: { requestRender(): void },
+	spec: ChoiceScreenSpec,
+	done: (id: string | undefined) => void,
+	radio: RadioGlyphs,
+): PiTui.Component & { handleInput(data: string): void; focused: boolean } & NativeHooks {
+	const { getKeybindings, truncateToWidth } = mods.tui;
+	const { choices } = spec;
+	let index = 0;
+	const move = (to: number): void => {
+		index = Math.max(0, Math.min(choices.length - 1, to));
+		tui.requestRender();
+	};
+	return {
+		focused: false,
+		invalidate() {},
+		render: (w: number): string[] => [
+			truncateToWidth(`\x1b[1m${displaySafe(spec.head)}\x1b[22m`, w),
+			...spec.lines.map((l) => truncateToWidth(l, w)),
+			"",
+			...choices.map((c, i) => truncateToWidth(`${i === index ? "→ " : "  "}${displaySafe(c.label)}`, w)),
+		],
+		nativeOverlay: {
+			role: spec.role,
+			head: spec.head,
+			anchor: "center",
+			...(spec.presentation.kind === "buttons" && spec.presentation.size === "sm" ? { size: "sm" as const } : {}),
+		},
+		nativeSheet: (cx: DescribeCtx): boolean => spec.presentation.kind === "picker" && cx.supports("picker"),
+		describe(cx: DescribeCtx): TspNode {
+			const { presentation } = spec;
+			if (presentation.kind === "buttons") {
+				return tn("col", { gap: "lg", role: spec.role }, [
+					tnFramed(
+						[
+							...spec.body,
+							tnBar([
+								null,
+								...choices.map((c, i) =>
+									tnButton(c.short ?? c.label, `pick:${c.id}`, {
+										...(i === index ? { keys: "enter" } : c.id === spec.cancelId ? { keys: "escape" } : {}),
+										...(c.tone ? { tone: c.tone } : {}),
+									}),
+								),
+							]),
+						],
+						"lg",
+					),
+				]);
+			}
+			if (cx.supports("picker")) {
+				const items = choices.filter((c) => !c.action && c.id !== spec.cancelId);
+				const actionChoices = choices.filter((c) => c.action);
+				const current = choices[index];
+				return tn("picker", {
+					role: spec.role,
+					title: spec.head,
+					...(presentation.subtitle !== undefined ? { subtitle: presentation.subtitle } : {}),
+					noun: "options",
+					size: "md",
+					layout: presentation.layout ?? "rows",
+					preview: "none",
+					query: null,
+					items: items.map((c) => ({ id: c.id, label: c.short ?? c.label, ...(c.detail !== undefined ? { detail: c.detail } : {}), ...(c.tone ? { tone: c.tone } : {}) })),
+					selected: current !== undefined && items.includes(current) ? current.id : null,
+					total: items.length,
+					actions: [
+						{ id: "confirm", label: "Select", keys: ["enter"], primary: true },
+						...actionChoices.map((c) => ({ id: c.id, label: c.label, ...(c.tone === "error" ? { danger: true } : {}) })),
+						{ id: "close", label: "Close", keys: ["esc"], end: true },
+					],
+				});
+			}
+			return tn("col", { gap: "md", role: spec.role }, [
+				tnFramed(
+					[
+						...spec.body,
+						tn(
+							"list",
+							{ selected: choices[index]?.id, actions: { click: "select", dblclick: "activate" } },
+							choices.map((c, i) =>
+								tn("item", { label: radioLabel(radio, c.label, i === index), ...(c.detail !== undefined ? { detail: c.detail } : {}), ...(c.tone ? { tone: c.tone } : {}) }, undefined, c.id),
+							),
+							"choices",
+						),
+						tnBar([null, tnButton("Cancel", "cancel", { keys: "escape" }), tnButton("Select", "confirm", { keys: "enter", tone: "accent" })]),
+					],
+					"md",
+				),
+			]);
+		},
+		handleNativeEvent(e: NativeEvent): void {
+			if (e.type === "select" || e.type === "activate") {
+				const at = choices.findIndex((c) => c.id === e.item);
+				if (at < 0) return;
+				if (e.type === "activate") done(e.item);
+				else move(at);
+			} else if (e.type === "action") {
+				if (e.act === "confirm") {
+					const current = choices[index];
+					if (current !== undefined && !(spec.presentation.kind === "picker" && current.action)) done(current.id);
+				} else if (e.act === "cancel" || e.act === "close") done(spec.cancelId);
+				else if (e.act.startsWith("pick:")) done(e.act.slice(5));
+				else if (choices.some((c) => c.id === e.act)) done(e.act);
+			}
+		},
+		handleInput(data: string): void {
+			const kb = getKeybindings();
+			if (kb.matches(data, "tui.select.up") || data === "k") move(index - 1);
+			else if (kb.matches(data, "tui.select.down") || data === "j") move(index + 1);
+			else if (kb.matches(data, "tui.select.confirm") || data === "\n") done(choices[index]?.id);
+			else if (kb.matches(data, "tui.select.cancel")) done(spec.cancelId);
+		},
+	};
+}
+
+/**
+ * Opens `spec` as a native overlay and resolves the chosen id (`undefined` = dismissed, also when `signal` aborts). Returns `null` when
+ * the native screen is unavailable (no live Tern surface, no `ui.custom`, modules missing, host never ran the factory): the caller then
+ * uses its host dialog.
+ */
+async function pickNative(ui: UiContext, spec: ChoiceScreenSpec, signal?: AbortSignal): Promise<string | undefined | null> {
+	if (!nativeLive() || typeof ui.custom !== "function") return null;
+	const mods = await loadDialogModules();
+	if (!mods) return null;
+	if (signal?.aborted) return undefined;
+	let ran = false;
+	let finish: ((id: string | undefined) => void) | undefined;
+	const onAbort = (): void => finish?.(undefined);
+	signal?.addEventListener("abort", onAbort, { once: true });
+	try {
+		const picked = await ui.custom<string | undefined>(
+			(tui, theme, _kb, done) => {
+				ran = true;
+				finish = done;
+				noteHostTui(tui);
+				return buildChoiceScreen(mods, tui, spec, done, radioGlyphs(theme));
+			},
+			spec.presentation.kind === "buttons" && spec.presentation.size === "sm" ? { overlay: true } : NATIVE_MD_OVERLAY,
+		);
+		return ran ? picked : null;
+	} finally {
+		signal?.removeEventListener("abort", onAbort);
+	}
+}
+
+/** Split a project-config path into its directory (with trailing separator) and file name for the native path view. */
+function splitConfigPath(p: string): { dir: string; file: string } {
+	const cut = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")) + 1;
+	return { dir: p.slice(0, cut), file: p.slice(cut) };
+}
+
+export function trustScreen(pp: string, title: string): ChoiceScreenSpec {
+	const { dir, file } = splitConfigPath(displaySafe(pp));
+	return {
+		role: "pi-verdict.trust",
+		head: "pi-verdict: trust this project?",
+		lines: [title],
+		body: [
+			tnText([{ t: "This project ships its own gate config", s: "strong" }]),
+			tn("card", { head: "Config file" }, [
+				tn("col", { gap: "xs" }, [
+					tnText([{ t: file, s: "code" }]),
+					...(dir !== "" ? [tnText([{ t: dir, s: "muted" }])] : []),
+				]),
+			]),
+			tn("col", { gap: "sm" }, [
+				tnText("If you trust it, it can override your global gate config:"),
+				tn("row", { gap: "sm", wrap: true }, ["allow rules", "builtinDenyFloor", "mode", "and more"].map((t) => tn("badge", { text: t, tone: "muted" }))),
+			]),
+			tnText([{ t: "Trust it only if you trust whoever wrote this repository.", s: "muted" }]),
+		],
+		choices: [
+			{ id: TRUST_CHOICE, label: TRUST_CHOICE, short: "Trust this project", detail: "Apply its config now and remember the choice", tone: "accent" },
+			{ id: NOT_NOW_CHOICE, label: NOT_NOW_CHOICE, short: "Not now", detail: "Ignore it for this session and ask again next time" },
+			{ id: NEVER_CHOICE, label: NEVER_CHOICE, short: "Never", detail: "Ignore it and don't ask again for this project", tone: "error" },
+		],
+		presentation: {
+			kind: "picker",
+			layout: "cards",
+			subtitle: [
+				{ t: displaySafe(pp), s: "path" },
+				{ t: " can override your global gate config (allow rules, builtinDenyFloor, mode, …).", s: "muted" },
+			],
+		},
+	};
+}
+
+/** One entry of a settings value as plain text: strings verbatim, scalars via `String`, nested containers compact JSON (ST-2). */
+function settingEntryText(x: unknown): string {
+	if (typeof x === "string") return displaySafe(x);
+	if (x !== null && typeof x === "object") return displaySafe(JSON.stringify(x));
+	return displaySafe(String(x));
+}
+
+function isPlainSettingObject(v: unknown): v is Record<string, unknown> {
+	return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Plain lines for a settings value in the settings-change dialog: no JSON syntax (ST-2). */
+export function settingValueLines(v: unknown): string[] {
+	if (v === undefined) return ["(not set)"];
+	if (Array.isArray(v)) return v.length === 0 ? ["(empty)"] : v.map((x) => `• ${settingEntryText(x)}`);
+	if (isPlainSettingObject(v)) {
+		const keys = Object.keys(v);
+		return keys.length === 0 ? ["(empty)"] : keys.map((k) => `${displaySafe(k)}: ${settingEntryText(v[k])}`);
+	}
+	return [settingEntryText(v)];
+}
+
+function settingValueNodes(v: unknown): TspNode[] {
+	if (v === undefined) return [tnProse([{ t: "(not set)", s: "muted" }])];
+	if (Array.isArray(v)) return v.length === 0 ? [tnProse([{ t: "(empty)", s: "muted" }])] : v.map((x) => tnText([{ t: settingEntryText(x), s: "code" }]));
+	if (isPlainSettingObject(v)) {
+		const keys = Object.keys(v);
+		if (keys.length === 0) return [tnProse([{ t: "(empty)", s: "muted" }])];
+		return keys.map((k) => tn("row", { gap: "sm", align: "start" }, [tnText([{ t: displaySafe(k), s: "code" }], { shrink: 0 }), tnProse(settingEntryText(v[k]), { grow: 1 })]));
+	}
+	return [tnText([{ t: settingEntryText(v), s: "code" }])];
+}
+
+export function settingsChangeScreen(d: { scope: string; where: string; key: string; action: string; before: unknown; after: unknown; notes: string[]; reason: string; message: string }): ChoiceScreenSpec {
+	return {
+		role: "pi-verdict.settings-change",
+		head: "pi-verdict: the agent wants to change a setting",
+		lines: d.message.split("\n"),
+		body: [
+			tn(
+				"col",
+				{ gap: "xs" },
+				[
+					["Scope", `${d.scope} — ${d.where}`],
+					["Key", d.key],
+					["Action", d.action],
+				].map(([k, v]) => tn("row", { gap: "sm", align: "start" }, [tnProse([{ t: k, s: "muted" }], { min: { w: "7ch" }, shrink: 0 }), tnProse(v, { grow: 1 })])),
+			),
+			tn("col", { gap: "xs" }, [tnHeading("Before"), ...settingValueNodes(d.before)]),
+			tn("col", { gap: "xs" }, [tnHeading("After"), ...settingValueNodes(d.after)]),
+			...d.notes.map((n) => tnProse(n, { tone: "warning" })),
+			tnProse([{ t: "Agent's reason: ", s: "muted" }, { t: displaySafe(d.reason) }]),
+		],
+		choices: [
+			{ id: "approve", label: "Approve", tone: "accent" },
+			{ id: "decline", label: "Decline", tone: "error" },
+		],
+		cancelId: "decline",
+		presentation: { kind: "buttons", size: "md" },
+	};
+}
+
+/** One-line /grants summary of a grant. */
+export function grantLine(g: PermissionGrant): string {
+	const n = g.paths.length;
+	const ruleText = g.rules.length ? ` · danger rules: ${g.rules.join(", ")}` : "";
+	return `${g.id} · ${displaySafe(g.request).replace(/\s+/g, " ").slice(0, 80)} · ${n} protected path${n === 1 ? "" : "s"}${ruleText} · by ${g.grantedBy}`;
+}
+
+export function grantsScreen(grants: PermissionGrant[], lines: string[]): ChoiceScreenSpec {
+	return {
+		role: "pi-verdict.grants",
+		head: `Permission grants (${grants.length} active)`,
+		lines,
+		body: [],
+		choices: [
+			...grants.map((g) => {
+				const n = g.paths.length;
+				const rules = g.rules.length ? ` · danger rules: ${g.rules.join(", ")}` : "";
+				return { id: g.id, label: `${g.id} · ${displaySafe(g.request).replace(/\s+/g, " ").slice(0, 80)}`, detail: `${n} protected path${n === 1 ? "" : "s"}${rules} · by ${g.grantedBy}` };
+			}),
+			{ id: "revoke-all", label: "Revoke all", tone: "error" as const, action: true as const },
+			{ id: "close", label: "Close" },
+		],
+		cancelId: "close",
+		presentation: { kind: "picker" },
+	};
+}
+
+export function grantRevokeScreen(grants: readonly PermissionGrant[], all: boolean, ruleReason: (id: string) => string): ChoiceScreenSpec {
+	const g = grants[0]!;
+	const scopeOf = (x: PermissionGrant): GrantScope => ({
+		paths: x.paths.map(({ path: p, access }) => ({ path: p, access })),
+		rules: x.rules.map((id) => ({ id, reason: ruleReason(id) })),
+	});
+	return {
+		role: "pi-verdict.grant-revoke",
+		head: all ? `Revoke all ${grants.length} permission grants?` : `Revoke ${g.id}?`,
+		// Host confirm fallback text: unchanged by the native layout.
+		lines: all
+			? grants.map(grantLine)
+			: displaySafe([g.request, ...g.paths.map((p) => `protected-path access: ${p.access} ${p.path}`), ...g.rules.map((id) => `danger rule: ${id}`)].join("\n")).split("\n"),
+		body: all
+			? grants.map((x) => tn("card", undefined, [tn("col", { gap: "md" }, [tnHeading(x.id), ...grantScopeNodes(x.request, scopeOf(x))])], x.id))
+			: grantScopeNodes(g.request, scopeOf(g)),
+		choices: [
+			{ id: "revoke", label: all ? `Revoke all ${grants.length}` : `Revoke ${g.id}`, tone: "error" },
+			{ id: "keep", label: "Keep" },
+		],
+		cancelId: "keep",
+		presentation: { kind: "buttons", size: "md" },
+	};
+}
+
+/** Review state line shared by both rule reviews: reviewed (success) or a warning note. */
+function reviewStateNode(confirmed: boolean, attempt: number, note: string | null | undefined): TspNode | null {
+	if (confirmed) return tnProse(`reviewed (attempt ${attempt}/${RULE_MAX_ATTEMPTS})${note ? `: ${note}` : ""}`, { tone: "success" });
+	return note ? tnProse(note, { tone: "warning" }) : null;
+}
+
+/** One `/rule` match row: the tool name (the `toolCallLine` prefix before the first ": ") as a muted badge, then the call text as inline code cut to one line. */
+function toolCallRow(line: string, tail: string | null): TspNode {
+	const at = line.indexOf(": ");
+	const tool = at > 0 ? line.slice(0, at) : null;
+	const text = at > 0 ? line.slice(at + 2) : line;
+	const spans: TspSpan[] = [{ t: displaySafe(text), s: "code" }];
+	if (tail !== null) spans.push({ t: ` ${displaySafe(tail)}`, s: "muted" });
+	return tn("row", { gap: "sm" }, [
+		...(tool !== null ? [tn("badge", { text: displaySafe(tool), tone: "muted", shrink: 0 })] : []),
+		tnText(spans, { truncate: tail === null ? "end" : "middle", grow: 1 }),
+	]);
+}
+
+/** Button choices for the rule reviews: long `id` for the host `select`, optional `short` native label; Save buttons accent, the cancel button error. */
+function reviewChoices(options: readonly { id: string; short?: string }[], cancelId: string): ChoiceScreenSpec["choices"] {
+	return options.map((o) => ({ id: o.id, label: o.id, ...(o.short !== undefined ? { short: o.short } : {}), ...(o.id.startsWith("Save") ? { tone: "accent" as const } : o.id === cancelId ? { tone: "error" as const } : {}) }));
+}
+
+export function ruleReviewScreen(d: {
+	kind: EditableListKey;
+	value: string;
+	rationale: string | null | undefined;
+	confirmed: boolean;
+	note: string | null | undefined;
+	attempt: number;
+	error?: string;
+	matches: RuleHistoryEval | null;
+	options: { id: string; short?: string }[];
+	cancelId: string;
+	lines: string[];
+}): ChoiceScreenSpec {
+	const body: TspNode[] = [tnProse(LIST_KEY_DESC[d.kind], { tone: "muted" }), tn("code", { text: displaySafe(d.value) }, undefined, "value")];
+	if (d.rationale) body.push(tnProse(displaySafe(d.rationale)));
+	const state = reviewStateNode(d.confirmed, d.attempt, d.note);
+	if (state) body.push(state);
+	const m = d.matches;
+	if (d.error !== undefined) body.push(tnProse(`${d.error} — edit or amend`, { tone: "warning" }));
+	else if (m !== null && !m.checked) body.push(tnProse("Classifier rule: applies when the classifier judges a call; not checked against history."));
+	else if (m !== null && m.checked) {
+		if (m.hits.length > 0) {
+			const hits = m.hits.slice(0, 5).map((h) => toolCallRow(h, null));
+			if (m.hits.length > 5) hits.push(tnText([{ t: `… ${m.hits.length - 5} more`, s: "muted" }]));
+			body.push(tn("col", { gap: "xs" }, [tnHeading(`Matches ${m.hits.length} of the last ${m.total} tool calls`), ...hits]));
+			if (m.shadowed.length > 0) {
+				body.push(
+					tn("col", { gap: "xs" }, [
+						tnHeading(`Stopped by an earlier layer on ${m.shadowed.length} of them`),
+						...m.shadowed.slice(0, 3).map((s) => toolCallRow(s.line, `→ ${s.verdict} (${s.reason})`)),
+					]),
+				);
+			}
+		} else body.push(tnProse(`Matches none of the last ${m.total} tool calls — check it does what you meant.`));
+	}
+	return {
+		role: "pi-verdict.rule-review",
+		head: `pi-verdict rule — ${d.kind}`,
+		lines: d.lines,
+		body,
+		choices: reviewChoices(d.options, d.cancelId),
+		cancelId: d.cancelId,
+		presentation: { kind: "buttons", size: "md" },
+	};
+}
+
+/** Label of the single native `Save…` button of the `/rule` review; it opens `ruleSaveScreen`. */
+export const RULE_SAVE_CHOICE = "Save…";
+
+/** Native scope picker behind the `/rule` review's `Save…` button. Item ids are the caller's save option strings. "Back" (Escape/Close) returns to the review. */
+export function ruleSaveScreen(kind: EditableListKey, value: string, targets: readonly { id: string; short: string; detail: string }[]): ChoiceScreenSpec {
+	return {
+		role: "pi-verdict.rule-save",
+		head: `Save the ${kind} rule`,
+		lines: [`Save the ${kind} rule to:`, ...targets.map((t) => `  ${t.short} — ${t.detail}`)],
+		body: [],
+		choices: [...targets.map((t) => ({ id: t.id, label: t.id, short: t.short, detail: displaySafe(t.detail) })), { id: "Back", label: "Back" }],
+		cancelId: "Back",
+		presentation: { kind: "picker", subtitle: [{ t: displaySafe(value), s: "code" }] },
+	};
+}
+
+export function rootRuleReviewScreen(d: {
+	strictness: string;
+	text: string;
+	summary: string | null | undefined;
+	confirmed: boolean;
+	note: string | null | undefined;
+	attempt: number;
+	tooLong: boolean;
+	sources: string[];
+	skipped: number;
+	options: { id: string; short?: string }[];
+	saveTo: { scope: MenuScope; file: string | null } | null;
+	cancelId: string;
+	lines: string[];
+}): ChoiceScreenSpec {
+	const body: TspNode[] = [tnProse(displaySafe(d.text), { wrap: "word" }, "text")];
+	if (d.summary) body.push(tnProse(displaySafe(d.summary)));
+	const state = reviewStateNode(d.confirmed, d.attempt, d.note);
+	if (state) body.push(state);
+	if (d.tooLong) body.push(tnProse(`root rule is ${d.text.length} characters (limit ${ROOT_RULE_MAX_CHARS}) — edit or regenerate`, { tone: "warning" }));
+	if (d.sources.length > 0) body.push(tnProse(`Sources: ${d.sources.join(" and ")}`, { tone: "muted" }));
+	if (d.skipped > 0) body.push(tnProse(`Skipped ${d.skipped} protected file(s).`, { tone: "muted" }));
+	if (d.saveTo !== null) body.push(tnProse([{ t: `Saves to ${d.saveTo.scope}`, s: "muted" }, ...(d.saveTo.file !== null ? [{ t: " · ", s: "muted" }, { t: displaySafe(d.saveTo.file), s: "path" }] : [])]));
+	return {
+		role: "pi-verdict.root-rule-review",
+		head: `pi-verdict root rule — ${d.strictness}`,
+		lines: d.lines,
+		body,
+		choices: reviewChoices(d.options, d.cancelId),
+		cancelId: d.cancelId,
+		presentation: { kind: "buttons", size: "md" },
+	};
 }
 
 /** Asks the user. The rich dialog offers Yes / No (while highlighted, an inline field `No, <text>`;
@@ -4834,10 +5865,17 @@ async function confirmGrant(ui: UiContext, spec: ApproveDialogSpec, signal?: Abo
 	});
 }
 
+/** Handle of an open /rule progress panel. */
+interface RuleProgressHandle {
+	signal: AbortSignal;
+	update(p: RuleProgress): void;
+	close(): void;
+}
 /** Waiting panel for the `/rule` generate → check → review loop: attempt counter, current phase, earlier failures; Escape cancels.
  *  Rich `ui.custom` panel (not awaited: the loop runs meanwhile); hosts without it, unavailable TUI modules, or an RPC `custom()` that never
- *  runs the factory fall back to the status widget. Shows phase/model id/request only, never rule text or config. `signal` aborts on Escape or `parentSignal`. */
-async function openRuleProgress(ui: UiContext, heading: string, title: string, request: string, parentSignal: AbortSignal | undefined): Promise<{ signal: AbortSignal; update(p: RuleProgress): void; close(): void }> {
+ *  runs the factory fall back to the status widget. Shows phase/model id/request only, never rule text or config. `signal` aborts on Escape or `parentSignal`.
+ *  `step` (only /verdict-debug passes it) adds a "Next" button / Enter binding to the rich panel so a preview can be advanced by hand. */
+async function openRuleProgress(ui: UiContext, heading: string, title: string, request: string, parentSignal: AbortSignal | undefined, step?: () => void): Promise<RuleProgressHandle> {
 	const ac = new AbortController();
 	const signal = parentSignal ? AbortSignal.any([parentSignal, ac.signal]) : ac.signal;
 	let status = "";
@@ -4863,10 +5901,11 @@ async function openRuleProgress(ui: UiContext, heading: string, title: string, r
 		};
 		void ui
 			.custom<undefined>((tui, theme, _kb, done) => {
+				noteHostTui(tui);
 				factoryRan = true;
 				const { Container, Loader, Text, getKeybindings } = mods.tui;
 				const { DynamicBorder } = mods.agent;
-				const root = new Container() as PiTui.Container & { handleInput(data: string): void };
+				const root = new Container() as PiTui.Container & { handleInput(data: string): void } & NativeHooks;
 				const failuresText = new Text("", 1, 0);
 				let setStatus: (s: string) => void;
 				let stopSpinner: () => void = () => {};
@@ -4888,7 +5927,7 @@ async function openRuleProgress(ui: UiContext, heading: string, title: string, r
 					root.addChild(line);
 				}
 				root.addChild(failuresText);
-				root.addChild(new Text(theme.fg("dim", "esc cancel"), 1, 0));
+				root.addChild(new Text(theme.fg("dim", step ? "enter next · esc cancel" : "esc cancel"), 1, 0));
 				root.addChild(new DynamicBorder());
 				const paint = (): void => {
 					setStatus(status);
@@ -4902,9 +5941,33 @@ async function openRuleProgress(ui: UiContext, heading: string, title: string, r
 					done(undefined);
 				};
 				root.handleInput = (data: string): void => {
-					if (!getKeybindings().matches(data, "tui.select.cancel")) return;
+					const kb = getKeybindings();
+					if (step && (kb.matches(data, "tui.select.confirm") || data === "\n")) {
+						step();
+						return;
+					}
+					if (!kb.matches(data, "tui.select.cancel")) return;
 					ac.abort();
 					closeRich?.();
+				};
+				root.describe = (): TspNode =>
+					tn(
+						"card",
+						{ head: heading, role: "pi-verdict.progress" },
+						[
+							tnText([{ t: displaySafe(request).slice(0, 200), s: "muted" }]),
+							tn("row", { gap: "sm", align: "center" }, [tn("spinner", { style: "dots" }), tnText(status)]),
+							...failures.slice(-3).map((f) => tnText(f, { tone: "warning" })),
+							tnBar([null, tnButton("Cancel", "cancel", { keys: "escape" }), ...(step ? [tnButton("Next", "next", { keys: "enter", tone: "accent" })] : [])]),
+						],
+						"progress",
+					);
+				root.handleNativeEvent = (e: NativeEvent): void => {
+					if (e.type === "action" && e.act === "next") step?.();
+					else if (e.type === "action" && e.act === "cancel") {
+						ac.abort();
+						closeRich?.();
+					}
 				};
 				return root;
 			})
@@ -4938,6 +6001,8 @@ type UiContext = ExtensionContext["ui"];
 const STATUS_WIDGET_KEY = "verdict";
 /** Widget key of the omp footer (see refreshStatus). */
 const FOOTER_WIDGET_KEY = "auto-mode";
+/** Widget key of the /verdict-debug label preview. */
+const DEBUG_WIDGET_KEY = "verdict-debug";
 
 /** omp-only: `ctx.agent = { kind: "main" | "sub", id, name, … }` (pi's ExtensionContext has no `agent`).
  *  Returns the subagent's identity, or null for a root session / pi. */
@@ -5104,24 +6169,43 @@ const NF_KEY = "\uF084"; // permission grants count
 const NF_MOON = "\uF186"; // unattended mode
 const NF_EYE = "\uF06E"; // supervised mode
 
-export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full" | "compact"): string {
+/** Classifier model and fallback text with their tones, shared by the ANSI and native footers. */
+function footerModelText(info: FooterInfo): { model: string; modelTone: "error" | "warning" | "accent"; fallback: string | null; fallbackTone: "warning" | "muted" } {
 	const { classifier, fallback } = info;
-	const modelLabel = classifier.state === "none" || classifier.id === null
-		? "no model · fail-closed"
-		: `${classifier.state === "unavailable" ? "⚠ ↺ " : classifier.state === "inherited" ? "↺ " : ""}${classifier.id}${classifier.thinking !== "off" ? `:${classifier.thinking}` : ""}`;
-	const modelColor = classifier.state === "none" ? "error" : classifier.state === "unavailable" ? "warning" : "accent";
-	const fallbackText = fallback ? `↳ ${fallback.id === null ? "⚠ unavailable" : fallback.id}·${fallback.mode}` : null;
-	const fallbackColor = fallback && fallback.id === null ? "warning" : "muted";
-	const infoItems: string[] = [];
-	if (info.confidenceThreshold !== null) infoItems.push(`≥${info.confidenceThreshold}%`);
-	if (info.thresholds.deny !== null) infoItems.push(`deny≥${info.thresholds.deny}%`);
-	if (info.thresholds.allow !== null) infoItems.push(`allow≥${info.thresholds.allow}%`);
-	if (info.subagentGate !== "off") infoItems.push(`subagent ${info.subagentGate}`);
+	return {
+		model:
+			classifier.state === "none" || classifier.id === null
+				? "no model · fail-closed"
+				: `${classifier.state === "unavailable" ? "⚠ ↺ " : classifier.state === "inherited" ? "↺ " : ""}${classifier.id}${classifier.thinking !== "off" ? `:${classifier.thinking}` : ""}`,
+		modelTone: classifier.state === "none" ? "error" : classifier.state === "unavailable" ? "warning" : "accent",
+		fallback: fallback ? `↳ ${fallback.id === null ? "⚠ unavailable" : fallback.id}·${fallback.mode}` : null,
+		fallbackTone: fallback && fallback.id === null ? "warning" : "muted",
+	};
+}
+/** Threshold / subagent badges shown after the counters. */
+function footerInfoItems(info: FooterInfo): string[] {
+	const items: string[] = [];
+	if (info.confidenceThreshold !== null) items.push(`≥${info.confidenceThreshold}%`);
+	if (info.thresholds.deny !== null) items.push(`deny≥${info.thresholds.deny}%`);
+	if (info.thresholds.allow !== null) items.push(`allow≥${info.thresholds.allow}%`);
+	if (info.subagentGate !== "off") items.push(`subagent ${info.subagentGate}`);
+	return items;
+}
+/** Risk chips: relaxed floors and unattended pass-throughs. */
+function footerRisks(info: FooterInfo): { text: string; color: "error" | "warning" }[] {
 	const risks: { text: string; color: "error" | "warning" }[] = [];
 	if (info.floorOff) risks.push({ text: "floor off", color: "error" });
 	if (info.ompGateOff) risks.push({ text: ".omp gate off", color: "warning" });
 	if (info.mode === "unattended" && info.unattendedDenyPathsAllow) risks.push({ text: "denyPaths allow", color: "error" });
 	if (info.mode === "unattended" && info.unattendedOmpDirAllow) risks.push({ text: ".omp allow", color: "error" });
+	return risks;
+}
+
+export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full" | "compact"): string {
+	const { classifier } = info;
+	const { model: modelLabel, modelTone: modelColor, fallback: fallbackText, fallbackTone: fallbackColor } = footerModelText(info);
+	const infoItems = footerInfoItems(info);
+	const risks = footerRisks(info);
 	const lead = {
 		auto: { color: "success", bg: "toolSuccessBg", full: `${NF_SHIELD} AUTO`, compact: "🛡 auto" },
 		unattended: { color: "error", bg: "toolErrorBg", full: `${NF_MOON} UNATTENDED`, compact: "🌙 unattended" },
@@ -5198,6 +6282,36 @@ export function renderFooter(info: FooterInfo, theme: FooterTheme, style: "full"
 	if (info.remembered > 0) parts.push(theme.fg("accent", `👤 ${info.remembered}`));
 	for (const i of infoItems) parts.push(theme.fg("muted", i));
 	return parts.join(theme.fg("dim", " · "));
+}
+
+/** Native footer (TSP): badges and styled spans carry the state; same facts and conditions as `renderFooter`, no command, path or rule text. */
+export function footerNode(info: FooterInfo): TspNode {
+	const modeBadge = {
+		auto: { text: "AUTO", tone: "success" },
+		unattended: { text: "UNATTENDED", tone: "error" },
+		supervised: { text: "SUPERVISED", tone: "warning" },
+		off: { text: "AUTO OFF · ungated", tone: "warning" },
+	} as const satisfies Record<ApprovalMode, { text: string; tone: TspTone }>;
+	const kids: TspNode[] = [tn("badge", modeBadge[info.mode])];
+	if (info.mode !== "off") {
+		for (const r of footerRisks(info)) kids.push(tn("badge", { text: r.text, tone: r.color }));
+		const m = footerModelText(info);
+		kids.push(tnProse([{ t: m.model, s: m.modelTone }, ...(m.fallback ? [{ t: " " }, { t: m.fallback, s: m.fallbackTone }] : [])]));
+		const count = (tone: TspTone, glyph: string, n: number): TspSpan => ({ t: `${glyph} ${n}`, s: n === 0 ? "muted" : tone });
+		kids.push(
+			tnProse([
+				count("success", "✓", info.counts.allow),
+				{ t: " " },
+				count("warning", "?", info.counts.ask),
+				{ t: " " },
+				count("error", "✗", info.counts.deny),
+			]),
+		);
+		if (info.grants > 0) kids.push(tnProse([{ t: `key ${info.grants}`, s: "accent" }]));
+		if (info.remembered > 0) kids.push(tnProse([{ t: `remembered ${info.remembered}`, s: "accent" }]));
+		for (const item of footerInfoItems(info)) kids.push(tnProse([{ t: item, s: "muted" }]));
+	}
+	return tn("row", { gap: "sm", align: "center", wrap: true, role: "pi-verdict.footer" }, kids);
 }
 
 /** Prompt status-bar chip of the approval mode, published by `refreshStatus` unless `modeStatus` is off (omp strips ANSI from setStatus; the text stays readable). */
@@ -5322,7 +6436,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	pi.registerFlag("auto-mode-model", { description: "Classifier model as provider/id[:thinking] (pi --model syntax; default: inherit session model)", type: "string" });
 	pi.registerFlag("auto-mode-debug", { description: "Notify every verdict incl. allows, with shadow-cache annotation", type: "boolean", default: false });
 
-	const debug = pi.getFlag("auto-mode-debug") === true || process.env.PI_AUTO_MODE_DEBUG === "1";
+	// Read live, not at load: hosts apply CLI flag values after the extension factory ran (pi: the loader answers getFlag with the registered default until bind), so a load-time read never sees --auto-mode-debug.
+	const isDebug = (): boolean => pi.getFlag("auto-mode-debug") === true || process.env.PI_AUTO_MODE_DEBUG === "1";
 	// Session state: reset list is owned by SessionState.reset
 	const state = new SessionState(undefined, agentDirPath());
 
@@ -5342,14 +6457,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if (v.verdict === "allow") {
 			if (v.remembered) {
 				// PR-9: silent like mechanical allows (PR-3); no action line for gate hits (PP-6)
-				if (debug) note(v.source === "protected-path" ? "🛡️ allow (remembered approval)" : `🛡️ allow (remembered approval): ${action}`, "info");
+				if (isDebug()) note(v.source === "protected-path" ? "🛡️ allow (remembered approval)" : `🛡️ allow (remembered approval): ${action}`, "info");
 				return undefined;
 			}
 			// #60 (CONTEXT.md notifications entry): classifier allows surface via notifyAllows OR
 			// debug — exactly one notification either way; the shadow suffix stays
 			// debug-only; mechanical passes (rule echo, protected-path confirm) stay
 			// debug-only — notifications carry judgment, the audit log carries completeness
-			if (debug) {
+			if (isDebug()) {
 				if (v.source === "rule") note(`🛡️ allow (rule): ${action}`, "info");
 				else if (v.source === "protected-path") note("🛡️ allow (protected-path confirm)", "info");
 				else note(`🛡️ allow (classifier): ${v.reason}\n  ${action}${v.shadow ? " " + v.shadow : ""}`, "info");
@@ -5360,7 +6475,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		}
 		if (v.verdict === "deny") {
 			if (v.retry) {
-				note(`🛡️ Auto Mode (unattended) blocked — needs justification: ${v.reason}\n  ${action}${debug && v.shadow ? " " + v.shadow : ""}`, "warning");
+				note(`🛡️ Auto Mode (unattended) blocked — needs justification: ${v.reason}\n  ${action}${isDebug() && v.shadow ? " " + v.shadow : ""}`, "warning");
 				return { block: true, reason: blockedReason("unattended-retry", v.reason) };
 			}
 			if (v.source === "protected-path" && !v.degraded) {
@@ -5381,7 +6496,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				note(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}`, "warning");
 				return { block: true, reason: blockedReason("rule", v.degraded ? `ask degraded to block in non-interactive mode: ${v.reason}` : v.reason, v.grantable === true) };
 			}
-			note(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}${debug && v.shadow ? " " + v.shadow : ""}`, "warning");
+			note(`🛡️ Auto Mode blocked: ${v.reason}\n  ${action}${isDebug() && v.shadow ? " " + v.shadow : ""}`, "warning");
 			return { block: true, reason: blockedReason("classifier", v.reason) };
 		}
 		// ask -> human confirmation; non-interactive was already downgraded inside the pipeline, reaching here implies a UI exists
@@ -5405,7 +6520,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			if (d.allow && d.remember && v.approvalKey) rememberApproval(v.approvalKey, call.toolName, opts.ctx, note);
 			if (d.allow) {
 				// debug notify carries no action line: same as above, notifications must not carry protected-path plaintext
-				if (debug) note("🛡️ allow (protected-path confirm)", "info");
+				if (isDebug()) note("🛡️ allow (protected-path confirm)", "info");
 				return undefined;
 			}
 			return { block: true, reason: blockedReason("user-declined", declineDetail("user declined protected-path access", d.reason)) };
@@ -5488,9 +6603,18 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	// omp strips every ANSI escape from setStatus text (sanitizeStatusText), which would reduce the colored blocks to plain
 	// text, so on omp the footer is a below-editor widget (rendered through Text, SGR preserved). pi keeps setStatus.
 	const isOmpHost = "logger" in pi && "typebox" in pi;
+	/** Publish one footer rendering: omp widget (native node in a live Tern surface) or the setStatus line. */
+	function publishFooter(ctx: ExtensionContext, info: FooterInfo, style: "full" | "compact" | "off"): void {
+		const text = style === "off" ? undefined : renderFooter(info, ctx.ui.theme, style);
+		if (isOmpHost && typeof ctx.ui.setWidget === "function") {
+			ctx.ui.setStatus("auto-mode", undefined);
+			setWidgetNative(ctx.ui, FOOTER_WIDGET_KEY, text === undefined ? undefined : [text], () => footerNode(info), { placement: "belowEditor" });
+			return;
+		}
+		ctx.ui.setStatus("auto-mode", text);
+	}
 	function refreshStatus(ctx: ExtensionContext): void {
 		const style = state.userRules.footer;
-		const text = style === "off" ? undefined : renderFooter(footerInfo(ctx), ctx.ui.theme, style);
 		const footerAsWidget = isOmpHost && typeof ctx.ui.setWidget === "function";
 		// The mode chip rides the prompt status bar (omp: the status line's `status` segment) when modeStatus is on, except while the
 		// footer itself is rendered into that bar (pi, footer on): there the footer's lead chip already shows the mode.
@@ -5498,12 +6622,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		ctx.ui.setStatus(MODE_STATUS_KEY, state.userRules.modeStatus && !footerInStatusBar ? modeStatusText(state.userRules.mode, ctx.ui.theme) : undefined);
 		const grantCount = state.userRules.mode === "off" ? 0 : state.grants.length;
 		ctx.ui.setStatus(GRANT_STATUS_KEY, state.userRules.grantStatus && !footerInStatusBar && grantCount > 0 ? ctx.ui.theme.fg("accent", `🔑 ${grantCount}`) : undefined);
-		if (footerAsWidget) {
-			ctx.ui.setStatus("auto-mode", undefined);
-			ctx.ui.setWidget(FOOTER_WIDGET_KEY, text === undefined ? undefined : [text], { placement: "belowEditor" });
-			return;
-		}
-		ctx.ui.setStatus("auto-mode", text);
+		publishFooter(ctx, footerInfo(ctx), style);
 	}
 
 	/** Session-scoped trust grant (set by the session_start prompt; /verdict reloads must honor it) */
@@ -5570,6 +6689,20 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	pi.on("session_start", async (_event, ctx) => {
 		// Project trust prompt: any await stays inside the prompt branch so the no-project path remains synchronous
 		sessionTrustedRoot = null;
+		// TUI probe (omp only): setWidget factories run synchronously with the host TUI, whose `nativeRendering` says whether TSP is live.
+		// Runs before the trust prompt so that prompt can already be native; a failure leaves native mode off.
+		if (isOmpHost && ctx.hasUI && typeof ctx.ui.setWidget === "function") {
+			try {
+				ctx.ui.setWidget(TUI_PROBE_KEY, ((tui: unknown) => {
+					noteHostTui(tui);
+					return { render: (): string[] => [], invalidate(): void {} };
+				}) as never);
+				ctx.ui.setWidget(TUI_PROBE_KEY, undefined);
+			} catch {
+				/* native stays off */
+			}
+			if (nativeLive()) void loadDialogModules(); // not awaited: the no-project path below stays synchronous
+		}
 		const pp = findProjectConfig(ctx.cwd, agentDirPath());
 		if (pp) {
 			const root = projectRootOf(pp);
@@ -5577,10 +6710,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			// ctx.agent is omp-only (pi's ExtensionContext has no `agent`): narrow at runtime
 			const isSub = subagentIdentity(ctx) !== null;
 			if (!rootIn(root, store.trusted) && !rootIn(root, store.untrusted) && ctx.hasUI && !isSub) {
-				const choice = await ctx.ui.select(
-					`🛡️ pi-verdict: ${pp} can override your global gate config (allow rules, builtinDenyFloor, mode, …). Trust this project?`,
-					[TRUST_CHOICE, NOT_NOW_CHOICE, NEVER_CHOICE],
-				);
+				const trustTitle = `🛡️ pi-verdict: ${pp} can override your global gate config (allow rules, builtinDenyFloor, mode, …). Trust this project?`;
+				const nativePick = await pickNative(ctx.ui, trustScreen(pp, trustTitle));
+				const choice = nativePick !== null ? nativePick : await ctx.ui.select(trustTitle, [TRUST_CHOICE, NOT_NOW_CHOICE, NEVER_CHOICE]);
 				if (choice === TRUST_CHOICE) {
 					sessionTrustedRoot = root;
 					const err = recordTrust(root, "trusted");
@@ -5830,10 +6962,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			hotkeys: { a: "show-all", r: "root-rule", f: "forget-approvals" },
 			hotkeyHint: "a all modes · r root rule · f forget approvals",
 		};
-		await ctx.ui.custom<"closed" | undefined>((tui, theme, _kb, done) => {
-			closeMenu = () => done("closed");
-			return buildSettingsMenu(mods, tui, theme, ctl, closeMenu);
-		});
+		await ctx.ui.custom<"closed" | undefined>(
+			(tui, theme, _kb, done) => {
+				noteHostTui(tui);
+				closeMenu = () => done("closed");
+				return buildSettingsMenu(mods, tui, theme, ctl, closeMenu);
+			},
+			nativeLive() ? { overlay: true } : undefined,
+		);
 		if (openRoot) await openRootRuleMenu(ctx);
 	}
 
@@ -5956,7 +7092,26 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				if (sources.length > 0) lines.push(`Sources: ${sources.join(" and ")}`);
 				if (project && project.skippedProtected > 0) lines.push(`Skipped ${project.skippedProtected} protected file(s).`);
 				const options = tooLong ? [EDIT, REGENERATE, DISCARD] : [SAVE, EDIT, REGENERATE, DISCARD];
-				const choice = await ctx.ui.select(displaySafe(lines.join("\n")), options);
+				const shown = displaySafe(lines.join("\n"));
+				const nativePick = await pickNative(
+					ctx.ui,
+					rootRuleReviewScreen({
+						strictness: cfg.strictness,
+						text,
+						summary,
+						confirmed,
+						note,
+						attempt,
+						tooLong,
+						sources,
+						skipped: project?.skippedProtected ?? 0,
+						options: options.map((o) => ({ id: o, ...(o === SAVE ? { short: "Save" } : o === EDIT ? { short: "Edit" } : o === REGENERATE ? { short: "Regenerate…" } : {}) })),
+						saveTo: tooLong ? null : { scope, file: scope === "global" ? userConfigPath() : scope === "local" ? localFile : null },
+						cancelId: DISCARD,
+						lines: shown.split("\n"),
+					}),
+				);
+				const choice = nativePick !== null ? nativePick : await ctx.ui.select(shown, options);
 				if (choice === undefined || choice === DISCARD) return;
 				if (choice === EDIT) {
 					const edited = await ctx.ui.editor("Edit root rule", text);
@@ -6067,10 +7222,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				hotkeys: { g: "generate" },
 				hotkeyHint: "g generate",
 			};
-			await ctx.ui.custom<"closed" | undefined>((tui, theme, _kb, done) => {
-				closeMenu = () => done("closed");
-				return buildSettingsMenu(mods, tui, theme, ctl, closeMenu);
-			});
+			await ctx.ui.custom<"closed" | undefined>(
+				(tui, theme, _kb, done) => {
+					noteHostTui(tui);
+					closeMenu = () => done("closed");
+					return buildSettingsMenu(mods, tui, theme, ctl, closeMenu);
+				},
+				nativeLive() ? { overlay: true } : undefined,
+			);
 			const pending = takePending();
 			if (!pending) return;
 			scope = pending.scope;
@@ -6444,7 +7603,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				saveList(scope, key, own.list.filter((_, j) => j !== Number(id)));
 			},
 		};
-		await ctx.ui.custom<"closed" | undefined>((tui, theme, _kb, done) => buildSettingsMenu(mods, tui, theme, ctl, () => done("closed")));
+		await ctx.ui.custom<"closed" | undefined>(
+			(tui, theme, _kb, done) => {
+				noteHostTui(tui);
+				return buildSettingsMenu(mods, tui, theme, ctl, () => done("closed"));
+			},
+			nativeLive() ? { overlay: true } : undefined,
+		);
 		await Promise.all(pendingOps);
 	}
 
@@ -6623,7 +7788,24 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					options.push(GLOBAL);
 				}
 				options.push(EDIT, AMEND, CANCEL);
-				const choice = await ctx.ui.select(displaySafe(lines.join("\n")), options);
+				const nativeOptions = [...("value" in v ? [{ id: RULE_SAVE_CHOICE }] : []), { id: EDIT, short: "Edit" }, { id: AMEND, short: "Amend…" }, { id: CANCEL }];
+				const shown = displaySafe(lines.join("\n"));
+				const nativePick = await pickNative(
+					ctx.ui,
+					ruleReviewScreen({ kind, value, rationale, confirmed, note, attempt, ...("error" in v ? { error: v.error } : {}), matches, options: nativeOptions, cancelId: CANCEL, lines: shown.split("\n") }),
+				);
+				let choice = nativePick !== null ? nativePick : await ctx.ui.select(shown, options);
+				if (choice === RULE_SAVE_CHOICE) {
+					const saveOptions = options.filter((o) => o === SESSION || o === PROJECT || o === GLOBAL);
+					const targets = [
+						{ id: SESSION, short: "Session only", detail: "this session; no file is written" },
+						...(localFile !== null ? [{ id: PROJECT, short: "Project", detail: localFile }] : []),
+						{ id: GLOBAL, short: "Global", detail: userConfigPath() },
+					];
+					const scopePick = await pickNative(ctx.ui, ruleSaveScreen(kind, value, targets));
+					choice = scopePick !== null ? scopePick : await ctx.ui.select(`Save the ${kind} rule`, saveOptions);
+					if (choice === undefined || choice === "Back") continue;
+				}
 				if (choice === undefined || choice === CANCEL) return;
 				if (choice === EDIT) {
 					const edited = await ctx.ui.editor(`Edit ${kind} rule`, value);
@@ -6833,12 +8015,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			if (key === "toggleShortcut") notes.push("Takes effect after /reload or a new session.");
 			if (sessionList) notes.push("Session entries are appended to the effective list; they cannot remove global/local entries.");
 
-			const [beforeText, afterText] = [before, after].map((v) => (v === undefined ? "(not set)" : displaySafe(JSON.stringify(v, null, 2))));
+			const indent = (v: unknown) => settingValueLines(v).map((l) => "  " + l);
 			const where = scope === "global" ? userConfigPath() : scope === "local" ? String(localFile) : "this session only";
-			const message = [`Scope: ${scope} — ${where}`, `Key: ${key}`, `Action: ${action}`, `Before: ${beforeText}`, `After: ${afterText}`, ...notes, `Agent's reason: ${displaySafe(reason)}`].join("\n");
+			const message = [`Scope: ${scope} — ${where}`, `Key: ${key}`, `Action: ${action}`, "Before:", ...indent(before), "After:", ...indent(after), ...notes, `Agent's reason: ${displaySafe(reason)}`].join("\n");
 			let approved = false;
 			try {
-				approved = (await serializeDialog(() => ctx.ui.confirm("🛡️ pi-verdict: the agent wants to change a setting", message, signal ? { signal } : undefined))) === true;
+				const nativePick = await serializeDialog(() => pickNative(ctx.ui, settingsChangeScreen({ scope, where, key, action, before, after, notes, reason, message }), signal));
+				approved = nativePick !== null ? nativePick === "approve" : (await serializeDialog(() => ctx.ui.confirm("🛡️ pi-verdict: the agent wants to change a setting", message, signal ? { signal } : undefined))) === true;
 			} catch {
 				approved = false;
 			}
@@ -6980,7 +8163,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 
 			if (!ctx.hasUI) return settingsToolText("Rejected: no interactive UI to ask the user, so the grant cannot be approved. Nothing was granted.");
-			const accessLines = [...paths.map((p) => `Protected-path access: ${p.access} ${p.path}`), ...ruleIds.map((id) => `Danger rule: ${id} — ${ruleReason(id)}`)];
+			const scope: GrantScope = { paths: paths.map(({ path: p, access }) => ({ path: p, access })), rules: ruleIds.map((id) => ({ id, reason: ruleReason(id) })) };
 			let decision: GrantDecision | "aborted";
 			try {
 				decision = await confirmGrant(
@@ -6990,13 +8173,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						toolName: GRANT_TOOL_NAME,
 						input: {},
 						action: request,
-						reasonLine: `Lasts until the session ends, the agent releases it, or you revoke it (/grants). Mode: ${rules.mode}.`,
-						extraLines: accessLines,
+						reasonLine: "Lasts until the session ends, the agent releases it, or you revoke it with /grants.",
+						scope,
 						question: "Approve this permission grant?",
 						jev: null,
 						minConfidence: null,
 						nerdFont: rules.footer === "full",
-						fallbackMessage: [request, ...accessLines].join("\n"),
+						fallbackMessage: [request, ...grantScopeLines(scope)].join("\n"),
 					},
 					signal,
 				);
@@ -7017,6 +8200,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	const noticeHost = pi as unknown as {
 		sendMessage?: (message: { customType: string; content: string; display: boolean; details: { ids: string[] } }, options: { deliverAs: "aside" | "nextTurn" }) => unknown;
 	};
+	/** Reason text of an effective danger rule; "" when the id is no longer configured. */
+	const dangerRuleReason = (id: string): string => state.userRules.dangerRules.find((r) => r.id === id)?.reason ?? "";
 	/** Revoke grants by id: persisted, notified, and the agent is told (a custom message delivered with its next turn). */
 	function revokeGrants(ids: readonly string[], ctx: ExtensionContext): void {
 		const revoked = state.grants.filter((g) => ids.includes(g.id));
@@ -7043,11 +8228,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	pi.registerCommand("grants", {
 		description: "List and revoke this session's permission grants: /grants [list|revoke <id>|revoke all]",
 		handler: async (args, ctx) => {
-			const grantLine = (g: PermissionGrant): string => {
-				const n = g.paths.length;
-				const ruleText = g.rules.length ? ` · danger rules: ${g.rules.join(", ")}` : "";
-				return `${g.id} · ${displaySafe(g.request).replace(/\s+/g, " ").slice(0, 80)} · ${n} protected path${n === 1 ? "" : "s"}${ruleText} · by ${g.grantedBy}`;
-			};
 			const words = (typeof args === "string" ? args : "").trim().split(/\s+/).filter(Boolean);
 			const none = (): void => ctx.ui.notify("🛡️ No active permission grants.", "info");
 			if (words.length === 0 && ctx.hasUI) {
@@ -7060,16 +8240,28 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					const lines = grants.map(grantLine);
 					const REVOKE_ALL = "Revoke all";
 					const CLOSE = "Close";
-					const choice = await ctx.ui.select(`🛡️ Permission grants (${grants.length} active)`, [...lines, REVOKE_ALL, CLOSE]);
+					const nativeList = await pickNative(ctx.ui, grantsScreen(grants, lines));
+					const choice =
+						nativeList !== null
+							? nativeList === undefined || nativeList === "close"
+								? CLOSE
+								: nativeList === "revoke-all"
+									? REVOKE_ALL
+									: lines[grants.findIndex((x) => x.id === nativeList)]
+							: await ctx.ui.select(`🛡️ Permission grants (${grants.length} active)`, [...lines, REVOKE_ALL, CLOSE]);
 					if (choice === undefined || choice === CLOSE) return;
+					/** Revoke confirmation: the native screen when live, else the host confirm with the same text. */
+					const confirmRevoke = async (spec: ChoiceScreenSpec): Promise<boolean> => {
+						const picked = await pickNative(ctx.ui, spec);
+						return picked !== null ? picked === "revoke" : await ctx.ui.confirm(spec.head, spec.lines.join("\n"));
+					};
 					if (choice === REVOKE_ALL) {
-						if (await ctx.ui.confirm(`Revoke all ${grants.length} permission grants?`, lines.join("\n"))) revokeGrants(grants.map((g) => g.id), ctx);
+						if (await confirmRevoke(grantRevokeScreen(grants, true, dangerRuleReason))) revokeGrants(grants.map((g) => g.id), ctx);
 						continue;
 					}
 					const g = grants[lines.indexOf(choice)];
 					if (!g) continue;
-					const detail = [g.request, ...g.paths.map((p) => `protected-path access: ${p.access} ${p.path}`), ...g.rules.map((id) => `danger rule: ${id}`)].join("\n");
-					if (await ctx.ui.confirm(`Revoke ${g.id}?`, displaySafe(detail))) revokeGrants([g.id], ctx);
+					if (await confirmRevoke(grantRevokeScreen([g], false, dangerRuleReason))) revokeGrants([g.id], ctx);
 				}
 			}
 			if (words.length === 0 || (words.length === 1 && words[0] === "list")) {
@@ -7090,6 +8282,453 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			ctx.ui.notify("pi-verdict: usage: /grants [list|revoke <id>|revoke all]", "warning");
 		},
 	});
+
+	/** Registered unconditionally (the debug flag is unknown at load); the handler refuses unless debug is on. */
+	function registerDebugCommand(): void {
+		pi.registerCommand("verdict-debug", {
+			description: "Debug (needs --auto-mode-debug or PI_AUTO_MODE_DEBUG=1): preview every pi-verdict screen with sample data (nothing is saved, no model calls): /verdict-debug [all|<screen>]",
+			handler: async (args, ctx) => {
+				if (!isDebug()) {
+					ctx.ui.notify("pi-verdict: /verdict-debug needs debug mode: start with --auto-mode-debug or PI_AUTO_MODE_DEBUG=1", "warning");
+					return;
+				}
+				const needsTui = (): void => ctx.ui.notify("pi-verdict: /verdict-debug needs an interactive TUI", "warning");
+				if (!ctx.hasUI || typeof ctx.ui.custom !== "function") return needsTui();
+				const mods = await loadDialogModules();
+				if (!mods) return needsTui();
+				const report = (id: string, outcome: string): void => ctx.ui.notify(`🛡️ debug ${id}: ${outcome}`, "info");
+				const pickOrSelect = async (spec: ChoiceScreenSpec): Promise<string | undefined> => {
+					const native = await pickNative(ctx.ui, spec);
+					if (native !== null) return native;
+					const label = await ctx.ui.select([spec.head, ...spec.lines].join("\n"), spec.choices.map((c) => c.label));
+					return spec.choices.find((c) => c.label === label)?.id;
+				};
+				const showChoice = async (id: string, spec: ChoiceScreenSpec): Promise<void> => {
+					const picked = await pickOrSelect(spec);
+					report(id, picked ?? "dismissed");
+				};
+				/** Step screen between footer / status / label variants; false ends the current demo. */
+				const nextOrDone = async (title: string, n: number, total: number): Promise<boolean> => {
+					const hint = "The preview is shown in the footer/widget area.";
+					const picked = await pickOrSelect({
+						role: "pi-verdict.debug-step",
+						head: `${title} (${n}/${total})`,
+						lines: [hint],
+						body: [tnText(hint, { tone: "muted" })],
+						choices: [{ id: "next", label: n < total ? "Next" : "Finish", tone: "accent" }, { id: "done", label: "Done" }],
+						cancelId: "done",
+						presentation: { kind: "buttons", size: "sm" },
+					});
+					return picked === "next";
+				};
+				const sampleGrant = (id: string, request: string, grantedBy: PermissionGrant["grantedBy"], paths: GrantPath[], rules: string[]): PermissionGrant => ({ id, request, paths, rules, grantedBy, grantedAt: new Date(0).toISOString() });
+				const askBase = { title: "🛡️ Auto Mode confirmation", question: "Allow execution?", nerdFont: state.userRules.footer === "full" } as const;
+				const askDecision = (id: string, d: AskDecision | "aborted"): void => report(id, d === "aborted" ? "aborted" : JSON.stringify(d));
+
+				const DEBUG_SCREENS: Array<{ id: string; label: string; run(): Promise<void> }> = [
+					{
+						id: "trust",
+						label: "Project trust prompt",
+						run: () => showChoice("trust", trustScreen("~/projects/sample/.omp/pi-verdict.json", "🛡️ pi-verdict (preview): this project has its own pi-verdict config")),
+					},
+					{
+						id: "ask",
+						label: "Ask dialog — classifier (jev meter, remember, Explain)",
+						run: async () => {
+							const input = { command: "cargo publish --dry-run" };
+							const action = toolCallLine("bash", input);
+							const opinion = "jev: ask 55% (confidence 61%; allow 30%, deny 15%) — concern: publishing";
+							const reasonLine = `Classifier opinion: ${opinion}`;
+							const d = await confirmAsk(
+								ctx.ui,
+								{ ...askBase, toolName: "bash", input, action, reasonLine, jev: parseJevReason(opinion), minConfidence: 70, remember: true, fallbackMessage: `${action}\n\n${reasonLine}\n\nAllow execution?` },
+								{
+									explain: async (q) => ({
+										ok: true,
+										text: q ? `Sample answer to: ${q}` : "Sample explanation: the command publishes nothing because of --dry-run, but the classifier could not confirm it from this session.",
+									}),
+								},
+							);
+							askDecision("ask", d);
+						},
+					},
+					{
+						id: "ask-protected",
+						label: "Ask dialog — protected path (no Explain)",
+						run: async () => {
+							const input = { path: "~/sample/.ssh/config" };
+							const action = toolCallLine("read", input);
+							const reasonLine = "Protected path (denyPaths)";
+							const d = await confirmAsk(ctx.ui, {
+								...askBase,
+								title: "🛡️ Auto Mode: protected path",
+								question: "Allow this access?",
+								toolName: "read",
+								input,
+								action,
+								reasonLine,
+								detail: "~/sample/.ssh/config",
+								jev: null,
+								minConfidence: null,
+								remember: true,
+								fallbackMessage: `${action}\n\n${reasonLine}\n\nProtected path: ~/sample/.ssh/config\n\nAllow this access?`,
+							});
+							askDecision("ask-protected", d);
+						},
+					},
+					{
+						id: "ask-rule",
+						label: "Ask dialog — rule ask (no jev)",
+						run: async () => {
+							const input = { command: "npm publish" };
+							const action = toolCallLine("bash", input);
+							const reasonLine = "Rule: danger rule npm-publish (ask)";
+							const d = await confirmAsk(ctx.ui, { ...askBase, toolName: "bash", input, action, reasonLine, jev: null, minConfidence: null, remember: false, fallbackMessage: `${action}\n\n${reasonLine}\n\nAllow execution?` });
+							askDecision("ask-rule", d);
+						},
+					},
+					{
+						id: "grant",
+						label: "Permission grant request",
+						run: async () => {
+							const request = "Deploy build 42 to staging and read the sample notes file";
+							const scope: GrantScope = { paths: [{ path: "~/sample/.omp/notes.md", access: "read" }], rules: [{ id: "gh-release", reason: "GitHub release change (sample)" }] };
+							const d = await confirmGrant(ctx.ui, {
+								...askBase,
+								title: "🛡️ pi-verdict: the agent requests a permission grant",
+								toolName: GRANT_TOOL_NAME,
+								input: {},
+								action: request,
+								reasonLine: "Lasts until the session ends, the agent releases it, or you revoke it with /grants.",
+								scope,
+								question: "Approve this permission grant?",
+								jev: null,
+								minConfidence: null,
+								fallbackMessage: [request, ...grantScopeLines(scope)].join("\n"),
+							});
+							report("grant", d === "aborted" ? "aborted" : JSON.stringify(d));
+						},
+					},
+					{
+						id: "settings-change",
+						label: "verdict_settings change confirmation",
+						run: () =>
+							showChoice(
+								"settings-change",
+								settingsChangeScreen({
+									scope: "session",
+									where: "this session only",
+									key: "footer",
+									action: "set",
+									before: "full",
+									after: "compact",
+									notes: ["Preview: nothing is saved."],
+									reason: "Sample reason: a narrower footer for screen recordings.",
+									message: "Set footer = compact for this session?",
+								}),
+							),
+					},
+					{
+						id: "grants",
+						label: "/grants list",
+						run: () => {
+							const samples = [
+								sampleGrant("G1", "Deploy build 42 to staging", "user", [], ["gh-release"]),
+								sampleGrant("G2", "Read the sample notes file", "classifier", [{ path: "~/sample/.omp/notes.md", access: "read", forms: [] }], []),
+							];
+							return showChoice("grants", grantsScreen(samples, samples.map(grantLine)));
+						},
+					},
+					{
+						id: "grant-revoke",
+						label: "Grant revoke confirmation",
+						run: () =>
+							showChoice(
+								"grant-revoke",
+								grantRevokeScreen(
+									[sampleGrant("G2", "Read the sample notes file and deploy build 42", "user", [{ path: "~/sample/.omp/notes.md", access: "read", forms: [] }], ["gh-release"])],
+									false,
+									dangerRuleReason,
+								),
+							),
+					},
+					{
+						id: "rule-review",
+						label: "/rule review",
+						run: () =>
+							showChoice(
+								"rule-review",
+								ruleReviewScreen({
+									kind: "allow",
+									value: "^cargo test\\b",
+									rationale: "Sample: lets cargo test run without a classifier call.",
+									confirmed: true,
+									note: null,
+									attempt: 2,
+									matches: {
+										checked: true,
+										total: 40,
+										hits: ["bash: cargo test", "bash: cargo test -p core", "bash: cargo test --workspace --all-features -- --test-threads=1 --nocapture " + "--skip slow_integration_case ".repeat(12)],
+										shadowed: [{ line: "bash: cargo test", verdict: "ask", reason: "sample earlier layer" }],
+									},
+									options: [{ id: RULE_SAVE_CHOICE }, { id: "Edit value", short: "Edit" }, { id: "Amend with feedback…", short: "Amend…" }, { id: "Cancel" }],
+									cancelId: "Cancel",
+									lines: ["pi-verdict rule — allow: regexes that auto-allow", "^cargo test\\b"],
+								}),
+							),
+					},
+					{
+						id: "rule-save",
+						label: "/rule save scope picker",
+						run: () =>
+							showChoice(
+								"rule-save",
+								ruleSaveScreen("allow", "^cargo test\\b", [
+									{ id: "Save — session only", short: "Session only", detail: "this session; no file is written" },
+									{ id: "Save — project", short: "Project", detail: "~/sample/.pi/pi-verdict.json" },
+									{ id: "Save — global", short: "Global", detail: "~/.pi/agent/config/pi-verdict.json" },
+								]),
+							),
+					},
+					{
+						id: "root-rule-review",
+						label: "/automode-setup root rule review",
+						run: () =>
+							showChoice(
+								"root-rule-review",
+								rootRuleReviewScreen({
+									strictness: "balanced",
+									text: "Sample root rule: allow read-only inspection and local builds; ask before network writes; deny anything touching credentials.",
+									summary: "Sample summary.",
+									confirmed: false,
+									note: "Sample review note.",
+									attempt: 1,
+									tooLong: false,
+									sources: ["history (3 user messages, 12 tool calls)"],
+									skipped: 1,
+									options: [{ id: "Save — session (session only)", short: "Save" }, { id: "Edit text", short: "Edit" }, { id: "Regenerate with feedback…", short: "Regenerate…" }, { id: "Discard" }],
+									saveTo: { scope: "session", file: null },
+									cancelId: "Discard",
+									lines: ["pi-verdict root rule — balanced", "Sample root rule: …"],
+								}),
+							),
+					},
+					{
+						id: "prefs",
+						label: "Settings sheet (every row kind)",
+						run: async () => {
+							const INITIAL_ENTRIES = ["^ls\\b", "^git status\\b"];
+							const values: Record<string, string> = {};
+							let entries = [...INITIAL_ENTRIES];
+							const val = (scope: MenuScope, id: string, dflt: string): string => values[`${scope}:${id}`] ?? dflt;
+							const info = (): MenuInfo => [{ tone: "muted", text: "Sample row — nothing is saved." }];
+							const ctl: MenuController = {
+								title: "debug sample",
+								scopes: ["session", "local", "global"],
+								scope: "session",
+								badge: (s) => ({ label: s, warn: s === "local" }),
+								pageTitle: (p) => p,
+								hotkeys: { r: "reset" },
+								hotkeyHint: "r reset samples",
+								rows: (scope, page): MenuRow[] => {
+									if (page === "entries") {
+										return [
+											...entries.map((text, i): MenuRow => ({ kind: "entry", id: String(i), text, editable: true, info })),
+											{ kind: "entry", id: "global-0", text: "^pwd$", tag: "global", editable: false, info },
+											{ kind: "add", id: "add", placeholder: "regex", info },
+										];
+									}
+									if (page !== null) return [];
+									return [
+										{ kind: "section", label: "choices" },
+										{ kind: "choice", id: "mode", label: "mode", values: ["auto", "unattended", "supervised"], value: val(scope, "mode", "auto"), shortcut: "ctrl+shift+y", info },
+										{ kind: "choice", id: "footer", label: "footer", values: ["inherit", "full", "compact", "off"], value: val(scope, "footer", "inherit"), inherited: { text: "full", source: "global" }, info },
+										{ kind: "choice", id: "danger", label: "danger", values: ["deny", "ask", "allow"], value: val(scope, "danger", "ask"), confirm: true, info },
+										{ kind: "choice", id: "locked", label: "locked", values: ["on", "off"], value: "on", locked: "set by the project config (sample)", info },
+										{ kind: "percent", id: "threshold", label: "threshold", allowInherit: true, value: val(scope, "threshold", "inherit"), inherited: { text: "80%", source: "default" }, info },
+										{ kind: "section", label: "lists" },
+										{ kind: "page", id: "entries", label: "entries", info },
+										{ kind: "page", id: "locked-page", label: "locked page", locked: "needs a trusted project (sample)", info },
+										{ kind: "section", label: "actions" },
+										{ kind: "action", id: "reset", label: "reset samples", key: "r", confirm: true, info },
+									];
+								},
+								change: (scope, id, value) => {
+									values[`${scope}:${id}`] = value;
+									report("prefs", `${scope} ${id} = ${value} (not saved)`);
+								},
+								action: (_scope, id) => {
+									if (id !== "reset") return;
+									for (const k of Object.keys(values)) delete values[k];
+									entries = [...INITIAL_ENTRIES];
+									report("prefs", "samples reset (not saved)");
+								},
+								submit: (_scope, _page, id, text) => {
+									if (text.trim() === "") return false;
+									if (id === "add") entries.push(text);
+									else entries[Number(id)] = text;
+									report("prefs", `entry ${id === "add" ? "added" : "edited"} (not saved)`);
+									return true;
+								},
+								remove: (_scope, _page, id) => {
+									entries.splice(Number(id), 1);
+									report("prefs", "entry removed (not saved)");
+								},
+							};
+							await ctx.ui.custom<"closed" | undefined>(
+								(tui, theme, _kb, done) => {
+									noteHostTui(tui);
+									return buildSettingsMenu(mods, tui, theme, ctl, () => done("closed"));
+								},
+								nativeLive() ? { overlay: true } : undefined,
+							);
+							report("prefs", "closed");
+						},
+					},
+					{
+						id: "progress",
+						label: "/rule progress panel (manual steps)",
+						run: async () => {
+							const STEPS: RuleProgress[] = [
+								{ attempt: 1, max: RULE_MAX_ATTEMPTS, phase: "checking" },
+								{ attempt: 1, max: RULE_MAX_ATTEMPTS, failure: "matches none of the last 40 tool calls (sample)" },
+								{ attempt: 2, max: RULE_MAX_ATTEMPTS, phase: "generating" },
+								{ attempt: 2, max: RULE_MAX_ATTEMPTS, phase: "checking" },
+								{ attempt: 2, max: RULE_MAX_ATTEMPTS, phase: "reviewing" },
+							];
+							// Executor form: the ES2022 target lib (and Node 20 hosts) have no Promise.withResolvers.
+							let resolve!: (v: "done" | "cancelled") => void;
+							const outcome = new Promise<"done" | "cancelled">((r) => (resolve = r));
+							let i = -1;
+							let handle: RuleProgressHandle | undefined;
+							const step = (): void => {
+								i++;
+								if (i < STEPS.length) handle?.update(STEPS[i]!);
+								else {
+									handle?.close();
+									resolve("done");
+								}
+							};
+							handle = await openRuleProgress(ctx.ui, "🛡️ pi-verdict /rule (preview)", "sample-model", "always allow cargo test", undefined, step);
+							handle.signal.addEventListener("abort", () => resolve("cancelled"), { once: true });
+							report("progress", await outcome);
+						},
+					},
+					{
+						id: "footer",
+						label: "Footer variants",
+						run: async () => {
+							const base: FooterInfo = {
+								mode: "auto",
+								classifier: { id: "typesafe/jev-latest", thinking: "off", state: "configured" },
+								fallback: { id: "anthropic/claude-haiku-4-5", mode: "shadow" },
+								counts: { allow: 12, ask: 2, deny: 1 },
+								floorOff: false,
+								ompGateOff: false,
+								confidenceThreshold: 70,
+								thresholds: { deny: 90, allow: 80 },
+								unattendedDenyPathsAllow: false,
+								unattendedOmpDirAllow: false,
+								subagentGate: "normal",
+								grants: 0,
+								remembered: 0,
+							};
+							const variants: Array<{ title: string; info: FooterInfo; style: "full" | "compact" }> = [
+								{ title: "auto · full", info: base, style: "full" },
+								{ title: "auto · compact", info: base, style: "compact" },
+								{ title: "unattended", info: { ...base, mode: "unattended", thresholds: { deny: 85, allow: null }, unattendedDenyPathsAllow: true }, style: "full" },
+								{ title: "supervised + grants/remembered", info: { ...base, mode: "supervised", thresholds: { deny: null, allow: 95 }, grants: 2, remembered: 1 }, style: "full" },
+								{ title: "off", info: { ...base, mode: "off" }, style: "full" },
+								{ title: "fallback enforce unavailable + risks", info: { ...base, fallback: { id: null, mode: "enforce" }, floorOff: true, ompGateOff: true }, style: "full" },
+								{ title: "no classifier (fail-closed)", info: { ...base, classifier: { id: null, thinking: "off", state: "none" } }, style: "full" },
+							];
+							try {
+								for (const [n, v] of variants.entries()) {
+									publishFooter(ctx, v.info, v.style);
+									if (!(await nextOrDone(v.title, n + 1, variants.length))) break;
+								}
+							} finally {
+								refreshStatus(ctx);
+							}
+						},
+					},
+					{
+						id: "status",
+						label: "Classifier status rows",
+						run: async () => {
+							const rows: Array<[string, boolean]> = [
+								["classifying bash via typesafe/jev-latest…", true],
+								["fallback classifier anthropic/claude-haiku-4-5 on bash…", true],
+								["awaiting your approval · bash", false],
+							];
+							try {
+								for (const [n, [text, busy]] of rows.entries()) {
+									showStatusRow(ctx.ui, text, busy);
+									if (!(await nextOrDone("Classifier status row", n + 1, rows.length))) break;
+								}
+							} finally {
+								ctx.ui.setWidget(STATUS_WIDGET_KEY, undefined);
+							}
+						},
+					},
+					{
+						id: "label",
+						label: "Verdict label",
+						run: async () => {
+							const samples: VerdictLabel[] = [
+								{ tool: "bash", how: "classifier", jev: { choice: "allow", probabilities: { allow: 92, ask: 6, deny: 2 }, confidence: 88 } },
+								{ tool: "read", how: "user", jev: null },
+								{ tool: "bash", how: "second-model", jev: null },
+								{ tool: "edit", how: "remembered", jev: null },
+							];
+							try {
+								for (const [n, sample] of samples.entries()) {
+									ctx.ui.setWidget(DEBUG_WIDGET_KEY, ((tui: unknown, theme: Theme) => {
+										noteHostTui(tui);
+										return labelComponent(sample, theme) ?? { render: (): string[] => [], invalidate(): void {} };
+									}) as never);
+									if (!(await nextOrDone("Verdict label", n + 1, samples.length))) break;
+								}
+							} finally {
+								ctx.ui.setWidget(DEBUG_WIDGET_KEY, undefined);
+							}
+						},
+					},
+				];
+				const runAll = async (): Promise<void> => {
+					for (const s of DEBUG_SCREENS) await s.run();
+				};
+
+				const arg = (typeof args === "string" ? args : "").trim().toLowerCase();
+				if (arg === "all") return runAll();
+				if (arg !== "") {
+					const screen = DEBUG_SCREENS.find((s) => s.id === arg);
+					if (screen) return screen.run();
+					ctx.ui.notify(`pi-verdict: unknown screen "${arg}" — valid: all, ${DEBUG_SCREENS.map((s) => s.id).join(", ")}`, "warning");
+					return;
+				}
+				for (;;) {
+					const spec: ChoiceScreenSpec = {
+						role: "pi-verdict.debug",
+						head: "pi-verdict debug — preview a screen",
+						lines: [],
+						body: [tnText("Sample data only: nothing is saved and no model is called.", { tone: "muted" })],
+						choices: [{ id: "all", label: "All screens in order", tone: "accent" }, ...DEBUG_SCREENS.map((s) => ({ id: s.id, label: s.label }))],
+						presentation: { kind: "picker", subtitle: "Sample data only: nothing is saved and no model is called." },
+					};
+					let picked = await pickNative(ctx.ui, spec);
+					if (picked === null) {
+						const label = await ctx.ui.select(spec.head, spec.choices.map((c) => c.label));
+						picked = spec.choices.find((c) => c.label === label)?.id;
+					}
+					if (picked === undefined) return;
+					if (picked === "all") await runAll();
+					else await DEBUG_SCREENS.find((s) => s.id === picked)?.run();
+				}
+			},
+		});
+	}
+	registerDebugCommand();
 
 	let warnedClassifierModel = false;
 	/** Thinking level set (pi native EXTENDED_THINKING_LEVELS; suffix syntax aligned with pi --model provider/id:thinking) */
@@ -7313,11 +8952,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	// Verdict label sink: a separate transcript row after the tool block. Rule-allow labels (`how: "rule"`) are recorded but never rendered (noise); other labels render.
 	// pi: TUI-only custom entry (persisted, not in LLM context). omp: `aside` custom message (model-visible, drained at the next step boundary; steer would abort the in-flight tool batch).
-	type LabelComponent = { render(width: number): string[]; invalidate(): void };
+	type LabelComponent = { render(width: number): string[]; invalidate(): void; describe?(): TspNode };
 	type LabelRenderer = (data: unknown, theme: Theme) => LabelComponent | undefined;
 	const labelComponent: LabelRenderer = (data, theme) => {
 		const l = asVerdictLabel(data);
-		return l && l.how !== "rule" ? { render: (w: number) => renderVerdictLabel(l, theme, state.userRules.footer === "full", w), invalidate() {} } : undefined;
+		return l && l.how !== "rule" ? { render: (w: number) => renderVerdictLabel(l, theme, state.userRules.footer === "full", w), invalidate() {}, describe: () => verdictLabelNode(l) } : undefined;
 	};
 	type OmpSendMessage = (message: { customType: string; content: string; display: boolean; details: VerdictLabel }, options: { deliverAs: "aside" }) => void;
 	const labelHost = pi as unknown as {
@@ -7397,7 +9036,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const onPhase = statusUi
 			? (phase: "classifier" | "fallback", modelId: string): void => {
 					statusShown = true;
-					statusUi.setWidget(STATUS_WIDGET_KEY, [statusUi.theme.fg("warning", phase === "classifier" ? `🛡️ verdict: classifying ${event.toolName} via ${modelId}…` : `🛡️ verdict: fallback classifier ${modelId} on ${event.toolName}…`)]);
+					const text = phase === "classifier" ? `classifying ${event.toolName} via ${modelId}…` : `fallback classifier ${modelId} on ${event.toolName}…`;
+					showStatusRow(statusUi, text, true);
 				}
 			: undefined;
 
@@ -7449,7 +9089,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if (!sub) {
 			// the awaiting row names the tool only (never command or path text, PP-6)
 			const awaiting = verdict.verdict === "ask" && statusUi !== null;
-			if (awaiting) statusUi.setWidget(STATUS_WIDGET_KEY, [statusUi.theme.fg("warning", `🛡️ verdict: awaiting your approval · ${event.toolName}`)]);
+			if (awaiting) showStatusRow(statusUi, `awaiting your approval · ${event.toolName}`, false);
 			let r: Presented;
 			try {
 				r = await present();
@@ -7474,7 +9114,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			finalize({ subagent: { ...sub, resolution }, ...(res.fb ? { fallback: res.fb } : {}) });
 			const out = (ui ?? ctx.ui).notify.bind(ui ?? ctx.ui);
 			if (res.verdict === "allow") {
-				if (debug || state.userRules.notifyAllows) out(`🛡️ [${label}] allow (second model, no human): ${res.reason}\n  ${action}`, "info");
+				if (isDebug() || state.userRules.notifyAllows) out(`🛡️ [${label}] allow (second model, no human): ${res.reason}\n  ${action}`, "info");
 				noteAllowed(verdictLabelFor(event.toolName, "second-model", res.reason));
 				return undefined;
 			}

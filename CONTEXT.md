@@ -275,6 +275,10 @@ Rules: [PR-8](docs/adjudication-rules.md#pr-8-verdict-counters)
 The compact approval-mode badge in the prompt status bar.
 Rules: [MD-6](docs/adjudication-rules.md#md-6-setting-a-mode)
 
+**Tern-native UI**:
+The description of a gate surface as a native node tree for omp inside Tern with the Tern Surface Protocol live; every other host keeps the ANSI surface, and a native node carries no more text than its ANSI twin.
+Rules: [PP-6](docs/adjudication-rules.md#pp-6-plaintext-confinement)
+
 ### Observability
 
 **Verdict audit log**:

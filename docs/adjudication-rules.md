@@ -199,6 +199,7 @@ The matched protected path MAY appear only in the local ask dialog and in the lo
 Why: reasons and notifications flow back into the agent context and prompts leave the machine for the model provider; the audit log is a local record in the same trust domain as `pi-verdict.json`.
 Code: `Verdict.detail`, `RuleResult.detail`, `presentVerdict`, `generateRule`, `critiqueRule`
 Pinned by: denyPaths (PP-1–PP-9) › path plaintext appears only in the confirm dialog, never in block reason or notifications; denyPaths (PP-1–PP-9) › headless block reason and notify carry no path plaintext either; adjudicate pipeline (interface level) › denyPaths zero-leak regression: no protected-path plaintext in any reason or notification (PP-6)
+Pinned by (native nodes): Tern-native UI (TSP) › PP-6: the status row, the footer and the transcript label carry no command text; Tern-native UI (TSP) › ask dialog › PP-6: a protected-path ask shows the path locally but offers no Explain item
 
 #### PP-7: Existence hint
 
@@ -534,10 +535,11 @@ Pinned by: live classifier status widget › row never carries command text; liv
 
 After an allowed call's result the gate records a label: how it passed (`rule`, `classifier`, `user`, `second-model`) plus jev probabilities and confidence when present. A label carries no reason text and no path. Rule labels are recorded but not rendered. On pi the label is a TUI-only transcript entry outside the model context; on omp it is an `aside` custom message and is therefore visible to the model.
 A call passed by a remembered approval (PR-9) is labelled `remembered`; unlike `rule` labels it is rendered.
+On the Tern-native surface the label row shows the probability meter and then a confidence meter (`conf <n>%`), each capped at `22ch` so neither stretches to the row width; a label without jev numbers shows only the tool name and the how badge.
 
 Why: a pass should be attributable at a glance; the omp transport has no TUI-only channel.
 Code: `verdictLabelFor`, `VerdictLabel`, the `tool_result` handler in `autoMode`
-Pinned by: approve dialog code expansion and verdict label › pi: classifier allow and user approval are told apart; denied calls leave no label; approve dialog code expansion and verdict label › omp: rule allow sends a hidden aside custom message, never a pi entry
+Pinned by: approve dialog code expansion and verdict label › pi: classifier allow and user approval are told apart; denied calls leave no label; approve dialog code expansion and verdict label › omp: rule allow sends a hidden aside custom message, never a pi entry; Tern-native UI (TSP) › verdict label: compact probability and confidence meters share one row (PR-7)
 
 #### PR-8: Verdict counters
 
@@ -785,11 +787,11 @@ Pinned by: settings tool (ST-1–ST-5) › invalid value is rejected before the 
 
 #### ST-2: Confirmation
 
-Every change (`set`, `unset`, `add`, `remove`) opens a confirmation dialog in every approval mode, showing scope and file, key, action, the stored value before and after, notes and the agent's reason. Nothing is written unless the user approves; a decline, an aborted signal or a dialog error writes nothing and the tool reports the decline as a normal result.
+Every change (`set`, `unset`, `add`, `remove`) opens a confirmation dialog in every approval mode, showing scope and file, key, action, the stored value before and after, notes and the agent's reason. The values are shown as parsed content, never as JSON syntax: a list as one `• <entry>` line per entry, an object as one `<key>: <value>` line per key, a scalar as its text, `(empty)` for an empty list or object and `(not set)` for an absent value. Nothing is written unless the user approves; a decline, an aborted signal or a dialog error writes nothing and the tool reports the decline as a normal result.
 
 Why: agent-initiated policy changes weaken or tighten the gate the agent runs under, so the user decides every one (security principle 8); the dialog is the tool's own approval, not a gate ask, so unattended does not skip it.
 Code: the `execute` handler registered as `SETTINGS_TOOL_NAME` in `autoMode`
-Pinned by: settings tool (ST-1–ST-5) › approved set writes the global config; settings tool (ST-1–ST-5) › declined change writes nothing
+Pinned by: settings tool (ST-1–ST-5) › approved set writes the global config; settings tool (ST-1–ST-5) › declined change writes nothing; Tern-native UI (TSP) › choice screens › verdict_settings: confirm message shows parsed values, not JSON; Tern-native UI (TSP) › choice screens › settingsChangeScreen: wider overlay and parsed value nodes
 
 #### ST-3: Fail closed
 
@@ -827,7 +829,7 @@ Pinned by: permission grants (GR-1–GR-6) › GR-1: mode off answers NA to ever
 
 #### GR-2: Human approval
 
-In `auto` and `supervised` a request opens the grant dialog with I approve, I reject and Ask for clarification or revision (the last is an inline text field; empty text leaves the dialog open). Approval creates grant `G<n>` (ids are never reused within a session) with `grantedBy: "user"`. Reject answers `Rejected by the user` and tells the agent not to repeat the request; clarify returns the user's text to the agent and grants nothing. Without a UI the request is rejected, and a dialog failure or abort grants nothing. Hosts without the rich dialog use a plain select (plus an input for the clarification). The dialog never offers Explain… (PP-9).
+In `auto` and `supervised` a request opens the grant dialog with I approve, I reject and Ask for clarification or revision (the last is an inline text field; empty text leaves the dialog open). The dialog body shows the request, the protected paths with their access level, the danger rules with their reasons and a one-line lifetime note; the native Tern dialog lays these out as headed sections, the ANSI dialog as plain lines. Approval creates grant `G<n>` (ids are never reused within a session) with `grantedBy: "user"`. Reject answers `Rejected by the user` and tells the agent not to repeat the request; clarify returns the user's text to the agent and grants nothing. Without a UI the request is rejected, and a dialog failure or abort grants nothing. Hosts without the rich dialog use a plain select (plus an input for the clarification). The dialog never offers Explain… (PP-9).
 
 Why: a grant widens what the classifiers may allow, so only a human, or in unattended a model consensus (GR-3), may create one.
 Code: `confirmGrant`, `buildApproveDialog` (variant `grant`)

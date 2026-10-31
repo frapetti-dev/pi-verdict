@@ -5,11 +5,11 @@
  * Session setup always goes through session(cfg, opts) (config -> harness -> install; the ordering constraint is internalized);
  * the temp-dir fixture goes through withTempDir (create -> fn -> cleanup).
  */
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, collectProjectContext, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, renderFooter, renderJevBar, resolveAgentDir, SessionState } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, buildChoiceScreen, collectProjectContext, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, grantLine, grantRevokeScreen, grantsScreen, renderFooter, renderJevBar, resolveAgentDir, RULE_SAVE_CHOICE, ruleReviewScreen, ruleSaveScreen, SessionState, settingsChangeScreen, settingValueLines, statusNode, trustScreen, verdictLabelNode, type ChoiceScreenSpec } from "../extensions/pi-verdict.ts";
 import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
 
 // ── Stub infrastructure ─────────────────────────────────
@@ -64,6 +64,8 @@ interface Harness {
 	/** `pi.registerTool` definitions by name */
 	tools: Record<string, ToolDefinitionStub>;
 	install: (opts?: { verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }>; ompHost?: boolean }) => void;
+	/** Sets a CLI flag value after install, as pi/omp do once the extension factory has loaded. */
+	setFlag: (name: string, value: unknown) => void;
 }
 
 function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; roles?: boolean }): Harness {
@@ -128,6 +130,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 	};
 	h.ctx = ctx;
 
+	h.setFlag = (name, value) => { flags[name] = value; };
 	h.install = (opts?: { verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }>; ompHost?: boolean }) => {
 		flags = { "auto-mode-debug": opts?.debug ?? false, ...(opts?.verdictMode ? { "verdict-mode": opts.verdictMode } : {}), ...(opts?.modelFlag ? { "auto-mode-model": opts.modelFlag } : {}) };
 		const prev = process.env.PI_AUTO_MODE_DEBUG;
@@ -5970,6 +5973,545 @@ describe("active-models probe", () => {
 			expect(probe()).toBe(published);
 			await sub.handlers["session_shutdown"]({}, sub.ctx);
 			expect(probe()).toBe(published); // a subagent shutdown must not delete it either
+		});
+	});
+});
+
+// ── Tern-native UI (TSP) ─────────────────────────────────
+
+describe("Tern-native UI (TSP)", () => {
+	const nativeTui = { requestRender() {}, nativeRendering: true };
+	const plainTui = { requestRender() {} };
+	const cx = { cols: 100, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
+	const NATIVE_MD = { overlay: true, overlayOptions: { width: "60%" } };
+	const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+	type NativeComponent = DialogComponent & { describe?(cx: unknown): unknown; handleNativeEvent?(e: unknown): void };
+	interface Snap { k: string; key?: string; p: Record<string, unknown>; c?: Snap[] }
+	interface NativeRun { nodes: Snap[]; options: unknown[] }
+	const newRun = (): NativeRun => ({ nodes: [], options: [] });
+	/** JSON snapshot of a node; component children (omp's Input) collapse to a marker. */
+	const snap = (n: unknown): Snap => JSON.parse(JSON.stringify(n, (_k, v) => (v && typeof v === "object" && typeof (v as { render?: unknown }).render === "function" ? "[component]" : v)));
+	const evt = (type: string, key: string, rest: Record<string, unknown>): unknown => ({ type, key, mods: [], ...rest });
+	const SESSION_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict-sessions", "s1.json");
+	const USER_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
+
+	test("verdict label: compact probability and confidence meters share one row (PR-7)", () => {
+		const n = snap(verdictLabelNode({ tool: "bash", how: "classifier", jev: { choice: "allow", probabilities: { allow: 87, ask: 10, deny: 3 }, confidence: 92 } }));
+		expect(n.k).toBe("row");
+		expect(n.p.role).toBe("pi-verdict.label");
+		const kids = n.c ?? [];
+		expect(kids.map((c) => c.k)).toEqual(["text", "badge", "meter", "meter"]);
+		expect(kids[2]!.p.label).toBe("allow 87%");
+		expect(kids[2]!.p.max).toEqual({ w: "22ch" });
+		expect(kids[3]!.p.value).toBe(0.92);
+		expect(kids[3]!.p.label).toBe("conf 92%");
+		expect(kids[3]!.p.max).toEqual({ w: "22ch" });
+		const bare = snap(verdictLabelNode({ tool: "bash", how: "classifier", jev: null }));
+		expect((bare.c ?? []).map((c) => c.k)).toEqual(["text", "badge"]);
+	});
+
+	/** Each ui.custom call builds the real component under `tui`, records the options and the first describe(), runs the next script, then presses Escape so nothing stays open. */
+	function driveNative(h: Harness, scripts: Array<(c: NativeComponent) => void>, run: NativeRun, tui: object = nativeTui): void {
+		h.ctx.ui.custom = async (factory: (tui: object, theme: typeof fakeTheme, kb: undefined, done: (r: unknown) => void) => NativeComponent, options: unknown) => {
+			const { initTheme } = await import("@earendil-works/pi-coding-agent");
+			initTheme("dark", false);
+			run.options.push(options);
+			const { promise, resolve } = Promise.withResolvers<unknown>();
+			const component = factory(tui, fakeTheme, undefined, resolve);
+			run.nodes.push(snap(component.describe?.(cx) ?? null));
+			scripts.shift()?.(component);
+			for (let i = 0; i < 6; i++) component.handleInput("\x1b");
+			return promise;
+		};
+	}
+
+	/** Makes the harness's setWidget factories run with a live Tern TUI (as omp does) and starts the session, so the probe sees `nativeRendering`. Needs `session(…, { ompHost: true })`. */
+	async function liveProbe(h: Harness, tui: object = nativeTui): Promise<{ components: Array<{ describe?(): unknown }> }> {
+		const seen: { components: Array<{ describe?(): unknown }> } = { components: [] };
+		h.ctx.ui.setWidget = (_key: string, content: unknown) => {
+			const factory = content as ((tui: object, theme: undefined) => { describe?(): unknown }) | undefined | string[]; // the widget content is a factory or a string array
+			if (typeof factory === "function") seen.components.push(factory(tui, undefined));
+		};
+		await h.handlers.session_start({}, h.ctx);
+		// The probe's module load is not awaited by session_start: wait for the same modules, then let its promise chain settle (microtasks, no wall clock).
+		await Promise.all([import("@earendil-works/pi-tui"), import("@earendil-works/pi-coding-agent")]);
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		return seen;
+	}
+
+	// The native host is module state: put it back to a plain TUI so later tests never see a live Tern surface.
+	afterEach(async () => {
+		const h = session({}, { ompHost: true });
+		await liveProbe(h, plainTui);
+	});
+
+	describe("ask dialog", () => {
+		const ASK = { text: "<verdict>ask</verdict> unsure" };
+		const clickKey = "pi-verdict.ask/choices";
+
+		test("a pointer activate on Yes allows; the dialog mounts as an overlay only while TSP is live", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			h.responses = [ASK];
+			const run = newRun();
+			driveNative(h, [(c) => c.handleNativeEvent!(evt("activate", clickKey, { item: "yes" }))], run);
+			expect(await toolCall(h, "bash", { command: "ls -la" })).toBeUndefined();
+			expect(run.options).toEqual([NATIVE_MD]);
+			expect(run.nodes[0].p.role).toBe("pi-verdict.ask");
+
+			const plain = session({}, { ompHost: true });
+			await liveProbe(plain, plainTui);
+			plain.responses = [ASK];
+			const plainRun = newRun();
+			driveNative(plain, [(c) => c.handleInput("\r")], plainRun, plainTui);
+			expect(await toolCall(plain, "bash", { command: "ls -la" })).toBeUndefined();
+			expect(plainRun.options).toEqual([undefined]);
+		});
+
+		test("a No row carries the typed reason into the block text; Decline blocks without one", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			h.responses = [ASK];
+			const run = newRun();
+			driveNative(
+				h,
+				[
+					(c) => {
+						c.handleNativeEvent!(evt("select", clickKey, { item: "no" }));
+						for (const ch of "stop") c.handleInput(ch);
+						run.nodes.push(snap(c.describe!(cx)));
+						c.handleNativeEvent!(evt("action", "pi-verdict.ask/actions", { act: "confirm" }));
+					},
+				],
+				run,
+			);
+			const r = await toolCall(h, "bash", { command: "ls -la" });
+			expect(r?.block).toBe(true);
+			expect(r.reason).toContain("stop");
+			expect(JSON.stringify(run.nodes[1])).toContain('"key":"reason"');
+
+			h.responses = [ASK];
+			const cancelRun = newRun();
+			driveNative(h, [(c) => c.handleNativeEvent!(evt("action", "pi-verdict.ask/actions", { act: "cancel" }))], cancelRun);
+			const declined = await toolCall(h, "bash", { command: "ls -la" });
+			expect(declined?.block).toBe(true);
+			expect(declined.reason).not.toContain("stop");
+		});
+
+		test("radio rows with detail lines; the reason field shows only under a selected No and Decline carries its text", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			h.responses = [ASK];
+			const run = newRun();
+			type Card = { p: { selected: boolean }; c: Array<{ p: { spans: Array<{ t: string }> } }> };
+			type Tree = { c: Array<{ key?: string; c?: unknown[]; p?: Record<string, unknown> }> };
+			/** The dialog rows sit in the inset frame (`tnFramed`: col → [spacer, row → [spacer, content col, spacer], spacer]). */
+			const rows = (t: Tree): Tree["c"] => ((t.c[0]!.c![1] as Tree).c[1]!.c as Tree["c"]);
+			driveNative(
+				h,
+				[
+					(c) => {
+						const tree = c.describe!(cx) as Tree;
+						const list = rows(tree).find((n) => n.key === "choices")!;
+						const [first, second] = list.c as Card[];
+						expect(first.p.selected).toBe(true);
+						expect(first.c[0].p.spans[0].t.startsWith("◉")).toBe(true);
+						expect(second.p.selected).toBe(false);
+						expect(second.c[0].p.spans[0].t.startsWith("○")).toBe(true);
+						expect(first.c[1].p.spans[0].t.length).toBeGreaterThan(0);
+						expect(rows(tree).some((n) => n.key === "reason")).toBe(false);
+
+						c.handleNativeEvent!(evt("select", "pi-verdict.ask/choices", { item: "no" }));
+						const reason = rows(c.describe!(cx) as Tree).find((n) => n.key === "reason")!;
+						const input = reason.c![1] as NativeComponent & { setValue(v: string): void };
+						input.setValue("stop");
+						c.handleNativeEvent!(evt("action", "pi-verdict.ask/actions", { act: "cancel" }));
+					},
+					(c) => {
+						// Text typed under No is ignored once another row is selected again.
+						c.handleNativeEvent!(evt("select", "pi-verdict.ask/choices", { item: "no" }));
+						const reason = rows(c.describe!(cx) as Tree).find((n) => n.key === "reason")!;
+						(reason.c![1] as NativeComponent & { setValue(v: string): void }).setValue("ignored");
+						c.handleNativeEvent!(evt("select", "pi-verdict.ask/choices", { item: "yes" }));
+						expect(rows(c.describe!(cx) as Tree).some((n) => n.key === "reason")).toBe(false);
+						c.handleNativeEvent!(evt("action", "pi-verdict.ask/actions", { act: "cancel" }));
+					},
+				],
+				run,
+			);
+			const r = await toolCall(h, "bash", { command: "ls -la" });
+			expect(r?.block).toBe(true);
+			expect(r.reason).toContain("stop");
+
+			h.responses = [ASK];
+			const declined = await toolCall(h, "bash", { command: "ls -la" });
+			expect(declined?.block).toBe(true);
+			expect(declined.reason).not.toContain("ignored");
+		});
+
+		test("Explain is a button in the bar, not a row", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			h.responses = [ASK];
+			const run = newRun();
+			driveNative(h, [], run);
+			await toolCall(h, "bash", { command: "ls -la" });
+			const text = JSON.stringify(run.nodes[0]);
+			type Node = { key?: string; c?: Node[] };
+			const root = run.nodes[0] as unknown as Node;
+			const choices = root.c![0]!.c![1]!.c![1]!.c!.find((n) => n.key === "choices")!;
+			expect(choices.c!.map((i) => i.key)).not.toContain("explain");
+			expect(text).toContain('"actions":{"click":"explain"}');
+			expect(text).toContain("Explain…");
+		});
+
+		test("PP-6: a protected-path ask shows the path locally but offers no Explain item", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			const run = newRun();
+			driveNative(h, [], run);
+			await toolCall(h, "bash", { command: "cat /proj/.omp/notes.txt" });
+			const text = JSON.stringify(run.nodes[0]);
+			expect(text).toContain('"text":"Protected path"');
+			expect(text).toContain(".omp referenced in the command");
+			expect(text).not.toContain('"explain"');
+		});
+	});
+
+	test("PP-6: the status row, the footer and the transcript label carry no command text", async () => {
+		const h = session({}, { ompHost: true });
+		const seen = await liveProbe(h);
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		expect(await toolCall(h, "bash", { command: "echo SECRET-MARKER" }, "c1")).toBeUndefined();
+		const nodes = seen.components.flatMap((c) => (c.describe ? [snap(c.describe())] : []));
+		expect(nodes.map((n) => n.p.role)).toEqual(expect.arrayContaining(["pi-verdict.status", "pi-verdict.footer"]));
+		expect(JSON.stringify(nodes)).not.toContain("SECRET-MARKER");
+		await h.handlers.tool_result({ toolCallId: "c1" }, h.ctx); // the label is emitted when the tool result lands
+		const label = h.sent.at(-1)!.message;
+		const rendered: NativeComponent = Object.values(h.messageRenderers)[0](label, {}, fakeTheme);
+		expect(snap(rendered.describe?.(cx)).p.role).toBe("pi-verdict.label");
+		expect(JSON.stringify([snap(verdictLabelNode(label.details)), snap(statusNode("classifying bash via mock/glm…", true))])).not.toContain("SECRET-MARKER");
+	});
+
+	describe("/verdict as a Tern prefs window", () => {
+		const prefsKey = "prefs";
+		const runVerdict = async (h: Harness, script: (c: NativeComponent, run: NativeRun) => void, arg = ""): Promise<NativeRun> => {
+			const run = newRun();
+			driveNative(h, [(c) => script(c, run)], run);
+			await h.commands.verdict.handler(arg, h.ctx);
+			return run;
+		};
+
+		test("describe lists the pages and a scope row; scope + choice changes write the session override", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			const run = await runVerdict(h, (c) => {
+				c.handleNativeEvent!(evt("change", prefsKey, { item: "__scope", value: "session" }));
+				c.handleNativeEvent!(evt("change", prefsKey, { item: "footer", value: "compact" }));
+			});
+			const first = run.nodes[0];
+			expect(first.k).toBe("prefs");
+			expect(first.p.page).toBe("__main");
+			expect(JSON.stringify(first.p.sections)).toContain('"id":"__scope"');
+			expect(JSON.stringify(first.p.pages)).toContain('"id":"allow"');
+			expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8")).footer).toBe("compact");
+		});
+
+		test("an entry row needs two clears to be removed", async () => {
+			const h = session({ deny: ["rm "] }, { ompHost: true });
+			await liveProbe(h);
+			const before = fs.readFileSync(USER_FILE(), "utf8");
+			let afterFirst = "";
+			await runVerdict(h, (c) => {
+				c.handleNativeEvent!(evt("action", prefsKey, { act: "page", value: "deny" }));
+				c.handleNativeEvent!(evt("change", prefsKey, { item: "0", value: null }));
+				afterFirst = fs.readFileSync(USER_FILE(), "utf8");
+				c.handleNativeEvent!(evt("change", prefsKey, { item: "0", value: null }));
+			});
+			expect(afterFirst).toBe(before);
+			expect(JSON.parse(fs.readFileSync(USER_FILE(), "utf8")).deny).toEqual([]);
+		});
+
+		test("a confirm choice shows an Apply row and commits only on apply", async () => {
+			await withTempDir("pv-native-roles-", async (dir) => {
+				const h = session({}, { ompHost: true, roles: true });
+				h.ompAgentDir = dir;
+				await liveProbe(h);
+				let pendingNode: Snap | undefined;
+				await runVerdict(h, (c) => {
+					c.handleNativeEvent!(evt("change", prefsKey, { item: "roles", value: "on" }));
+					pendingNode = snap(c.describe!(cx));
+					expect(fs.existsSync(path.join(dir, "config.yml"))).toBe(false);
+					c.handleNativeEvent!(evt("action", prefsKey, { act: "apply", value: "roles::apply" }));
+				});
+				expect(JSON.stringify(pendingNode)).toContain('"id":"roles::apply"');
+				expect(fs.existsSync(path.join(dir, "config.yml"))).toBe(true);
+			});
+		});
+	});
+
+	describe("choice screens", () => {
+		const choicesKey = "pi-verdict.grants/choices";
+
+		test("/grants: activating a grant, then Revoke, revokes it without the host select/confirm", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			const granted = await h.tools.verdict_grant.execute("t1", { action: "request", request: "deploy build 42 to staging" }, undefined, undefined, h.ctx);
+			expect(granted.content[0].text.startsWith("Approved by the user")).toBe(true);
+			const [selects, confirms] = [h.selects, h.confirms];
+			const run = newRun();
+			driveNative(
+				h,
+				[(c) => c.handleNativeEvent!(evt("activate", choicesKey, { item: "G1" })), (c) => c.handleNativeEvent!(evt("action", "pi-verdict.grant-revoke/actions", { act: "pick:revoke" }))],
+				run,
+			);
+			await h.commands.grants.handler("", h.ctx);
+			expect(run.nodes.map((n) => n.p.role)).toEqual(["pi-verdict.grants", "pi-verdict.grant-revoke"]);
+			expect(run.options).toEqual([NATIVE_MD, NATIVE_MD]);
+			expect(run.nodes[0].k).toBe("picker");
+			expect(h.notifies.some(([m]) => m.includes("No active permission grants"))).toBe(true);
+			expect((h as unknown as { selects: number }).selects).toBe(selects);
+			expect(h.confirms).toBe(confirms);
+		});
+
+		test("grantRevokeScreen: structured sections, md overlay, Revoke <id>/Keep; host lines unchanged", () => {
+			const mk = (id: string, request: string, paths: { path: string; access: "read" | "write" }[], rules: string[]) =>
+				({ id, request, paths: paths.map((p) => ({ ...p, forms: [] })), rules, grantedBy: "user", grantedAt: new Date(0).toISOString() }) as unknown as Parameters<typeof grantLine>[0];
+			const reason = (id: string): string => (id === "gh-release" ? "GitHub release change" : "");
+			const g2 = mk("G2", "<request>", [{ path: "~/x/.omp/n.md", access: "read" }], ["gh-release"]);
+			const one = grantRevokeScreen([g2], false, reason);
+			expect(one.presentation).toEqual({ kind: "buttons", size: "md" });
+			expect(one.head).toBe("Revoke G2?");
+			expect(one.choices.map((c) => c.label)).toEqual(["Revoke G2", "Keep"]);
+			expect(one.cancelId).toBe("keep");
+			const json = JSON.stringify(one.body);
+			for (const s of ['"text":"Request"', '"text":"Protected path"', "~/x/.omp/n.md", '"text":"Danger rule"', "GitHub release change"]) expect(json).toContain(s);
+			expect(one.body.map((n) => n.key)).toEqual(["request", "paths", "rules"]);
+			expect(one.lines).toEqual(["<request>", "protected-path access: read ~/x/.omp/n.md", "danger rule: gh-release"]);
+
+			const grants = [mk("G1", "deploy", [], ["gh-release"]), g2];
+			const all = grantRevokeScreen(grants, true, reason);
+			expect(all.head).toBe("Revoke all 2 permission grants?");
+			expect(all.choices[0]!.label).toBe("Revoke all 2");
+			const cards = (all.body as { k: string; key?: string }[]).filter((n) => n.k === "card");
+			expect(cards.map((n) => n.key)).toEqual(["G1", "G2"]);
+			expect(all.body).toHaveLength(2);
+			expect(all.lines).toEqual(grants.map(grantLine));
+		});
+
+		test("ruleReviewScreen: tool name chip, one-line clamped calls, short buttons", () => {
+			const spec = ruleReviewScreen({
+				kind: "allow",
+				value: "^cargo test\\b",
+				rationale: null,
+				confirmed: true,
+				note: null,
+				attempt: 1,
+				matches: { checked: true, total: 40, hits: ["bash: cargo test", "bash: " + "x".repeat(900)], shadowed: [{ line: "bash: cargo test", verdict: "ask", reason: "r" }] },
+				options: [{ id: RULE_SAVE_CHOICE }, { id: "Edit value", short: "Edit" }, { id: "Cancel" }],
+				cancelId: "Cancel",
+				lines: [],
+			});
+			type N = { k: string; p?: Record<string, unknown>; c?: N[] };
+			const cols = (spec.body as N[]).filter((n) => n.k === "col");
+			const [hitsCol, shadowCol] = cols;
+			const hitRows = hitsCol!.c!.filter((n) => n.k === "row");
+			expect(hitRows).toHaveLength(2);
+			const [badge, text] = hitRows[0]!.c!;
+			expect(badge!.k).toBe("badge");
+			expect(badge!.p!.text).toBe("bash");
+			expect(text!.p!.spans).toEqual([{ t: "cargo test", s: "code" }]);
+			expect(text!.p!.truncate).toBe("end");
+			const long = hitRows[1]!.c![1]!;
+			expect(long.p!.truncate).toBe("end");
+			expect(long.p!.wrap).toBeUndefined();
+			expect(long.p!.lines).toBeUndefined();
+			const shadowText = shadowCol!.c!.find((n) => n.k === "row")!.c![1]!;
+			expect(shadowText.p!.truncate).toBe("middle");
+			expect((shadowText.p!.spans as Array<{ t: string; s: string }>).at(-1)).toEqual({ t: " → ask (r)", s: "muted" });
+			expect(spec.choices.map((c) => c.short ?? c.label)).toEqual(["Save…", "Edit", "Cancel"]);
+		});
+
+		test("/rule: Save… opens the scope picker; Back returns to the review; Global saves", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			h.responses = [{ text: "<kind>allow</kind><value>^cargo build\\b</value> m" }, { text: "<verdict>ok</verdict> fine" }];
+			const selects = h.selects;
+			const picks = ["unused"];
+			h.selectPicks = picks;
+			const scripts: Array<((c: NativeComponent) => void) | undefined> = [
+				(c) => c.handleNativeEvent!(evt("action", "pi-verdict.rule-review/actions", { act: "pick:" + RULE_SAVE_CHOICE })),
+				undefined,
+				(c) => c.handleNativeEvent!(evt("action", "pi-verdict.rule-review/actions", { act: "pick:" + RULE_SAVE_CHOICE })),
+				undefined,
+			];
+			const roles: string[] = [];
+			h.ctx.ui.custom = async (factory: (tui: object, theme: typeof fakeTheme, kb: undefined, done: (r: unknown) => void) => NativeComponent) => {
+				const { initTheme } = await import("@earendil-works/pi-coding-agent");
+				initTheme("dark", false);
+				const { promise, resolve } = Promise.withResolvers<unknown>();
+				const component = factory(nativeTui, fakeTheme, undefined, resolve);
+				const node = snap(component.describe?.(cx) ?? null);
+				if (node.p.role === "pi-verdict.progress") return promise;
+				roles.push(node.p.role as string);
+				if (roles.length === 4) {
+					const items = node.p.items as Array<{ id: string; label: string }>;
+					component.handleNativeEvent!(evt("activate", "pi-verdict.rule-save/choices", { item: items.find((i) => i.label === "Global")!.id }));
+				} else scripts.shift()?.(component);
+				for (let i = 0; i < 6; i++) component.handleInput("\x1b");
+				return promise;
+			};
+			await h.commands.rule.handler("allow cargo build", h.ctx);
+			expect(roles).toEqual(["pi-verdict.rule-review", "pi-verdict.rule-save", "pi-verdict.rule-review", "pi-verdict.rule-save"]);
+			expect(JSON.parse(fs.readFileSync(USER_FILE(), "utf8")).allow.at(-1)).toBe("^cargo build\\b");
+			expect(picks).toEqual(["unused"]);
+			expect(h.selects).toBe(selects);
+		});
+
+		test("verdict_settings: Decline on the native screen declines the change", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			const run = newRun();
+			driveNative(h, [(c) => c.handleNativeEvent!(evt("action", "pi-verdict.settings-change/actions", { act: "cancel" }))], run);
+			const out = await h.tools.verdict_settings.execute("t1", { action: "set", key: "footer", value: "compact", scope: "session", reason: "r" }, undefined, undefined, h.ctx);
+			expect(out.content[0].text).toContain("The user declined the change");
+			expect(run.nodes[0].p.role).toBe("pi-verdict.settings-change");
+			expect(h.confirms).toBe(0);
+			expect(fs.existsSync(SESSION_FILE())).toBe(false);
+		});
+
+		test("verdict_settings: confirm message shows parsed values, not JSON", async () => {
+			const h = session({ allow: ["^ls\\b"] });
+			const run = async (args: Record<string, unknown>): Promise<string> => {
+				await h.tools.verdict_settings.execute("t1", { reason: "r", ...args }, undefined, undefined, h.ctx);
+				return h.confirmMsgs[h.confirmMsgs.length - 1]!;
+			};
+			const valueLines = (msg: string): string[] => msg.split("\n").filter((l) => l.startsWith("  "));
+			const added = await run({ action: "add", key: "allow", value: "^pwd$", scope: "global" });
+			expect(added).toContain("  • ^ls\\b");
+			expect(added).toContain("  • ^pwd$");
+			const danger = await run({ action: "set", key: "dangerRules", value: { "gh-release": "ask" }, scope: "global" });
+			expect(danger).toContain("  gh-release: ask");
+			const footer = await run({ action: "set", key: "footer", value: "compact", scope: "session" });
+			expect(footer).toContain("After:\n  compact");
+			for (const msg of [added, danger, footer]) {
+				for (const l of valueLines(msg)) expect(l).not.toMatch(/[\[\]{}"]/);
+			}
+			const unset = await run({ action: "set", key: "notifyAllows", value: true, scope: "global" });
+			expect(unset).toContain("Before:\n  (not set)\nAfter:\n  true");
+		});
+
+		test("settingsChangeScreen: wider overlay and parsed value nodes", () => {
+			const spec = settingsChangeScreen({ scope: "global", where: "w", key: "dangerRules", action: "set", before: undefined, after: { "gh-release": "ask" }, notes: [], reason: "r", message: "m" });
+			expect(spec.presentation).toEqual({ kind: "buttons", size: "md" });
+			const tree = JSON.stringify(spec.body);
+			expect(tree).not.toContain('"k":"code"');
+			expect(tree).toContain("(not set)");
+			expect(tree).toContain("gh-release");
+			expect(settingValueLines([])).toEqual(["(empty)"]);
+			expect(settingValueLines({ a: 1, b: null })).toEqual(["a: 1", "b: null"]);
+		});
+
+		test("trust is a picker sheet, reviews float at md with button choices, /grants is a picker sheet", async () => {
+			const mods = { tui: await import("@earendil-works/pi-tui"), agent: await import("@earendil-works/pi-coding-agent") };
+			const glyphs = { on: "◉", off: "○" };
+			const build = (spec: ChoiceScreenSpec): { component: NativeComponent; picked: () => string | undefined } => {
+				let picked: string | undefined;
+				const component = buildChoiceScreen(mods, { requestRender() {} }, spec, (id) => { picked = id; }, glyphs) as NativeComponent & { nativeOverlay?: { size?: string }; nativeSheet?(cx: unknown): boolean };
+				return { component, picked: () => picked };
+			};
+			type Shape = NativeComponent & { nativeOverlay?: { size?: string }; nativeSheet?(cx: unknown): boolean };
+
+			const trustBuilt = build(trustScreen("~/p/.omp/pi-verdict.json", "t"));
+			const trust = trustBuilt.component as Shape;
+			expect(trust.nativeSheet?.(cx)).toBe(true);
+			const trustTree = snap(trust.describe!(cx));
+			expect(trustTree.k).toBe("picker");
+			expect(trustTree.p.layout).toBe("cards");
+			const trustItems = trustTree.p.items as Array<{ id: string; label: string; detail?: string }>;
+			expect(trustItems.map((i) => i.label)).toEqual(["Trust this project", "Not now", "Never"]);
+			expect(trustItems.every((i) => i.detail !== undefined)).toBe(true);
+			expect(JSON.stringify(trustTree.p.subtitle)).toContain('"t":"~/p/.omp/pi-verdict.json"');
+			// the item ids stay the long choices the caller compares against
+			trust.handleNativeEvent!(evt("activate", "", { item: trustItems[1]!.id }));
+			expect(trustBuilt.picked()).toBe("Not now — ignore it this session");
+			// without picker support the same spec falls back to the radio list
+			expect(JSON.stringify(trust.describe!({ ...cx, supports: () => false }))).toContain('"k":"list"');
+
+			const review = build(ruleReviewScreen({ kind: "allow", value: "^ls\\b", rationale: null, confirmed: false, note: null, attempt: 1, matches: null, options: [{ id: "Save" }, { id: "Cancel" }], cancelId: "Cancel", lines: [] })).component as Shape;
+			expect(review.nativeOverlay?.size).toBeUndefined();
+			expect(review.nativeSheet?.(cx)).toBe(false);
+
+			const grants = build(grantsScreen([{ id: "G1", request: "deploy", paths: [], rules: [], grantedBy: "user", grantedAt: new Date(0).toISOString() }], []));
+			const sheet = grants.component as Shape;
+			expect(sheet.nativeSheet?.(cx)).toBe(true);
+			expect(sheet.nativeSheet?.({ ...cx, supports: () => false })).toBe(false);
+			const tree = snap(sheet.describe!(cx));
+			expect(tree.k).toBe("picker");
+			expect((tree.p.actions as Array<{ id: string; danger?: boolean }>).find((a) => a.id === "revoke-all")?.danger).toBe(true);
+			expect((tree.p.items as Array<{ id: string }>).map((i) => i.id)).toEqual(["G1"]);
+			sheet.handleNativeEvent!(evt("action", "", { act: "revoke-all" }));
+			expect(grants.picked()).toBe("revoke-all");
+		});
+	});
+
+	describe("/verdict-debug (debug only)", () => {
+		const snapshotConfig = (): Array<[string, string]> => {
+			const root = path.join(TMP_AGENT, "config");
+			return (fs.readdirSync(root, { recursive: true }) as string[])
+				.map((rel): [string, string] => [rel, fs.statSync(path.join(root, rel)).isFile() ? fs.readFileSync(path.join(root, rel), "utf8") : ""])
+				.sort(([a], [b]) => a.localeCompare(b));
+		};
+
+		test("a flag applied after load enables it; without debug the command refuses", async () => {
+			const h = session({}, { ompHost: true });
+			await liveProbe(h);
+			let mounted = 0;
+			h.ctx.ui.custom = async () => void mounted++;
+			await h.commands["verdict-debug"].handler("all", h.ctx);
+			expect(mounted).toBe(0);
+			expect(h.notifies.some(([m]) => m.includes("/verdict-debug needs debug mode"))).toBe(true);
+
+			h.setFlag("auto-mode-debug", true); // hosts apply CLI flag values after the factory ran
+			await h.commands["verdict-debug"].handler("bogus", h.ctx);
+			expect(h.notifies.some(([m]) => m.includes('unknown screen "bogus"'))).toBe(true);
+		});
+
+		test("with debug, all shows every screen natively and changes nothing", async () => {
+			const h = session({}, { ompHost: true, debug: true });
+			const seen = await liveProbe(h);
+			const before = snapshotConfig();
+			h.sent.length = 0;
+			h.calls.length = 0;
+			const run = newRun();
+			driveNative(h, [], run);
+			await h.commands["verdict-debug"].handler("all", h.ctx);
+
+			expect(run.nodes.map((n) => n.p.role ?? n.k)).toEqual([
+				"pi-verdict.trust",
+				"pi-verdict.ask",
+				"pi-verdict.ask",
+				"pi-verdict.ask",
+				"pi-verdict.ask",
+				"pi-verdict.settings-change",
+				"pi-verdict.grants",
+				"pi-verdict.grant-revoke",
+				"pi-verdict.rule-review",
+				"pi-verdict.rule-save",
+				"pi-verdict.root-rule-review",
+				"prefs",
+				"pi-verdict.progress",
+				"pi-verdict.debug-step",
+				"pi-verdict.debug-step",
+				"pi-verdict.debug-step",
+			]);
+			const roles = seen.components.map((c) => (snap(c.describe?.() ?? null)?.p?.role as string | undefined) ?? "");
+			expect(roles).toContain("pi-verdict.footer");
+			expect(roles).toContain("pi-verdict.status");
+			expect(roles).toContain("pi-verdict.label");
+			expect(snapshotConfig()).toEqual(before);
+			expect(h.sent).toEqual([]);
+			expect(h.calls).toEqual([]);
 		});
 	});
 });

@@ -15,7 +15,7 @@
 2. **Window / pane / tab control: yes, by shelling out.** Tern ships a scripting CLI (`tern split|new|pip|dock|focus|move|run|send|capture|events|open|browser|ls …`) that works from inside a pane (verified live on this Windows box). An extension can call it with `pi.exec`. omp's built-in `ctx.ui.openTerminal` does **not** support Tern (only tmux, Zellij, Herdr, CMUX, Orca).
 3. **Tern-side chrome (tab bar, status line, layouts, CSS, key binds, block types): not from an omp extension.** That needs a separate Tern **Luau plugin**; the two can only cooperate through files, processes, pane writes or the `tern` CLI [INFERENCE: no direct omp↔plugin API was found].
 
-**Not reachable through omp's TSP layer as shipped (18.13.3):** TSP's HTML `el` kind, program stylesheets (`s` verb), program palette (`t` verb) and `flow` surfaces: omp's wire types contain none of them. Workaround: spawn a helper program using the Tern SDK in a new pane.
+**Not reachable through omp's TSP layer as shipped (18.13.3):** TSP's HTML `el` kind, program stylesheets (`s` verb), program palette (`t` verb) and `flow` surfaces: omp's wire types contain none of them. Workaround: spawn a helper program using the Tern SDK in a new pane. Partial exception for styling: Tern ships its own CSS for omp's `omp.*` role names, and a node of any extension can carry one of those roles to borrow it (measured, see "Typography and roles" below).
 
 ## What tern is
 
@@ -121,7 +121,7 @@ Packages with `plugin.toml` + `host.luau` (daemon side) + `window.luau` (each wi
 | Keyboard | Yes: kitty keyboard protocol, bracketed paste | **Yes** | `handleInput`, `wantsKeyRelease`, `ctx.ui.onTerminalInput`; reserved keys (`ctrl+c/d/z/k/p/l/o/t/g/q`, `alt+m`, `shift+tab`, `escape`, `enter`, …) can't be bound (`omp://extensions.md`, "Constraints and pitfalls") |
 | Native text editing (selection, undo, atomic send) | Yes: `edit`/`undo`/`send` features | Yes, via the composer / `CustomEditor` | omp advertises `features:["edit","undo","send"]` (`omp://tui-core-renderer.md:204-207`); `setEditorComponent` factory must return a `CustomEditor` subclass (`types.ts:420`) |
 | Images | `image` node (blobs); Kitty graphics per omp's table | **Yes** | `Image` component describes itself (`components/image.ts:794`); blob upload/cache automatic (`native/blobs.ts`) |
-| Program CSS stylesheets (`s` verb), program palette (`t`) | Yes | **No through omp's layer** | `TspVerb = "q"\|"o"\|"f"\|"b"\|"x"\|"r"\|"e"` only (`[PI-WIRE]/src/tsp.ts:31`). Workaround [INFERENCE, untested]: `tui.terminal.write()` a raw APC `s`/`t` message for omp's surface id; undocumented and could desync omp's reconciler. Safer: helper process in its own pane (below) |
+| Program CSS stylesheets (`s` verb), program palette (`t`) | Yes | **No through omp's layer** (partly via bundled roles) | `TspVerb = "q"\|"o"\|"f"\|"b"\|"x"\|"r"\|"e"` only (`[PI-WIRE]/src/tsp.ts:31`). Workaround [INFERENCE, untested]: `tui.terminal.write()` a raw APC `s`/`t` message for omp's surface id; undocumented and could desync omp's reconciler. Safer: helper process in its own pane (below). Measured partial route: put one of Tern's bundled `omp.*` roles on a node (e.g. `omp.advisor.note` on `text`) to get its font, size and weight, see "Typography and roles" |
 | `el` HTML elements/forms, `block` kind | `el` and `block` listed in Tern's vocabulary | **No (typed out)** | omp's `TSP_KINDS` (`[PI-WIRE]/src/tsp.ts:38-82`) has no `el`/`block` and does have `media`, which Tern's docs table doesn't list; versions may differ [INFERENCE]. Check Tern's live `hello.kinds` with `PI_TUI_TSP_RECORD` |
 | `flow` surfaces (output kept in scrollback) | Yes (feature `flow`) | **No via omp's TUI** (`mode: "inline"\|"screen"`, `backend.ts:231`) | Run a Tern-SDK CLI via `pi.exec`/new pane, or `tern open` / `tern capture` |
 | Stray raw ANSI/escape output | Hidden while an inline surface owns the pane | **Effectively no in native mode** | "Bytes that aren't TSP while a surface is live … stay hidden with the rest of the grid until it closes or suspends" (`…/protocol/surfaces.md`, "Stray output"). Title/progress/notification OSCs are fine (omp already sends progress) |
@@ -140,6 +140,63 @@ Packages with `plugin.toml` + `host.luau` (daemon side) + `window.luau` (each wi
 1. **In-session UI**: components with `describe()`/`describeScreen()`/`handleNativeEvent()`, with a rows fallback (so it works in Windows Terminal too).
 2. **Window orchestration**: a thin helper calling `pi.exec("tern", …)`; check `process.env.TERM_PROGRAM === "tern"` and `TERN_PANE` first (the same gate omp uses: `[PI-CA]/src/tools/browser/tern/kind.ts:22-49`).
 3. **Anything needing CSS, `el` forms, flow output or custom Tern chrome**: ship a separate program using `@stencil-hq/tern` (opened with `tern split … -- cmd`) and/or a Tern Luau plugin.
+
+## Typography and roles (measured live)
+
+*Measured 2026-10-30 on omp 18.14.0 inside Tern, while redesigning pi-verdict's dialogs. Method: a throwaway extension (or the pi-verdict `/verdict-debug` screens) in a side pane started with `tern split "$TERN_PANE" right --keep-open --cwd DIR --json -- pwsh -NoProfile -Command "$env:PI_CODING_AGENT_DIR='TMP'; omp --no-extensions -e EXT.ts"` (temp agent dir with copies of `agent.db`, `config.yml`, `models.db` for model auth), driven with `tern send ID text …` / `tern send ID keys enter`, and `tern ctl shot NAME` which writes `NAME.png` plus `NAME.layout.json` (every element with its computed `fontFamily`, `fontSize`, `fontWeight`) under `%LOCALAPPDATA%\Programs\Tern\target\shots\tern\live\`. Fonts below are read from those dumps, not judged from the screenshots. Pane ids come from `tern inspect` (indented first column); `$(…)` capture of `tern split --json` stdout fails on this box, redirect to a file.*
+
+### Which node kinds are sans or monospace
+
+Tern draws Geist (sans) or JetBrains Mono (monospace). Without a role:
+
+| Where | Font |
+| --- | --- |
+| `text`, `md`, `code`, `card` content, `kv`, `section` heads, `list`/`item` content, table body cells, in overlays, docks and widgets | monospace |
+| Overlay title (`nativeOverlay.head`), `omp.btn` buttons, `badge` chips, `tabs`, table header cells, the `picker` sheet (rows, details, subtitle) | sans |
+| `md` in the chat transcript (`main` region) | sans, but not reachable from a dialog |
+
+Consequence: a dialog built from plain `text`/`md` nodes is monospace, whatever its container. The only sans body text without a role is the `picker` sheet.
+
+### `picker` hides its preview in narrow panes
+
+A `picker` with `preview` children shows them only while the sheet is wide. In a narrow pane the 580 px sheet gets the class `pv-hide` and the preview is dropped, even with `size: "lg"`. So a picker cannot be relied on to display the command, a classifier opinion or a free-text field. pi-verdict therefore uses a picker only for the trust prompt (no heavy content) and keeps approvals as a card dialog.
+
+### Roles restyle nodes, and an extension can reuse Tern's roles
+
+`role` on a node is a hook into Tern's bundled stylesheet. omp's own `describe()` implementations use `omp.*` names such as `omp.plan.body`, `omp.plan.options`, `omp.btn`, `omp.sheet.head`. Nothing stops an extension from setting the same names on its own nodes. Test: 578 distinct `"omp.*"` strings found by grepping `@oh-my-pi/pi-tui/src`, each put on (a) an `md` node, (b) a `text` node and (c) a `col` wrapping an `md`, 578 nodes per run, computed font read per node. Roles that gave a sans face: 55 on `md`, 57 on `text`, 61 on `col>md` (the rest stayed monospace). The effect is per kind: `omp.plan.body` makes `md` and `col>md` sans but leaves `text` monospace, and `omp.ask.question` makes only `md` sans.
+
+Roles that give plain prose, as measured (family size/weight):
+
+| Role | on `md` | on `text` | on `col>md` | What it looks like |
+| --- | --- | --- | --- | --- |
+| `omp.advisor.note` | sans 13.5/400 | sans 13.5/400 | sans 13.5/400 | compact, no box, no padding (used by pi-verdict) |
+| `omp.plan.body` | sans 13.5/400 | monospace | sans 13.5/400 | plan prose; used for pi-verdict's explanation `md` |
+| `omp.plan.feedback` | sans 16/400 | sans 16/400 | sans 16/400 | roomy: adds vertical padding per row |
+| `omp.plan.prompt` | sans 13/550 | sans 13/550 | sans 13/550 | bold prompt line |
+| `omp.plan.note` | sans 12.5/400 | sans 12.5/400 | sans 12.5/400 | boxed note with an accent bar on the left |
+| `omp.ask.question` | sans 15/550 | monospace | monospace | question line, `md` only |
+| `omp.sheet.head` | sans 14/600 | sans 14/600 | sans 14/600 | section heading |
+| `omp.hub.title` | sans 17/600 | sans 17/600 | sans 17/600 | large title |
+| `omp.app.git.body`, `omp.usage.label`, `omp.welcome.tip`, `omp.app.git.message` | sans 12.5-13/400 | same | same | plain sans; not inspected for padding or boxes |
+
+Caveats. Only fonts were read from the dumps; backgrounds, borders and padding were judged from screenshots for the `omp.plan.*` roles and `omp.advisor.note`, and not at all for the other roles. The names are Tern's, not a documented extension API, so a Tern release can rename or restyle them [INFERENCE: nothing in the docs promises stability]. A role replaces the node's own role, so an extension's custom role on the same node would be lost. Probe pitfall: Escape did not dismiss a custom overlay in a throwaway probe extension (the overlay stayed open), so each probe mode needs its own pane.
+
+### How omp's plan review window is built (a model to copy)
+
+`@oh-my-pi/pi-tui/src/overlays/plan-review-overlay.ts`, class `PlanReviewOverlay` (`describe()` ~l.1533). It is plain TSP nodes with Tern-owned roles, not a `picker`:
+
+- `nativeOverlay` is `{role: "omp.overlay.planReview", size: "lg", anchor: "center", head: <the plan's first heading>}`; the root is a borderless `col` (gap `md`), the overlay is the frame.
+- Head tools: right-aligned `row` (`omp.plan.tools`) of buttons (Copy, Edit in `$EDITOR`, Cancel).
+- Body: `col` `omp.plan.body` (grow) of one `md` per section, annotations as `col`s with `omp.plan.note`; with enough headings, a `row` puts a Contents `list` (`omp.plan.toc`, depth roles `omp.plan.toc.depthN`) in a 32ch sidebar next to the body.
+- Strategy slider: a `tabs` node (`omp.plan.strategy`); decision bar: a `list` of items (`omp.plan.options`) that Tern lays out as buttons with the first as the hero; submitting state is a `spinner`.
+- Focus is shown with `tone: "accent"` on the focused region; events come back through `handleNativeEvent` (`action`, `select`, `activate`).
+
+So the plan window mixes sans UI and rendered markdown because its roles carry the styling, not because of a different node kind. The same mechanism is what the pi-verdict ask, review and confirm dialogs reuse.
+
+### Other measured layout facts
+
+- Gap tokens accepted by `col`/`row`: `none|xs|sm|md|lg`.
+- A declared overlay size `md`/`lg` becomes `full` in panes under about 100 columns; an undeclared `md` obtained with `overlayOptions.width: "60%"` floats at every pane width.
 
 ## Windows caveats
 
@@ -183,3 +240,4 @@ Packages with `plugin.toml` + `host.luau` (daemon side) + `window.luau` (each wi
 5. **Stability of Tern's daemon JSON protocol** (`TERN_PANE_SOCKET`) beyond omp's own use; no public spec found. Prefer the `tern` CLI unless a spec is published.
 6. **Direct omp-extension ↔ Tern-plugin channel** (shared event bus or message API): none found; needs confirmation from Stencil or the plugin API reference (`https://docs.stencil.so/tern/reference/api.md`, not read).
 7. **Event names for `tern events --filter`**: only `pane_spawned` and `layout_changed` appear (in the product page demo); the full list wasn't found.
+8. **Stability and full style of the bundled `omp.*` roles.** Only fonts were measured; whether Tern keeps these names across releases, and what padding/background each role adds, is unverified (the stylesheet isn't public). Re-run the 578-role probe after a Tern or omp upgrade.
