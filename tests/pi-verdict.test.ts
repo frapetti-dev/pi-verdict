@@ -5984,6 +5984,7 @@ describe("Tern-native UI (TSP)", () => {
 	const plainTui = { requestRender() {} };
 	const cx = { cols: 100, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
 	const NATIVE_MD = { overlay: true, overlayOptions: { width: "60%" } };
+	const NATIVE_WIDE = { overlay: true, overlayOptions: { width: "90%" } };
 	const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 	type NativeComponent = DialogComponent & { describe?(cx: unknown): unknown; handleNativeEvent?(e: unknown): void };
 	interface Snap { k: string; key?: string; p: Record<string, unknown>; c?: Snap[] }
@@ -6056,7 +6057,7 @@ describe("Tern-native UI (TSP)", () => {
 			const run = newRun();
 			driveNative(h, [(c) => c.handleNativeEvent!(evt("activate", clickKey, { item: "yes" }))], run);
 			expect(await toolCall(h, "bash", { command: "ls -la" })).toBeUndefined();
-			expect(run.options).toEqual([NATIVE_MD]);
+			expect(run.options).toEqual([NATIVE_WIDE]);
 			expect(run.nodes[0].p.role).toBe("pi-verdict.ask");
 
 			const plain = session({}, { ompHost: true });

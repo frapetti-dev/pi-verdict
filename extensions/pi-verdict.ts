@@ -3102,6 +3102,8 @@ export function tnFramed(kids: readonly (TspNode | object)[], gap: "sm" | "md" |
 }
 /** Overlay width that maps to an undeclared `md` on omp's TSP backend: a floating dialog at every pane width (a declared `md`/`lg` fills panes under 100 columns). */
 const NATIVE_MD_OVERLAY = { overlay: true, overlayOptions: { width: "60%" } } as const;
+/** Wider variant for the approval dialog, which can hold a command or code diff. Same undeclared-`md` mapping as `NATIVE_MD_OVERLAY`, just more columns. */
+const NATIVE_WIDE_OVERLAY = { overlay: true, overlayOptions: { width: "90%" } } as const;
 interface RadioGlyphs {
 	on: string;
 	off: string;
@@ -5346,7 +5348,7 @@ async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSig
 			const dialog = buildApproveDialog(mods, tui, theme, shown, done);
 			if (signal?.aborted) queueMicrotask(() => done(undefined));
 			return dialog;
-		}, nativeLive() ? NATIVE_MD_OVERLAY : undefined);
+		}, nativeLive() ? NATIVE_WIDE_OVERLAY : undefined);
 		return isAskPick(r) ? r : undefined;
 	} finally {
 		signal?.removeEventListener("abort", onAbort);

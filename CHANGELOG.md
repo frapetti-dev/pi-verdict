@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Changed
+
+- Tern-native ask dialog: the approval dialog (the `ui.custom` call in `pickAsk`) now mounts with `overlayOptions.width: "90%"` (was `"60%"`) so long commands and code in its body wrap less; omp still maps it to an undeclared `md` that floats at every pane width. The other medium dialogs (grants, choice screens) keep `"60%"`; the ANSI/pi dialog is unchanged.
+
 ## [0.25.0] - 2026-10-31
 
 ### Added
