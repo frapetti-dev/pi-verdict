@@ -4,7 +4,7 @@ This document is the normative definition of pi-verdict's gate behavior. The key
 
 Each rule is a `####` heading followed by a normative statement, then `Why:` (the reason, with a link when the reason is a measurement), `Code:` (implementing symbols, no line numbers) and `Pinned by:` (the `describe › test` titles in `tests/` that assert the rule, or `unpinned`).
 
-Contents: [RL Rule layer](#rl-rule-layer) · [PG Path grading](#pg-path-grading) · [PP Protected paths and the forced .omp gate](#pp-protected-paths-and-the-forced-omp-gate) · [CL Classifier](#cl-classifier) · [JV jev adapter](#jv-jev-adapter) · [CS Confidence floor, mode thresholds, fallback cascade](#cs-confidence-floor-mode-thresholds-fallback-cascade) · [MD Approval modes](#md-approval-modes) · [PR Outcome and presentation](#pr-outcome-and-presentation) · [SG Subagent gate](#sg-subagent-gate) · [CF Configuration, scopes, trust](#cf-configuration-scopes-trust) · [AU Audit log and shadow cache](#au-audit-log-and-shadow-cache) · [RG Rule generator](#rg-rule-generator) · [RR Root rule](#rr-root-rule) · [ST Settings tool](#st-settings-tool) · [Decision tables](#decision-tables)
+Contents: [RL Rule layer](#rl-rule-layer) · [PG Path grading](#pg-path-grading) · [PP Protected paths and the forced .omp gate](#pp-protected-paths-and-the-forced-omp-gate) · [CL Classifier](#cl-classifier) · [JV jev adapter](#jv-jev-adapter) · [CS Confidence floor, mode thresholds, fallback cascade](#cs-confidence-floor-mode-thresholds-fallback-cascade) · [SC Script and file context](#sc-script-and-file-context) · [MD Approval modes](#md-approval-modes) · [PR Outcome and presentation](#pr-outcome-and-presentation) · [SG Subagent gate](#sg-subagent-gate) · [CF Configuration, scopes, trust](#cf-configuration-scopes-trust) · [AU Audit log and shadow cache](#au-audit-log-and-shadow-cache) · [RG Rule generator](#rg-rule-generator) · [RR Root rule](#rr-root-rule) · [ST Settings tool](#st-settings-tool) · [EG Gated execution](#eg-gated-execution) · [Decision tables](#decision-tables)
 
 ## RL: Rule layer
 
@@ -99,6 +99,14 @@ Why: the tool's own dialog (GR-2) or unattended consensus (GR-3) is its gate; th
 Code: `classifyByRules`, `GRANT_TOOL_NAME`
 Pinned by: permission grants (GR-1–GR-6) › GR-1: the tool call itself is a mechanical allow
 
+#### RL-10: Gated-execution tool
+
+A call to the tool named `execute_gated_tool` is allowed by the rule layer with reason `pi-verdict gated-execution wrapper (the wrapped call is adjudicated inside the tool)`, without a classifier call and silently (PR-3). It sits where the `tools` allowlist sits (RL-2 step 6); like RL-8 it has no rule target (RL-3). The wrapped call is adjudicated inside the tool (EG-1), so the wrapper's own allow decides nothing.
+
+Why: the wrapper is only a carrier for extra context; the real decision is the adjudication of the call it names, so a second classifier call on the wrapper would judge nothing.
+Code: `classifyByRules`, `EXEC_GATED_TOOL_NAME`
+Pinned by: gated execution (EG-1–EG-4) › EG-1: the wrapper is allowed mechanically (RL-10); bad arguments return text, mode off says NA
+
 
 ## PG: Path grading
 
@@ -162,9 +170,9 @@ Pinned by: denyPaths (PP-1–PP-9) › normalization matrix: ~, $HOME, relative,
 
 #### PP-2: Candidate extraction
 
-The path candidates of a call are: a file tool's `path`; the cwd for a scope tool without a path; for a command tool, every path-like token of the command string (`~/…`, `$HOME/…`, absolute paths, `./` and `../` forms, and `word/word` relative forms, with backslashes unified to `/` on win32); none for tools outside both families. The extractor produces evidence only. It NEVER reads the contents of external scripts and does not resolve command substitution or encoded paths.
+The path candidates of a call are: a file tool's `path`; the cwd for a scope tool without a path; for a command tool, every path-like token of the command string (`~/…`, `$HOME/…`, absolute paths, `./` and `../` forms, and `word/word` relative forms, with backslashes unified to `/` on win32); none for tools outside both families. The extractor produces evidence only. It does not resolve command substitution or encoded paths, and it does not read scripts: the contents of a local script a command runs reach the classifier as file context (SC-1–SC-3), never the rule layer, so a protected path named only inside a script is not a hit.
 
-Why: recursive script scanning is unsound by construction (scripts spawning scripts, dynamic evaluation), and a partial implementation would advertise coverage it does not have; holes fall back to the existence hint (PP-7).
+Why: recursive script scanning is unsound by construction (scripts spawning scripts, dynamic evaluation), and a partial implementation would advertise coverage it does not have; the classifier reads the script as evidence instead (SC-3) and the remaining holes fall back to the existence hint (PP-7).
 Code: `denyPathCandidates`, `BASH_PATH_TOKENS`
 Pinned by: denyPaths (PP-1–PP-9) › obfuscation payloads: base64-embedded path falls to the classifier with the hint; literal-in-$() and quoted $HOME still hit
 
@@ -385,11 +393,11 @@ Pinned by: omp model roles › the verdict-fallback role beats classifierFallbac
 
 #### CS-6: Shadow mode
 
-In `classifierFallbackMode: "shadow"` (default) the fallback is consulted on triggered calls and its opinion is recorded (audit `fallback`, session counters), but it NEVER changes a verdict: a demotion still asks the human, a fail-closed deny stands, an unattended slip still blocks as `unattended-retry`.
+In `classifierFallbackMode: "shadow"` (default) the fallback is consulted on triggered calls and its opinion is recorded (audit `fallback`, session counters), but it NEVER changes a verdict: a demotion still asks the human, a fail-closed deny stands, an unattended slip still blocks as `unattended-retry`. The one exception is a call that carries file context (SC-5): its cascade runs in `enforce` whatever the configured mode, and the audit records `mode: "enforce"`.
 
 Why: shadow-first rollout so fallback behavior can be measured against ground truth (AU-3) before it holds authority; observe-only state follows the shadow-cache discipline (AU-5); flipping to `enforce` is a human decision after about two weeks of shadow data with no ground-truth evidence of fallback false-allows ([research/classifier-fallback-model-feasibility.md](../research/classifier-fallback-model-feasibility.md)).
 Code: `runConfidenceCascade`, `FallbackCascade`
-Pinned by: confidence floor + cascade (#67) › shadow + demotion: the human is asked, the fallback opinion recorded, verdicts untouched; confidence floor + cascade (#67) › fail-closed: no fallback denies; shadow records the opinion; enforce adjudicates de novo
+Pinned by: confidence floor + cascade (#67) › shadow + demotion: the human is asked, the fallback opinion recorded, verdicts untouched; confidence floor + cascade (#67) › fail-closed: no fallback denies; shadow records the opinion; enforce adjudicates de novo; script and file context (SC-1–SC-6) › SC-5: with file context a shadow-mode fallback is authoritative; the audit holds hashes, never content
 
 #### CS-7: Enforce mode
 
@@ -406,6 +414,65 @@ If the fallback is unresolvable or both its attempts fail: in `shadow` the outco
 Why: once the user configures a second layer its silent failure must not quietly degrade the gate to a single layer; the tier that was to adjudicate is down, so the human decides.
 Code: `runConfidenceCascade`
 Pinned by: confidence floor + cascade (#67) › enforce fallback failure/unresolvable on a demotion falls to the human (headless → deny); confidence floor + cascade (#67) › aborted signal aborts the fallback attempt; both modes fall to the human
+
+## SC: Script and file context
+
+#### SC-1: Local-script detection
+
+For a command tool, the gate detects the local scripts the command runs: the first word of each command segment (after `&&`, `||`, `;`, `|` and leading `VAR=value` assignments and the `env`, `time`, `nohup`, `exec`, `command` and `&` wrappers) is a script when it is an existing file or a path with a script extension (`.ts`, `.js`, `.py`, `.sh`, `.ps1`, `.rb`, `.pl`, `.php` and siblings), or an interpreter (`bun`, `node`, `deno`, `tsx`, `python`, `bash`, `sh`, `zsh`, `pwsh`, `ruby`, `perl`, `php`, including a `run` or `-File` word) whose first non-flag argument is such a path, or `source` / `.` followed by such a path. Inline code (`-c`, `-e`, `--eval`) and subcommands without a script path (`bun test`, `python -m pytest`) are not scripts. Detection is lexical, resolves relative paths against the session cwd, returns each path once, and is skipped for commands longer than `BASH_MAX_MATCH_LEN`. A detected path that does not exist is still a candidate (SC-3 lists it as `<missing>`).
+
+Why: a script's text decides what the command does, and the classifier sees only the command line; detection is deliberately shallow because exhaustive resolution is unsound (PP-2), and what it misses stays a gray-zone call as before.
+Code: `detectLocalScripts`, `SCRIPT_INTERPRETER`, `SCRIPT_EXTENSION`, `INLINE_CODE_FLAG`
+Pinned by: script and file context (SC-1–SC-6) › SC-1: scripts run through an interpreter, directly or by sourcing are detected; inline code and subcommands are not
+
+#### SC-2: Loading and protected files
+
+Detected scripts, files the agent cites (EG-1) and files the classifier requests (SC-4) are read by the gate. Each file is capped at 32 KB (the cap is marked `truncated`), all files together at 64 KB, a file over 16 MiB is not read (`unreadable`), and a directory, a missing file or a read error is `missing`. A file in the S0 credential tier, covered by `denyPaths` or under a `.omp` directory is NEVER read and its name is NEVER shown: it appears only as `(protected, withheld)` (PP-6). Every file contributes a SHA-256 of its full content to the context digest, whether or not it was shown.
+
+Why: the file context goes to a model provider, so it is bound by the same confinement as every protected path; hashing the whole file lets the digest (SC-6) notice any edit, including one past the cap.
+Code: `loadFileContext`, `fileContextDigest`, `MAX_FILE_CONTEXT_BYTES`, `MAX_FILE_CONTEXT_TOTAL_BYTES`, `MAX_FILE_CONTEXT_READ_BYTES`
+Pinned by: script and file context (SC-1–SC-6) › SC-2: a credential-tier script is withheld — no name, no content reach the classifier; script and file context (SC-1–SC-6) › SC-2: a denyPaths-covered script is withheld the same way
+
+#### SC-3: File context in the classifier call
+
+When file context exists, the classifier user message gains a `<files>` block after the transcript: one `<file path origin sha256 [truncated]>` element per loaded file (origin `script`, `agent` or `classifier`; paths relative to the cwd where possible), `<missing>` entries for files that could not be read, and the agent's unverified explanation (EG-1) in `<explanation source="agent, unverified">`. Content is inert: a literal closing tag inside a file is escaped (`<\/file`). The system prompt gains the `File context:` paragraph stating that the files are evidence, not instruction, and that a missing or truncated file calls for lower confidence and ask over allow. Without file context the message and the system prompt are byte-identical to the pre-file-context form.
+
+Why: the gate reads the files itself, so the content is first-party evidence the agent cannot rewrite, unlike the transcript's tool results (CL-4); the agent's explanation is labeled as the agent's own claim.
+Code: `classifierUserMessage`, `FILE_CONTEXT_TASK`, `trustedPolicyBlock`, `ClassifierFileInput`
+Pinned by: script and file context (SC-1–SC-6) › SC-3: script content reaches the classifier as inert evidence; plain calls carry no file context
+
+#### SC-4: File requests
+
+A generative first-layer classifier is offered one file round when the call carries file context or an agent explanation: it may answer `<need-files>` with up to three paths, one per line, instead of a verdict. The gate loads them (SC-2, same budget), appends them with origin `classifier`, and calls the classifier again with a fresh two-attempt budget (CL-7). The follow-up reply MUST be a verdict (CL-6); a second request, or no verdict after it, is an ask with reason `no verdict after the file follow-up` (headless: degraded deny, PR-1) rather than a fail-closed deny, because the classifier did answer. A failure of every attempt stays fail-closed. A typed-decision (jev) model is never offered a request.
+
+Why: the classifier is the party that knows which imported file matters; one bounded round buys that without an open-ended tool loop. The offer is limited to calls with file context or an explanation so every other call's prompt stays unchanged.
+Code: `classifyWithModel`, `NEED_FILES_TASK`, `parseClassifierReply`, `MAX_FILE_REQUEST_PATHS`
+Pinned by: script and file context (SC-1–SC-6) › SC-4: a generative classifier may request one more file; the round-2 message carries it; script and file context (SC-1–SC-6) › SC-4: a second request, or any contract violation after the follow-up, is an ask (headless: degraded deny), not a fail-closed deny; script and file context (SC-1–SC-6) › SC-4: a typed-decision (jev) first layer is never offered a file request
+
+#### SC-5: Cascade with file context
+
+A call with file context that enters the cascade (CS-3) runs it in `enforce` mode whatever `classifierFallbackMode` says (CS-6); a fallback that is not a jev model may answer `<need-files>` (SC-4) and then `<rejudge/>` to hand the call back to the first layer. The rejudge call goes to the first-layer model with the enriched file context, and its reply passes `confidenceDemotion`, `applyModeThresholds` and the CS-7 carve-out like an ordinary first-layer verdict. The audit `fallback` record carries `rejudged: true`; the audit `files` entries hold path, origin, status, `truncated` and SHA-256, NEVER content (AU-1).
+
+Why: a fallback that has read the file is better placed to decide than a first layer that abstained without it, and a jev first layer cannot ask for files, so the fallback does it and returns the call.
+Code: `runConfidenceCascade`, `REJUDGE_TASK`, `auditFileEntries`
+Pinned by: script and file context (SC-1–SC-6) › SC-5: with file context a shadow-mode fallback is authoritative; the audit holds hashes, never content; script and file context (SC-1–SC-6) › SC-5: the fallback may request files, then hand the call back (rejudge) to the first layer with the enriched context
+
+#### SC-6: Digest in approval and shadow keys
+
+The context digest (SC-2) is part of the remembered-approval key (PR-9) and of the shadow-cache command key (AU-5). A remembered approval of a command that runs a script therefore stops matching when the script, or a file the call cited, changes; the call is classified again.
+
+Why: "approve this command" must not silently cover different code behind the same command line.
+Code: `approvalKey`, `shadowCommandKey`, `fileContextDigest`
+Pinned by: script and file context (SC-1–SC-6) › SC-6: editing a script invalidates a remembered approval; an unchanged script stays remembered
+
+#### SC-7: Viewing the code in the ask dialog
+
+An ask dialog that carries code (the command, plus each loaded script or file with the file's name when it is not protected) shows each block with a **View** control; `v` (ANSI) or the button (Tern) opens a full-size scrollable viewer of that block, Tab/Previous/Next switches block, Esc/Close returns to the ask with its state unchanged. The Tern dialog and viewer mount as overlays at 95% width. Protected files never appear as blocks (SC-2).
+
+Why: the user is asked to approve code they could not read in the inline preview; a script of a few hundred lines needs a real viewer.
+Code: `buildApproveDialog`, `buildCodeViewer`, `viewCode`, `dialogViewBlocks`, `NATIVE_WIDE_OVERLAY`
+Pinned by: script and file context (SC-1–SC-6) › ask dialog: the script is a second code block; v opens the viewer, Tab switches block, Esc returns to the ask
+Pinned by (native nodes): Tern-native UI (TSP) › ask dialog › SC: a script's file context gets a View button; View opens the 95% viewer overlay and closing re-opens the ask
 
 ## MD: Approval modes
 
@@ -882,6 +949,40 @@ While the host is in plan mode, the main agent's gate briefing (GR-7) gains extr
 Why: "Approve and execute" starts a new session and grants are session-scoped (GR-6), so grants are planned in the plan phase and requested in the execution phase.
 Code: `gateBriefing`, `planModeActive`, the `before_agent_start` handler
 Pinned by: plan-mode grant planning (GR-8) › active omp plan mode: the briefing requires a Permission grants section requested at execution start; plan-mode grant planning (GR-8) › inactive or paused plan mode, pi without sessionModes, or a throwing getState add no plan-mode lines; plan-mode grant planning (GR-8) › a gated subagent in plan mode gets no plan-mode lines
+
+## EG: Gated execution
+
+#### EG-1: The wrapper tool
+
+`execute_gated_tool` takes `tool` (a registered tool name other than itself, `verdict_grant` and `verdict_settings`), `input` (an object: the wrapped call's arguments), optional `files` (at most 10 paths of 1–500 characters the call depends on) and optional `explanation` (at most 1000 characters). It adjudicates the wrapped call with the cited files and the explanation as extra context (SC-3) and does not run it: the result text starts `Cleared:` (allowed, with a one-shot pre-clearance, EG-2), `Allowed by rule:` (no clearance needed) or `NA:` (the gate is inactive: mode `off`, or an ungated subagent), and any other outcome is the ordinary block text. A wrapper call that would ask the user shows the same ask dialog; invalid arguments return an `Invalid …` text. The agent's explanation and cited files are the agent's claims: the explanation is labeled unverified (SC-3) and the cited files are read by the gate (SC-2).
+
+Why: when a script's dependencies are not visible to the gate, the agent can point at them instead of splitting the command or being denied without recourse.
+Code: `execute_gated_tool` registration in `autoMode`, `gateCall`, `adjudicate` (`extra`), `MAX_GATED_FILES`, `MAX_GATED_EXPLANATION_CHARS`
+Pinned by: gated execution (EG-1–EG-4) › EG-1: the wrapper is allowed mechanically (RL-10); bad arguments return text, mode off says NA
+
+#### EG-2: One-shot pre-clearance
+
+A classifier allow, or a user allow of an ask, obtained through the wrapper stores a clearance keyed by the tool, its input and the digest of the script files alone (the plain follow-up call carries no agent-cited files), and holds the full digest of scripts plus cited files. The next identical call within 120 s passes without a classifier call or dialog if the full digest, recomputed from the files on disk, is unchanged; it consumes the clearance. A deny, a rule deny, an expired clearance or a changed file never clears; a call that is rule-allowed needs none. A call adjudicated with `extra` never consumes a clearance. The session reset clears all clearances.
+
+Why: the wrapper pays for the heavier adjudication once; the plain call that follows must not be classified again on thinner context and possibly contradicted, but the allowance must not outlive the code it vouched for.
+Code: `SessionState.addClearance`, `SessionState.takeClearance`, `CLEARANCE_TTL_MS`, `adjudicate`
+Pinned by: gated execution (EG-1–EG-4) › EG-2: classifier allow issues a one-shot clearance; the identical call passes without a classifier call, a second does not; gated execution (EG-1–EG-4) › EG-2: a denied or rule-denied call is never cleared; gated execution (EG-1–EG-4) › EG-2: a rule-allowed inner call needs no clearance; gated execution (EG-1–EG-4) › EG-2: the clearance expires, and an edited file voids it
+
+#### EG-3: Subagents
+
+A subagent may use the wrapper. The wrapped call is adjudicated under the subagent gate (SG-1–SG-5) exactly like the plain call; its clearance is held by the session state of the process and is not shared across sessions.
+
+Why: subagents run scripts too, and the wrapper changes only the context of the judgment, never who may decide.
+Code: `gateCall`, `execute_gated_tool` registration in `autoMode`
+Pinned by: gated execution (EG-1–EG-4) › EG-3: a subagent may use the wrapper
+
+#### EG-4: Hint on missing context
+
+When a classifier deny, or a user decline, concerns a call whose file context was incomplete (a detected script was missing, unreadable or protected) and the call did not come through the wrapper, the block reason ends with a hint to retry through `execute_gated_tool`, listing the scripts or files the command depends on under `files`. The hint never names a protected file (PP-6), is absent on rule denies and on wrapper calls.
+
+Why: a deny made on partial context is the one deny the agent can legitimately repair by supplying more context.
+Code: `GATED_TOOL_HINT`, `presentVerdict`, `Verdict.missingContext`
+Pinned by: gated execution (EG-1–EG-4) › EG-4: a classifier deny with missing file context points at the wrapper; a wrapper call does not
 
 ## Decision tables
 

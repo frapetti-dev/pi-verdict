@@ -25,7 +25,7 @@ Defaults are the built-in values used when a key is absent. The first-run templa
 | `supervisedAllowThreshold` | number 0–100 or `null` | `null` | yes | [CS-2](adjudication-rules.md#cs-2-mode-thresholds) |
 | `classifierModel` | `provider/id[:level]` or `null` | `null` (session model) | no | [CL-2](adjudication-rules.md#cl-2-classifier-model-resolution), [CL-3](adjudication-rules.md#cl-3-thinking-level) |
 | `classifierFallbackModel` | `provider/id[:level]` or `null` | `null` (no cascade) | no | [CS-5](adjudication-rules.md#cs-5-fallback-resolution-and-budget) |
-| `classifierFallbackMode` | `shadow`, `enforce` | `"shadow"` | yes | [CS-6](adjudication-rules.md#cs-6-shadow-mode), [CS-7](adjudication-rules.md#cs-7-enforce-mode) |
+| `classifierFallbackMode` | `shadow`, `enforce` | `"shadow"` | yes | [CS-6](adjudication-rules.md#cs-6-shadow-mode), [CS-7](adjudication-rules.md#cs-7-enforce-mode), [SC-5](adjudication-rules.md#sc-5-cascade-with-file-context) (a call with file context always cascades in `enforce`) |
 | `explainGateModel` | `provider/id[:level]` or `null` | `null` (session model) | no | [PR-5](adjudication-rules.md#pr-5-explain-gate) |
 | `explainGatePrompt` | string or `null` | `null` (built-in task) | no | [PR-5](adjudication-rules.md#pr-5-explain-gate) |
 | `rules` | free-text string list | `[]` | list additions | [CL-5](adjudication-rules.md#cl-5-system-prompt-composition) |

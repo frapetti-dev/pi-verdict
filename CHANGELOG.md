@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+
+- **Script-aware gate** ([SC-1](docs/adjudication-rules.md#sc-1-local-script-detection)–[SC-7](docs/adjudication-rules.md#sc-7-viewing-the-code-in-the-ask-dialog)): a command that runs a local script (`bun x.ts`, `python tool.py`, `./run.sh`, `source env.sh`, `pwsh -File a.ps1`) is judged with the script text as **file context** in the classifier's user message (per file 32 KB, 64 KB total, `<files>` block with inert content, a `File context:` system-prompt paragraph; unchanged byte-for-byte when no file context exists). Files in the S0 tier, covered by `denyPaths` or under `.omp` are never read and never named (`(protected, withheld)`, PP-6); a missing or unreadable script is listed as `<missing>`. A generative classifier called with file context or an agent explanation may answer `<need-files>` (up to three paths) once; the follow-up must be a verdict, otherwise the call is an ask (headless: degraded deny) rather than a fail-closed deny. jev models are never offered the request.
+- Cascade with file context ([SC-5](docs/adjudication-rules.md#sc-5-cascade-with-file-context)): a call carrying file context that enters the cascade runs it in `enforce` whatever `classifierFallbackMode` says (the audit records `mode: "enforce"`); a non-jev fallback may request files and answer `<rejudge/>`, which sends the call back to the first layer with the enriched context (its reply passes `confidenceDemotion`, mode thresholds and the CS-7 carve-out). Audit records gain `files` (path, origin, status, `truncated`, SHA-256, never content) and the `fallback` sub-object `rejudged`.
+- `execute_gated_tool` agent tool ([RL-10](docs/adjudication-rules.md#rl-10-gated-execution-tool), [EG-1](docs/adjudication-rules.md#eg-1-the-wrapper-tool)–[EG-4](docs/adjudication-rules.md#eg-4-hint-on-missing-context)): the agent names a tool call, up to 10 files it depends on and an explanation (labeled unverified); the gate adjudicates it with that context without running it and, on an allow, issues a one-use, 120-second pre-clearance for the identical follow-up call, void if a script or cited file changed. A classifier deny or user decline made on incomplete file context tells the agent to retry through the wrapper. Allowed mechanically by the rule layer; available to subagents.
+- Ask dialog code viewer ([SC-7](docs/adjudication-rules.md#sc-7-viewing-the-code-in-the-ask-dialog)): every code block of an ask dialog (the command, each loaded script or file) has a **View** button (Tern) or the `v` key (ANSI) opening a full-size scrollable viewer (new Tern role `pi-verdict.view`, exported `buildCodeViewer`); Tab or Previous/Next switch block, Esc or Close returns to the ask. `ApproveDialogSpec` gains `files`.
+
+### Changed
+
+- Tern-native ask dialog overlay width is now `"95%"` (was `"90%"`) so code reads with less wrapping; other medium dialogs keep `"60%"`.
+- Remembered approvals and the shadow cache are keyed with the file-context digest ([SC-6](docs/adjudication-rules.md#sc-6-digest-in-approval-and-shadow-keys)): editing a script (or a file the call cited) invalidates the remembered approval of the command that runs it. `approvalKey` and `shadowCommandKey` take a digest argument (`""` when there is no file context); `AskPick` gains `{ view: number }` (an ask dialog asking to open a block, handled inside `confirmAsk`).
+- [PP-2](docs/adjudication-rules.md#pp-2-candidate-extraction) no longer says external script contents are never read: the extractor still does not read scripts, but local scripts reach the classifier as file context. `CS-6` shadow mode no longer applies to calls that carry file context.
+
 ## [0.25.1] - 2026-11-02
 
 ### Changed

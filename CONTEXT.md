@@ -134,6 +134,26 @@ Rules: [PP-7](docs/adjudication-rules.md#pp-7-existence-hint)
 The set of tool calls the rule layer leaves undecided and hands to the classifier.
 Rules: [CL-1](docs/adjudication-rules.md#cl-1-gray-zone)
 
+**Local script**:
+A script file a shell command runs through an interpreter, directly or by sourcing, found by lexical detection against the session working directory.
+Rules: [SC-1](docs/adjudication-rules.md#sc-1-local-script-detection)
+
+**File context**:
+The contents of local scripts and cited or requested files that the gate itself reads and shows the classifier next to the transcript; protected files appear only as withheld.
+Rules: [SC-2](docs/adjudication-rules.md#sc-2-loading-and-protected-files), [SC-3](docs/adjudication-rules.md#sc-3-file-context-in-the-classifier-call)
+
+**File request**:
+The classifier answering `<need-files>` with up to three paths instead of a verdict, once per call.
+Rules: [SC-4](docs/adjudication-rules.md#sc-4-file-requests)
+
+**Rejudge**:
+The fallback classifier handing a call that carries file context back to the first layer with the enriched context.
+Rules: [SC-5](docs/adjudication-rules.md#sc-5-cascade-with-file-context)
+
+**Pre-clearance**:
+A one-use, short-lived allowance that `execute_gated_tool` issues for an identical follow-up call, void when any cited or script file changes.
+Rules: [EG-2](docs/adjudication-rules.md#eg-2-one-shot-pre-clearance)
+
 ### Classifier
 
 **Classifier**:

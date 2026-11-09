@@ -9,7 +9,7 @@ import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, buildChoiceScreen, collectProjectContext, declineDetail, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, grantLine, grantRevokeScreen, grantsScreen, renderFooter, renderJevBar, resolveAgentDir, RULE_SAVE_CHOICE, ruleReviewScreen, ruleSaveScreen, SessionState, settingsChangeScreen, settingValueLines, statusNode, trustScreen, verdictLabelNode, type ChoiceScreenSpec } from "../extensions/pi-verdict.ts";
+import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, buildChoiceScreen, collectProjectContext, declineDetail, detectLocalScripts, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, grantLine, grantRevokeScreen, grantsScreen, renderFooter, renderJevBar, resolveAgentDir, RULE_SAVE_CHOICE, ruleReviewScreen, ruleSaveScreen, SessionState, settingsChangeScreen, settingValueLines, statusNode, trustScreen, verdictLabelNode, type ChoiceScreenSpec } from "../extensions/pi-verdict.ts";
 import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
 
 // ── Stub infrastructure ─────────────────────────────────
@@ -5742,14 +5742,14 @@ describe("remembered approval (PR-9)", () => {
 		const run = (state: SessionState) => adjudicate(state, call, adjudicateEnv({ hasUI: true }));
 		setConfig({ deny: ["^cargo\\b"] });
 		const gray = new SessionState(undefined, TMP_AGENT);
-		gray.rememberApproval(approvalKey("gray", "bash", BUILD, "/proj"));
+		gray.rememberApproval(approvalKey("gray", "bash", BUILD, "/proj", ""));
 		expect((await run(gray)).verdict).toBe("deny");
 		const denied = new SessionState(undefined, TMP_AGENT);
-		denied.rememberApproval(approvalKey("rule-deny", "bash", BUILD, "/proj"));
+		denied.rememberApproval(approvalKey("rule-deny", "bash", BUILD, "/proj", ""));
 		expect((await run(denied)).verdict).toBe("deny");
 		setConfig({ mode: "supervised", deny: ["^cargo\\b"] });
 		const relaxed = new SessionState(undefined, TMP_AGENT);
-		relaxed.rememberApproval(approvalKey("rule-deny", "bash", BUILD, "/proj"));
+		relaxed.rememberApproval(approvalKey("rule-deny", "bash", BUILD, "/proj", ""));
 		expect(await run(relaxed)).toMatchObject({ verdict: "allow", remembered: true });
 	});
 
@@ -5984,7 +5984,7 @@ describe("Tern-native UI (TSP)", () => {
 	const plainTui = { requestRender() {} };
 	const cx = { cols: 100, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
 	const NATIVE_MD = { overlay: true, overlayOptions: { width: "60%" } };
-	const NATIVE_WIDE = { overlay: true, overlayOptions: { width: "90%" } };
+	const NATIVE_WIDE = { overlay: true, overlayOptions: { width: "95%" } };
 	const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 	type NativeComponent = DialogComponent & { describe?(cx: unknown): unknown; handleNativeEvent?(e: unknown): void };
 	interface Snap { k: string; key?: string; p: Record<string, unknown>; c?: Snap[] }
@@ -6176,6 +6176,34 @@ describe("Tern-native UI (TSP)", () => {
 			expect(text).toContain('"text":"Protected path"');
 			expect(text).toContain(".omp referenced in the command");
 			expect(text).not.toContain('"explain"');
+		});
+
+		test("SC: a script's file context gets a View button; View opens the 95% viewer overlay and closing re-opens the ask", async () => {
+			const dir = fs.mkdtempSync(path.join(os.homedir(), ".pv-sc-nat-"));
+			try {
+				fs.writeFileSync(path.join(dir, "scratch.ts"), "console.log('NATIVE-VIEW')");
+				const h = session({}, { ompHost: true, cwd: dir });
+				await liveProbe(h);
+				h.responses = [ASK];
+				const run = newRun();
+				driveNative(
+					h,
+					[
+						(c) => c.handleNativeEvent!(evt("action", "pi-verdict.ask", { act: "view:1" })),
+						(c) => c.handleNativeEvent!(evt("action", "pi-verdict.view", { act: "close" })),
+						(c) => c.handleNativeEvent!(evt("activate", clickKey, { item: "yes" })),
+					],
+					run,
+				);
+				expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
+				expect(run.options).toEqual([NATIVE_WIDE, NATIVE_WIDE, NATIVE_WIDE]);
+				expect(run.nodes.map((n) => n.p.role)).toEqual(["pi-verdict.ask", "pi-verdict.view", "pi-verdict.ask"]);
+				expect(JSON.stringify(run.nodes[0])).toContain("view:1");
+				expect(JSON.stringify(run.nodes[0])).toContain("view:0");
+				expect(JSON.stringify(run.nodes[1])).toContain("NATIVE-VIEW");
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
 		});
 	});
 
@@ -6514,5 +6542,311 @@ describe("Tern-native UI (TSP)", () => {
 			expect(h.sent).toEqual([]);
 			expect(h.calls).toEqual([]);
 		});
+	});
+});
+
+describe("script and file context (SC-1–SC-6)", () => {
+	const ALLOW = { text: "<verdict>allow</verdict> ok" };
+	const ASK = { text: "<verdict>ask</verdict> needs a human" };
+	const JEV_ALLOW_50 = "<verdict>allow</verdict> jev: allow 92% (confidence 50%; ask 7%, deny 1%)";
+	const JEV_ALLOW_80 = "<verdict>allow</verdict> jev: allow 90% (confidence 80%; ask 9%, deny 1%)";
+	const NEED_LIB = { text: "<need-files>\nlib.ts\n</need-files>" };
+	const MARK = "rm " + "-rf /SC-MARKER"; // concatenated so the dangerous regex does not match this file
+	const JEV_MODEL = { id: "jev-latest", provider: "typesafe", api: "jev" };
+	const { DOWN } = MENU;
+	let root: string;
+	beforeAll(() => { root = fs.mkdtempSync(path.join(os.homedir(), ".pv-sc-")); });
+	afterAll(() => { fs.rmSync(root, { recursive: true, force: true }); clearAudit(); });
+	const put = (name: string, content: string): string => {
+		const p = path.join(root, name);
+		fs.writeFileSync(p, content);
+		return p;
+	};
+	const userMessage = (h: Harness, i = 0): string => h.calls[i].messages[0].content;
+	const filesBlock = (h: Harness, i = 0): string => userMessage(h, i).split("<files>")[1]!.split("</files>")[0]!;
+
+	test("SC-1: scripts run through an interpreter, directly or by sourcing are detected; inline code and subcommands are not", () => {
+		const x = put("x.ts", "1");
+		const py = put("tool.py", "1");
+		const sh = put("run.sh", "1");
+		const env = put("env.sh", "1");
+		const ps = put("a.ps1", "1");
+		expect(detectLocalScripts("bun x.ts", root)).toEqual([x]);
+		expect(detectLocalScripts("FOO=1 bun run ./x.ts", root)).toEqual([x]);
+		expect(detectLocalScripts("python3 -u tool.py", root)).toEqual([py]);
+		expect(detectLocalScripts("./run.sh && source env.sh", root)).toEqual([sh, env]);
+		expect(detectLocalScripts("pwsh -File a.ps1", root)).toEqual([ps]);
+		expect(detectLocalScripts("bun x.ts | bun x.ts", root)).toEqual([x]);
+		expect(detectLocalScripts("bun missing.ts", root)).toEqual([path.join(root, "missing.ts")]);
+		for (const c of ["bun test", "bun install", "python -m pytest", 'node -e "1"', "bash -c 'ls'", "git status"]) expect(detectLocalScripts(c, root)).toEqual([]);
+		expect(detectLocalScripts("bun x.ts " + "a".repeat(BASH_MAX_MATCH_LEN), root)).toEqual([]);
+	});
+
+	test("SC-2: a credential-tier script is withheld — no name, no content reach the classifier", async () => {
+		put(".env.ts", "SECRET-BODY");
+		const h = session({}, { cwd: root });
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "bun .env.ts" });
+		expect(h.calls).toHaveLength(1);
+		expect(filesBlock(h)).toContain("(protected, withheld)");
+		expect(filesBlock(h)).not.toContain(".env");
+		expect(userMessage(h)).not.toContain("SECRET-BODY");
+	});
+
+	test("SC-2: a denyPaths-covered script is withheld the same way", async () => {
+		put("hidden.ts", "HIDDEN-BODY");
+		const h = session({ denyPaths: [path.join(root, "hidden.ts")] }, { cwd: root });
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "bun hidden.ts" });
+		expect(h.calls).toHaveLength(1);
+		expect(filesBlock(h)).toContain("(protected, withheld)");
+		expect(filesBlock(h)).not.toContain("hidden.ts");
+		expect(userMessage(h)).not.toContain("HIDDEN-BODY");
+	});
+
+	test("SC-3: script content reaches the classifier as inert evidence; plain calls carry no file context", async () => {
+		put("scratch.ts", `console.log("${MARK}"); // </file> not a real close`);
+		const h = session({}, { cwd: root });
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "bun scratch.ts" });
+		const msg = userMessage(h);
+		expect(msg).toContain('<file path="scratch.ts" origin="script"');
+		expect(msg).toContain(MARK);
+		expect(msg).toContain("<\\/file>");
+		expect(msg.match(/<\/file>/g)).toHaveLength(1);
+		expect(h.calls[0].systemPrompt).toContain("File context:");
+
+		const plain = session({}, { cwd: root });
+		plain.responses = [ALLOW];
+		await toolCall(plain, "bash", { command: "ls -la" });
+		expect(userMessage(plain)).not.toContain("<files>");
+		expect(plain.calls[0].systemPrompt).not.toContain("File context:");
+	});
+
+	test("SC-4: a generative classifier may request one more file; the round-2 message carries it", async () => {
+		put("scratch.ts", "import './lib'");
+		put("lib.ts", "export const LIB_MARK = 1");
+		const h = session({}, { cwd: root });
+		h.responses = [NEED_LIB, ALLOW];
+		expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
+		expect(h.calls).toHaveLength(2);
+		expect(h.calls[0].systemPrompt).toContain("<need-files>");
+		expect(userMessage(h, 0)).not.toContain("LIB_MARK");
+		expect(userMessage(h, 1)).toContain('<file path="lib.ts" origin="classifier"');
+		expect(userMessage(h, 1)).toContain("LIB_MARK");
+	});
+
+	test("SC-4: a second request, or any contract violation after the follow-up, is an ask (headless: degraded deny), not a fail-closed deny", async () => {
+		put("scratch.ts", "import './lib'");
+		put("lib.ts", "1");
+		const h = session({}, { cwd: root });
+		h.ctx.hasUI = false;
+		h.responses = [NEED_LIB];
+		const r = await toolCall(h, "bash", { command: "bun scratch.ts" });
+		expect(r?.block).toBe(true);
+		expect(r.reason).toContain("no verdict after the file follow-up");
+		expect(h.calls).toHaveLength(3);
+		const ui = session({}, { cwd: root });
+		ui.responses = [NEED_LIB];
+		expect(await toolCall(ui, "bash", { command: "bun scratch.ts" })).toBeUndefined(); // confirmAnswer yes: the user decides
+		expect(ui.confirms).toBe(1);
+	});
+
+	test("SC-4: a typed-decision (jev) first layer is never offered a file request", async () => {
+		put("scratch.ts", "1");
+		const h = session({}, { cwd: root });
+		h.ctx.model = JEV_MODEL;
+		h.responses = [ALLOW];
+		await toolCall(h, "bash", { command: "bun scratch.ts" });
+		expect(h.calls[0].systemPrompt).toContain("File context:");
+		expect(h.calls[0].systemPrompt).not.toContain("<need-files>");
+	});
+
+	test("SC-5: with file context a shadow-mode fallback is authoritative; the audit holds hashes, never content", async () => {
+		clearAudit();
+		put("scratch.ts", `console.log("${MARK}")`);
+		const h = session({ audit: true, confidenceThreshold: 70, classifierFallbackModel: "mock/fb", classifierFallbackMode: "shadow" }, { cwd: root });
+		h.ctx.model = JEV_MODEL;
+		h.findMap = { "mock/fb": { id: "fb-model" } };
+		h.responses = [{ text: JEV_ALLOW_50 }, ALLOW];
+		expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
+		expect(h.confirms).toBe(0);
+		expect(h.calls).toHaveLength(2);
+		const rec = readAudit()[0];
+		expect(rec.fallback).toMatchObject({ mode: "enforce", verdict: "allow", effective: "allow" });
+		expect(rec.files).toHaveLength(1);
+		expect(rec.files[0]).toMatchObject({ path: "scratch.ts", origin: "script", status: "loaded", truncated: false });
+		expect(rec.files[0].sha256).toMatch(/^[0-9a-f]{64}$/);
+		expect(JSON.stringify(rec)).not.toContain("SC-MARKER");
+
+		const plain = session({ confidenceThreshold: 70, classifierFallbackModel: "mock/fb", classifierFallbackMode: "shadow" }, { cwd: root });
+		plain.ctx.model = JEV_MODEL;
+		plain.findMap = { "mock/fb": { id: "fb-model" } };
+		plain.responses = [{ text: JEV_ALLOW_50 }, { text: "<verdict>deny</verdict> unsafe" }];
+		expect(await toolCall(plain, "bash", { command: "ls -la" })).toBeUndefined(); // no file context: shadow stays advisory, the human decides
+		expect(plain.confirms).toBe(1);
+	});
+
+	test("SC-5: the fallback may request files, then hand the call back (rejudge) to the first layer with the enriched context", async () => {
+		clearAudit();
+		put("scratch.ts", "import './lib'");
+		put("lib.ts", "export const LIB_MARK = 1");
+		const h = session({ audit: true, confidenceThreshold: 70, classifierFallbackModel: "mock/fb", classifierFallbackMode: "shadow" }, { cwd: root });
+		h.ctx.model = JEV_MODEL;
+		h.findMap = { "mock/fb": { id: "fb-model" } };
+		h.responses = [{ text: JEV_ALLOW_50 }, NEED_LIB, { text: "<rejudge/>" }, { text: JEV_ALLOW_80 }];
+		expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
+		expect(h.calls.map((c) => c.model)).toEqual(["jev-latest", "fb-model", "fb-model", "jev-latest"]);
+		expect(h.calls[1].systemPrompt).toContain("<need-files>");
+		expect(h.calls[2].systemPrompt).toContain("<rejudge/>");
+		expect(userMessage(h, 3)).toContain("LIB_MARK");
+		expect(h.calls[3].systemPrompt).not.toContain("<need-files>");
+		expect(h.calls[3].systemPrompt).not.toContain("<rejudge/>");
+		expect(h.confirms).toBe(0);
+		expect(readAudit()[0].fallback).toMatchObject({ mode: "enforce", rejudged: true, effective: "allow" });
+	});
+
+	test("SC-6: editing a script invalidates a remembered approval; an unchanged script stays remembered", async () => {
+		put("scratch.ts", "v1");
+		const h = session({}, { cwd: root });
+		h.responses = [ASK];
+		driveDialogs(h, [[DOWN, "\r"]], []);
+		expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
+		expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
+		expect(h.calls).toHaveLength(1);
+		put("scratch.ts", "v2");
+		driveDialogs(h, [["\r"]], []);
+		expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
+		expect(h.calls).toHaveLength(2);
+	});
+
+	test("ask dialog: the script is a second code block; v opens the viewer, Tab switches block, Esc returns to the ask", async () => {
+		put("scratch.ts", "console.log('SCRATCH-VIEW')");
+		const h = session({}, { cwd: root });
+		h.responses = [ASK];
+		const rendered: string[] = [];
+		const after: string[] = [];
+		driveDialogs(h, [["v"], ["\t", "\x1b"], ["\r"]], rendered, after);
+		expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
+		expect(rendered).toHaveLength(3);
+		expect(rendered[0]).toContain("script scratch.ts");
+		expect(rendered[0]).toContain("view code");
+		expect(rendered[1]).toContain("(1/2)");
+		expect(after[1]).toContain("(2/2)");
+		expect(after[1]).toContain("SCRATCH-VIEW");
+		expect(rendered[2]).toContain("Allow execution?");
+	});
+});
+
+describe("gated execution (EG-1–EG-4)", () => {
+	const ALLOW = { text: "<verdict>allow</verdict> ok" };
+	const DENY = { text: "<verdict>deny</verdict> no" };
+	const MARK = "rm " + "-rf /EG-MARKER";
+	let root: string;
+	beforeAll(() => { root = fs.mkdtempSync(path.join(os.homedir(), ".pv-eg-")); });
+	afterAll(() => { fs.rmSync(root, { recursive: true, force: true }); });
+	const put = (name: string, content: string): void => fs.writeFileSync(path.join(root, name), content);
+	const wrap = (h: Harness, params: Record<string, unknown>) => h.tools.execute_gated_tool.execute("t1", params, undefined, undefined, h.ctx);
+	const wrapText = async (h: Harness, params: Record<string, unknown>): Promise<string> => (await wrap(h, params)).content[0].text;
+	const RUN = { command: "bun scratch.ts" };
+
+	test("EG-1: the wrapper is allowed mechanically (RL-10); bad arguments return text, mode off says NA", async () => {
+		const h = session({}, { cwd: root });
+		expect(await toolCall(h, "execute_gated_tool", { tool: "bash", input: RUN })).toBeUndefined();
+		expect(h.calls).toHaveLength(0);
+		expect(await wrapText(h, { tool: "", input: RUN })).toContain("Invalid tool");
+		expect(await wrapText(h, { tool: "verdict_grant", input: {} })).toContain("Invalid tool");
+		expect(await wrapText(h, { tool: "bash", input: [] })).toContain("Invalid input");
+		expect(await wrapText(h, { tool: "bash", input: RUN, files: Array<string>(11).fill("a.ts") })).toContain("Invalid files");
+		expect(await wrapText(h, { tool: "bash", input: RUN, explanation: "x".repeat(1001) })).toContain("Invalid explanation");
+		expect(h.calls).toHaveLength(0);
+		const off = session({}, { cwd: root });
+		await off.commands.automode.handler("off", off.ctx);
+		expect(await wrapText(off, { tool: "bash", input: RUN })).toStartWith("NA:");
+	});
+
+	test("EG-2: classifier allow issues a one-shot clearance; the identical call passes without a classifier call, a second does not", async () => {
+		put("scratch.ts", "import './helper'");
+		put("helper.ts", `export const m = "${MARK}"`);
+		const h = session({}, { cwd: root });
+		h.responses = [ALLOW];
+		const text = await wrapText(h, { tool: "bash", input: RUN, files: ["helper.ts"], explanation: "run tests" });
+		expect(text).toStartWith("Cleared:");
+		expect(h.calls).toHaveLength(1);
+		const msg: string = h.calls[0].messages[0].content;
+		expect(msg).toContain('<file path="helper.ts" origin="agent"');
+		expect(msg).toContain(MARK);
+		expect(msg).toContain('<explanation source="agent, unverified">run tests</explanation>');
+		expect(await toolCall(h, "bash", RUN)).toBeUndefined();
+		expect(h.calls).toHaveLength(1);
+		expect(await toolCall(h, "bash", RUN)).toBeUndefined(); // one use: classified again (allow)
+		expect(h.calls).toHaveLength(2);
+	});
+
+	test("EG-2: a denied or rule-denied call is never cleared", async () => {
+		put("scratch.ts", "1");
+		const h = session({}, { cwd: root });
+		h.responses = [DENY];
+		const denied = await wrapText(h, { tool: "bash", input: RUN, files: [] });
+		expect(denied).toContain("BLOCKED");
+		expect((await toolCall(h, "bash", RUN))?.block).toBe(true);
+		expect(h.calls).toHaveLength(2);
+		const danger = { command: "rm " + "-rf /opt/x" };
+		expect(await wrapText(h, { tool: "bash", input: danger })).toContain("rm-recursive");
+		expect((await toolCall(h, "bash", danger))?.block).toBe(true);
+	});
+
+	test("EG-2: a rule-allowed inner call needs no clearance", async () => {
+		const h = session({ allow: ["^ls\\b"] }, { cwd: root });
+		expect(await wrapText(h, { tool: "bash", input: { command: "ls" } })).toBe("Allowed by rule: call bash directly.");
+	});
+
+	test("EG-2: the clearance expires, and an edited file voids it", async () => {
+		put("scratch.ts", "import './helper'");
+		put("helper.ts", "v1");
+		setConfig({});
+		const state = new SessionState(undefined, TMP_AGENT);
+		let n = 0;
+		const env = { ...adjudicateEnv({ hasUI: true }), cwd: root, complete: (async () => { n++; return { content: [{ type: "text", text: "<verdict>allow</verdict> ok" }], stopReason: "stop" }; }) as unknown as ReturnType<typeof adjudicateEnv>["complete"] };
+		const call = { toolName: "bash", input: RUN };
+		const issue = async (): Promise<string> => {
+			const w = await adjudicate(state, call, env, { files: ["helper.ts"], explanation: null });
+			expect(w.clearKey).toBeDefined();
+			state.addClearance(w.clearKey!.key, w.clearKey!.files, w.clearKey!.digest);
+			return w.clearKey!.key;
+		};
+		await issue();
+		expect(await adjudicate(state, call, env)).toMatchObject({ verdict: "allow", cleared: true });
+		expect(n).toBe(1);
+		const key = await issue();
+		state.clearances.get(key)!.expires = Date.now() - 1;
+		expect((await adjudicate(state, call, env)).cleared).toBeUndefined();
+		expect(n).toBe(3);
+		await issue();
+		put("helper.ts", "v2");
+		expect((await adjudicate(state, call, env)).cleared).toBeUndefined();
+		expect(n).toBe(5);
+	});
+
+	test("EG-3: a subagent may use the wrapper", async () => {
+		put("scratch.ts", "1");
+		const h = session({ subagentGate: "normal" }, { cwd: root });
+		h.ctx.agent = { kind: "sub", id: "Scout1", name: "scout" };
+		h.responses = [ALLOW];
+		expect(await wrapText(h, { tool: "bash", input: RUN })).toStartWith("Cleared:");
+	});
+
+	test("EG-4: a classifier deny with missing file context points at the wrapper; a wrapper call does not", async () => {
+		const h = session({}, { cwd: root });
+		h.responses = [DENY];
+		const r = await toolCall(h, "bash", { command: "bun missing.ts" });
+		expect(r?.block).toBe(true);
+		expect(r.reason).toContain("retry through execute_gated_tool");
+		const viaWrapper = await wrapText(h, { tool: "bash", input: { command: "bun missing.ts" } });
+		expect(viaWrapper).toContain("BLOCKED");
+		expect(viaWrapper).not.toContain("retry through execute_gated_tool");
+		const rule = session({}, { cwd: root });
+		const danger = await toolCall(rule, "bash", { command: "rm " + "-rf /opt/x" });
+		expect(danger.reason).not.toContain("execute_gated_tool");
 	});
 });
