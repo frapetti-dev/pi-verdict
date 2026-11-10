@@ -3552,13 +3552,15 @@ export type MenuRow =
 	| { kind: "section"; label: string } // "" = plain rule
 	| { kind: "choice"; id: string; label: string; values: readonly string[]; value: string; shortcut?: string; confirm?: boolean; locked?: string; inherited?: { text: string; source: string }; info(value: string): MenuInfo; maxInfo?(value: string): MenuInfo }
 	| { kind: "percent"; id: string; label: string; allowInherit: boolean; value: string; inherited?: { text: string; source: string }; info(value: string): MenuInfo; maxInfo?(value: string): MenuInfo }
-	| { kind: "page"; id: string; label: string; locked?: string; info(): MenuInfo }
+	| { kind: "page"; id: string; label: string; icon?: string; locked?: string; info(): MenuInfo }
 	| { kind: "action"; id: string; label: string; key?: string; confirm?: boolean; info(): MenuInfo }
 	| { kind: "add"; id: string; placeholder: string; info(): MenuInfo }
 	| { kind: "entry"; id: string; text: string; tag?: string; editable: boolean; info(): MenuInfo };
 export interface MenuController {
 	/** breadcrumb root, e.g. "approval" | "rules" */
 	title: string;
+	/** Tern prefs tab icon of the main page */
+	icon?: string;
 	/** Tab order */
 	scopes: readonly MenuScope[];
 	/** initial scope */
@@ -3940,8 +3942,8 @@ export function buildSettingsMenu(
 		if (!cx.supports("prefs")) return null;
 		const { rs, row: selected } = current();
 		const pages = [
-			{ id: "__main", label: ctl.title },
-			...ctl.rows(scope, null).flatMap((r) => (r.kind === "page" ? [{ id: r.id, label: r.label, ...(r.locked !== undefined ? { disabled: r.locked } : {}) }] : [])),
+			{ id: "__main", label: ctl.title, ...(ctl.icon ? { icon: ctl.icon } : {}) },
+			...ctl.rows(scope, null).flatMap((r) => (r.kind === "page" ? [{ id: r.id, label: r.label, ...(r.icon ? { icon: r.icon } : {}), ...(r.locked !== undefined ? { disabled: r.locked } : {}) }] : [])),
 		];
 		const badge = ctl.badge(scope);
 		const scopeSection: PrefSection = {
@@ -7582,6 +7584,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		];
 		const ctl: MenuController = {
 			title: "approval",
+			icon: "shield",
 			scopes: localFile === null ? ["global", "session"] : ["global", "local", "session"],
 			scope: "session",
 			badge: (scope) => (scope === "local" && untrusted ? { label: "local · untrusted", warn: true } : { label: scope, warn: false }),
@@ -7858,6 +7861,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			let closeMenu: () => void = () => {};
 			const ctl: MenuController = {
 				title: "root rule",
+				icon: "rule",
 				scopes,
 				scope,
 				badge: (s) => (s === "local" && untrusted ? { label: "local · untrusted", warn: true } : { label: s, warn: false }),
@@ -7882,7 +7886,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						{ kind: "choice", id: "strictness", label: "strictness", values: ROOT_RULE_STRICTNESS, value: cfg.strictness, info: (v) => [{ tone: "text", text: STRICTNESS_DOC[v as RootRuleStrictness] ?? v }] },
 						{ kind: "choice", id: "history", label: "history", values: ["on", "off"], value: cfg.history ? "on" : "off", info: () => [{ tone: "text", text: "Read this session's user messages and tool calls (never tool output)." }] },
 						{ kind: "choice", id: "codebase", label: "codebase", values: ["on", "off"], value: cfg.codebase ? "on" : "off", info: () => [{ tone: "text", text: "Read the project's docs, manifests, CI files and git remotes; secret and protected paths are skipped." }] },
-						{ kind: "page", id: "clarifications", label: `clarifications (${cfg.clarifications.length})`, info: () => [{ tone: "text", text: "Your instructions for the generator — trusted, never sent to the classifier." }] },
+						{ kind: "page", id: "clarifications", label: `clarifications (${cfg.clarifications.length})`, icon: "question", info: () => [{ tone: "text", text: "Your instructions for the generator — trusted, never sent to the classifier." }] },
 						{ kind: "section", label: "" },
 						{ kind: "action", id: "generate", label: "▸ generate root rule", key: "g", info: () => [{ tone: "muted", text: "Draft the root rule from the inputs above; you review it before saving." }] },
 					];
@@ -7998,6 +8002,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 
 	const LIST_LABEL = (key: EditableListKey): string => (key === "rules" ? "classifier rules" : key);
+	const LIST_ICON: Record<EditableListKey, string> = { allow: "check", deny: "warning", tools: "tools", denyPaths: "key", rules: "rule" };
 	const LIST_SCOPE_LINE: Record<MenuScope, string> = {
 		global: "Saved to the global config — the base list.",
 		local: "Saved to this project's config — replaces the global list for this project.",
@@ -8183,6 +8188,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 		const ctl: MenuController = {
 			title: "rules",
+			icon: "settings",
 			scopes: localFile === null ? ["global", "session"] : ["global", "local", "session"],
 			scope: initial,
 			badge: (scope) => (scope === "local" && untrusted ? { label: "local · untrusted", warn: true } : { label: scope, warn: false }),
@@ -8197,6 +8203,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 							kind: "page",
 							id: key,
 							label: `${LIST_LABEL(key)} (${count})`,
+							icon: LIST_ICON[key],
 							...(own.invalid ? { locked: "fix by hand" } : {}),
 							info: () => [{ tone: "text", text: `${LIST_KEY_DESC[key][0]!.toUpperCase()}${LIST_KEY_DESC[key].slice(1)}` }, { tone: "muted", text: LIST_SCOPE_LINE[scope] }, ...untrustedWarn(scope)],
 						});
@@ -8212,6 +8219,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 							kind: "page",
 							id: BUILTIN_PAGE,
 							label: "danger rules & path tiers",
+							icon: "shield",
 							info: () => [
 								{ tone: "text", text: "Action per built-in rule: deny, ask, or allow (the classifier decides). Custom danger rules are added in the config file or via verdict_settings." },
 								{ tone: "muted", text: "Entries merge per id: session over local over global." },
