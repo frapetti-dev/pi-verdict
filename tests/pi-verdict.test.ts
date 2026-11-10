@@ -2915,7 +2915,7 @@ describe("/verdict omp custom roles", () => {
 	const TAGS = { "verdict-fallback": { name: "VERDICT FALLBACK" }, "explain-gate": { name: "EXPLAIN GATE" } };
 	const parse = (file: string): any => Bun.YAML.parse(fs.readFileSync(file, "utf8"));
 	const { DOWN, ENTER, LEFT, RIGHT, ESC } = MENU;
-	const ROLES_ROW = times(10, DOWN); // five lists, .omp gate, footer, mode in status bar, grants in status bar, built-in rules page, then custom roles
+	const ROLES_ROW = times(11, DOWN); // five lists, .omp gate, footer, mode in status bar, grants in status bar, built-in rules page, built-in floor, then custom roles
 	async function open(h: Harness, dir: string, keys: string[], rendered: string[] = [], after: string[] = []): Promise<void> {
 		h.ompAgentDir = dir;
 		await h.handlers.session_start({}, h.ctx);
@@ -4859,6 +4859,31 @@ describe("session-scoped switches (menu redesign)", () => {
 		expect(h.confirms).toBe(1);
 		const warnings = h.notifies.filter(([, l]) => l === "warning").map(([m]) => m).join("\n");
 		expect(warnings).toContain('gateOmpDir: "nope"');
+	});
+
+	test("/verdict session: built-in floor off lifts built-in rules for this session, inherit restores it", async () => {
+		const h = session({});
+		await h.handlers.session_start({}, h.ctx);
+		driveMenu(h, [...times(10, DOWN), RIGHT, RIGHT]); // inherit → on → off
+		await h.commands.verdict.handler("session", h.ctx);
+		expect(JSON.parse(fs.readFileSync(SESSION_FILE(), "utf8"))).toEqual({ builtinDenyFloor: false });
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		expect(await toolCall(h, "bash", { command: "sudo ls" })).toBeUndefined();
+		expect(h.calls).toHaveLength(1);
+		driveMenu(h, [...times(10, DOWN), LEFT, LEFT]); // off → on → inherit
+		await h.commands.verdict.handler("session", h.ctx);
+		expect(fs.existsSync(SESSION_FILE())).toBe(false);
+		expect((await toolCall(h, "bash", { command: "sudo ls" }))?.block).toBe(true);
+	});
+
+	test("a session file with a non-boolean builtinDenyFloor keeps the floor on and reports a skip", async () => {
+		const h = session({});
+		fs.mkdirSync(SESSION_DIR(), { recursive: true });
+		fs.writeFileSync(SESSION_FILE(), JSON.stringify({ builtinDenyFloor: "nope" }));
+		await h.handlers.session_start({}, h.ctx);
+		expect((await toolCall(h, "bash", { command: "sudo ls" }))?.block).toBe(true);
+		const warnings = h.notifies.filter(([, l]) => l === "warning").map(([m]) => m).join("\n");
+		expect(warnings).toContain('builtinDenyFloor: "nope"');
 	});
 });
 

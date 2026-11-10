@@ -12,7 +12,7 @@ Defaults are the built-in values used when a key is absent. The first-run templa
 | `deny` | regex string list | `[]` | list additions | [RL-2](adjudication-rules.md#rl-2-evaluation-order), [RL-4](adjudication-rules.md#rl-4-user-regexes) |
 | `tools` | tool-name list | `[]` | list additions | [RL-7](adjudication-rules.md#rl-7-tools-allowlist) |
 | `denyPaths` | path list | `[]` | list additions | [PP-1](adjudication-rules.md#pp-1-declaration-normalization-and-anchoring) to [PP-7](adjudication-rules.md#pp-7-existence-hint) |
-| `builtinDenyFloor` | boolean | `true` | no | [RL-6](adjudication-rules.md#rl-6-builtindenyfloor) |
+| `builtinDenyFloor` | boolean | `true` | yes | [RL-6](adjudication-rules.md#rl-6-builtindenyfloor) |
 | `dangerRules` | object: id → action string, `false`, or `{pattern?, action?, reason?, flags?}` | `{}` | yes (merged per id) | [RL-5](adjudication-rules.md#rl-5-danger-rules), [CF-4](adjudication-rules.md#cf-4-merge-semantics) |
 | `pathRules` | object: path tier id → `deny`, `ask`, `allow` | `{}` | yes (merged per id) | [PG-3](adjudication-rules.md#pg-3-s0-secrets), [CF-4](adjudication-rules.md#cf-4-merge-semantics) |
 | `gateOmpDir` | boolean | `true` | yes | [PP-8](adjudication-rules.md#pp-8-forced-omp-gate) |

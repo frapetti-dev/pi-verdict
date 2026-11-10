@@ -422,8 +422,8 @@ export type PercentKey = (typeof PERCENT_KEYS)[number];
 export const APPROVAL_KEYS = ["mode", ...PERCENT_KEYS, "unattendedDenyPaths", "unattendedOmpDir", "classifierFallbackMode"] as const;
 export type ApprovalKey = (typeof APPROVAL_KEYS)[number];
 export type SettingSource = "session" | "local" | "global" | "default";
-/** Keys a session override may carry: the approval keys plus the three switches the `/verdict` menu edits per session. */
-export const SESSION_KEYS = [...APPROVAL_KEYS, "gateOmpDir", "footer", "modeStatus", "grantStatus"] as const;
+/** Keys a session override may carry: the approval keys plus the switches the `/verdict` menu edits per session. */
+export const SESSION_KEYS = [...APPROVAL_KEYS, "builtinDenyFloor", "gateOmpDir", "footer", "modeStatus", "grantStatus"] as const;
 export type SessionKey = (typeof SESSION_KEYS)[number];
 const isSessionKey = (k: string): k is SessionKey => (SESSION_KEYS as readonly string[]).includes(k);
 /** Per-id map keys (built-in rule actions) a session override may carry; kept apart from SESSION_KEYS, whose Record maps hold scalar meanings. */
@@ -1012,13 +1012,16 @@ function settingSourcesOf(sessionKeys: string[], localKeys: string[], globalKeys
 	) as Record<SessionKey, SettingSource>;
 }
 
-/** Rules when the user config is missing or unreadable: empty rules with the floor ON, session keys still applied. */
+/** Rules when the user config is missing or unreadable: empty rules with the floor ON unless the session turns it off, session keys still applied. */
 function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[]): LoadedRules {
 	const session = sanitizeSessionRaw(sessionRaw, skipped);
 	if (session.ruleAdditions !== undefined) skipped.push("session ruleAdditions: not applied — user config not loaded");
 	if (session.rootRule !== undefined) skipped.push("session rootRule: not applied — user config not loaded");
 	const fbMode = session.classifierFallbackMode;
 	if (fbMode !== undefined && fbMode !== "shadow" && fbMode !== "enforce") skipped.push(`classifierFallbackMode: ${JSON.stringify(fbMode)}`);
+	let floorOn = true;
+	if (typeof session.builtinDenyFloor === "boolean") floorOn = session.builtinDenyFloor;
+	else if (session.builtinDenyFloor !== undefined) skipped.push(`builtinDenyFloor: ${JSON.stringify(session.builtinDenyFloor)}`);
 	let gateOmpDir = true;
 	if (typeof session.gateOmpDir === "boolean") gateOmpDir = session.gateOmpDir;
 	else if (session.gateOmpDir !== undefined) skipped.push(`gateOmpDir: ${JSON.stringify(session.gateOmpDir)}`);
@@ -1036,12 +1039,13 @@ function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[])
 			...EMPTY_RULES,
 			...parseApprovalKeys(session, skipped),
 			classifierFallbackMode: fbMode === "enforce" ? "enforce" : "shadow",
+			builtinDenyFloor: floorOn,
 			gateOmpDir,
 			modeStatus,
 			grantStatus,
 			footer: footerOk ? footer : EMPTY_RULES.footer,
-			dangerRules: parseDangerRules(mergeRuleMaps("dangerRules", [session.dangerRules], skipped), true, skipped),
-			pathRules: parsePathRules(mergeRuleMaps("pathRules", [session.pathRules], skipped), true, skipped),
+			dangerRules: parseDangerRules(mergeRuleMaps("dangerRules", [session.dangerRules], skipped), floorOn, skipped),
+			pathRules: parsePathRules(mergeRuleMaps("pathRules", [session.pathRules], skipped), floorOn, skipped),
 		},
 		skipped,
 		shortcutWarning: null,
@@ -1179,6 +1183,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 		const footerRaw = raw.footer;
 		const footerOk = footerRaw === "full" || footerRaw === "compact" || footerRaw === "off";
 		if (footerRaw !== undefined && !footerOk) skipped.push(`footer: ${JSON.stringify(footerRaw)}`);
+		if (raw.builtinDenyFloor !== undefined && typeof raw.builtinDenyFloor !== "boolean") skipped.push(`builtinDenyFloor: ${JSON.stringify(raw.builtinDenyFloor)}`);
 		if (raw.gateOmpDir !== undefined && typeof raw.gateOmpDir !== "boolean") skipped.push(`gateOmpDir: ${JSON.stringify(raw.gateOmpDir)}`);
 		if (raw.modeStatus !== undefined && typeof raw.modeStatus !== "boolean") skipped.push(`modeStatus: ${JSON.stringify(raw.modeStatus)}`);
 		if (raw.grantStatus !== undefined && typeof raw.grantStatus !== "boolean") skipped.push(`grantStatus: ${JSON.stringify(raw.grantStatus)}`);
@@ -3585,7 +3590,7 @@ const ENUM_VALUES: Partial<Record<SessionKey, readonly string[]>> = {
 };
 
 /** What a key means when no scope sets it (global scope shows these instead of `inherit`). */
-const MENU_DEFAULTS: Partial<Record<SessionKey, string>> = { mode: "auto", unattendedDenyPaths: "deny", unattendedOmpDir: "deny", classifierFallbackMode: "shadow", gateOmpDir: "on", footer: "full", modeStatus: "on", grantStatus: "on" };
+const MENU_DEFAULTS: Partial<Record<SessionKey, string>> = { mode: "auto", unattendedDenyPaths: "deny", unattendedOmpDir: "deny", classifierFallbackMode: "shadow", builtinDenyFloor: "on", gateOmpDir: "on", footer: "full", modeStatus: "on", grantStatus: "on" };
 
 /** One-line meaning of each enum value, shown under the selected row (`inherit` and percent values are composed by the controller). */
 const VALUE_MEANING: Record<string, Record<string, string>> = {
@@ -3598,6 +3603,10 @@ const VALUE_MEANING: Record<string, Record<string, string>> = {
 	unattendedDenyPaths: { deny: "deny — unattended blocks a denyPaths hit", allow: "allow — unattended lets a denyPaths hit through silently" },
 	unattendedOmpDir: { deny: "deny — unattended blocks a .omp directory access", allow: "allow — unattended lets a .omp directory access through silently" },
 	classifierFallbackMode: { shadow: "shadow — the second model only records its opinion", enforce: "enforce — the second model decides" },
+	builtinDenyFloor: {
+		on: "on — built-in danger rules and path tiers act at their configured actions (default)",
+		off: "off — every built-in rule acts as allow: the classifier decides (risk accepted by you); custom danger rules, denyPaths and the .omp gate stay active",
+	},
 	gateOmpDir: { on: "on — ask before any .omp directory access (default)", off: "off — no forced gate on .omp directories" },
 	footer: { full: "full — Nerd Font powerline blocks (default)", compact: "compact — plain one-line text", off: "off — no footer status" },
 	modeStatus: { on: "on — mode chip in the prompt status bar (default; hidden on pi while the footer is on)", off: "off — no mode chip in the prompt status bar" },
@@ -3613,11 +3622,11 @@ const PERCENT_MEANING: Record<PercentKey, string> = {
 	supervisedAllowThreshold: "supervised mode: jev allow probability needed to allow (otherwise ask)",
 };
 
-/** Percent keys store a number, `null` = off; enum keys store their string; gateOmpDir/modeStatus/grantStatus store a boolean. Parse a menu value back; `undefined` = inherit (drop the key), `"invalid"` = not a value. */
+/** Percent keys store a number, `null` = off; enum keys store their string; builtinDenyFloor/gateOmpDir/modeStatus/grantStatus store a boolean. Parse a menu value back; `undefined` = inherit (drop the key), `"invalid"` = not a value. */
 export function parseMenuValue(key: SessionKey, text: string): unknown | "invalid" {
 	const t = text.trim();
 	if (t === "inherit") return undefined;
-	if (key === "gateOmpDir" || key === "modeStatus" || key === "grantStatus") return t === "on" ? true : t === "off" ? false : "invalid";
+	if (key === "builtinDenyFloor" || key === "gateOmpDir" || key === "modeStatus" || key === "grantStatus") return t === "on" ? true : t === "off" ? false : "invalid";
 	const values = ENUM_VALUES[key];
 	if (values) return values.includes(t) ? t : "invalid";
 	if (t === "off") return null;
@@ -7995,7 +8004,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		session: "Added for this session only; appended to the local/global list.",
 	};
 
-	/** /verdict menu: list pages (allow/deny/tools/denyPaths/classifier rules), the gateOmpDir / footer / modeStatus / grantStatus switches and omp custom roles, at global / local / session scope. */
+	/** /verdict menu: list pages (allow/deny/tools/denyPaths/classifier rules), the builtinDenyFloor / gateOmpDir / footer / modeStatus / grantStatus switches and omp custom roles, at global / local / session scope. */
 	async function openVerdictMenu(ctx: ExtensionContext, initial: MenuScope): Promise<void> {
 		const mods = typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
 		if (!mods) {
@@ -8063,7 +8072,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			return true;
 		};
 
-		const switchRow = (scope: MenuScope, key: "gateOmpDir" | "footer" | "modeStatus" | "grantStatus", label: string): MenuRow => {
+		const switchRow = (scope: MenuScope, key: "builtinDenyFloor" | "gateOmpDir" | "footer" | "modeStatus" | "grantStatus", label: string): MenuRow => {
 			const raw = storedAt(scope, localFile);
 			const stored = raw[key];
 			const isBool = key !== "footer";
@@ -8209,6 +8218,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 								...untrustedWarn(scope),
 							],
 						},
+						switchRow(scope, "builtinDenyFloor", "built-in floor"),
 					);
 					if (rolesTarget) {
 						const rc = readOmpConfig(rolesTarget.file, rolesTarget.yaml);
@@ -8274,7 +8284,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					changeBuiltin(scope, id, value);
 					return;
 				}
-				if (id === "gateOmpDir" || id === "footer" || id === "modeStatus" || id === "grantStatus") applySetting(ctx, scope, id, value, localFile);
+				if (id === "builtinDenyFloor" || id === "gateOmpDir" || id === "footer" || id === "modeStatus" || id === "grantStatus") applySetting(ctx, scope, id, value, localFile);
 			},
 			action: (scope, id) => {
 				if (id === TRUST_ROW_ID && localFile !== null) {
@@ -8376,7 +8386,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	});
 
 	pi.registerCommand("verdict", {
-		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, gateOmpDir switch, footer style, modeStatus and grantStatus switches, omp custom roles) in a settings menu: /verdict [global|local|session]",
+		description: "Edit pi-verdict rules (allow/deny/denyPaths/tools/rules lists, builtinDenyFloor and gateOmpDir switches, footer style, modeStatus and grantStatus switches, omp custom roles) in a settings menu: /verdict [global|local|session]",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("pi-verdict: /verdict needs an interactive UI", "warning");
@@ -8610,7 +8620,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		"Before saying a built-in rule blocks an operation, call get with key \"dangerRules\" (danger rules such as gh-release, sudo, rm-recursive) or \"pathRules\" (path tiers) to see the current action of each rule (deny, ask, allow); get needs no approval. " +
 		"Actions: get (read effective and per-scope values; no approval), set (replace a key's whole value), unset (drop a key at one scope), add/remove (one entry of a list key: allow, deny, denyPaths, tools, rules). " +
 		"Scopes: global = the user config; local = the project config (applied only when the project is trusted); session = this session only, highest precedence. " +
-		"Session scope takes only the approval keys (mode, thresholds, unattendedDenyPaths, unattendedOmpDir, classifierFallbackMode), gateOmpDir, footer, modeStatus, grantStatus, rootRule, dangerRules and pathRules; on list keys it appends to the effective list. " +
+		"Session scope takes only the approval keys (mode, thresholds, unattendedDenyPaths, unattendedOmpDir, classifierFallbackMode), builtinDenyFloor, gateOmpDir, footer, modeStatus, grantStatus, rootRule, dangerRules and pathRules; on list keys it appends to the effective list. " +
 		"dangerRules (per-id map: action \"deny\"|\"ask\"|\"allow\" for a built-in or custom danger rule, false removes a rule, {pattern, action?, reason?, flags?} adds a custom rule) and pathRules (path tier → action) merge per id with the entries already stored at the scope on set: a null id is dropped at that scope, and unset drops the whole map. " +
 		"Every change opens a confirmation dialog for the user, so always give a clear `reason`; nothing is saved unless the user approves. denyPaths values are never returned (only a count). Not available in subagents.";
 
