@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 - Remembered approvals and the shadow cache are keyed with the file-context digest ([SC-6](docs/adjudication-rules.md#sc-6-digest-in-approval-and-shadow-keys)): editing a script (or a file the call cited) invalidates the remembered approval of the command that runs it. `approvalKey` and `shadowCommandKey` take a digest argument (`""` when there is no file context); `AskPick` gains `{ view: number }` (an ask dialog asking to open a block, handled inside `confirmAsk`).
 - [PP-2](docs/adjudication-rules.md#pp-2-candidate-extraction) no longer says external script contents are never read: the extractor still does not read scripts, but local scripts reach the classifier as file context. `CS-6` shadow mode no longer applies to calls that carry file context.
 
+### Fixed
+
+- Footer rendered as ANSI instead of the Tern-native node until toggled off and on in settings: on a TSP-capable omp host the footer widget is now always published as a component carrying both `render` and `describe` (the host uses `describe` whenever its surface is live, including when TSP goes live after `session_start`), and it is re-published once the native dialog modules finish loading. A stale session never republishes (`sessionEpoch`).
+
 ## [0.25.1] - 2026-11-02
 
 ### Changed

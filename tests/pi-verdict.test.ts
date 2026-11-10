@@ -6091,6 +6091,13 @@ describe("Tern-native UI (TSP)", () => {
 		await liveProbe(h, plainTui);
 	});
 
+	test("footer: on a TSP-capable host that is not live yet, the footer is still published with describe() (Tern can adopt it later)", async () => {
+		const h = session({}, { ompHost: true });
+		const seen = await liveProbe(h, { requestRender() {}, nativeRendering: false });
+		const roles = seen.components.map((c) => (snap(c.describe?.() ?? null) as { p?: { role?: string } } | undefined)?.p?.role);
+		expect(roles).toContain("pi-verdict.footer");
+	});
+
 	describe("ask dialog", () => {
 		const ASK = { text: "<verdict>ask</verdict> unsure" };
 		const clickKey = "pi-verdict.ask/choices";

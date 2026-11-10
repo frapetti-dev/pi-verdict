@@ -3502,16 +3502,20 @@ function noteHostTui(tui: unknown): void {
 export function nativeLive(): boolean {
 	return nativeHost?.nativeRendering === true;
 }
+/** True when the host TUI can render through a Tern surface at all (omp's TUI has the `nativeRendering` getter; pi's does not), live or not yet. */
+function nativeCapable(): boolean {
+	return nativeHost !== undefined && "nativeRendering" in nativeHost;
+}
 const TUI_PROBE_KEY = "pi-verdict-tui-probe";
 
 /**
- * `ui.setWidget` that publishes a native node while TSP is live and the plain `lines` otherwise (`undefined` clears). The native
- * factory's render reproduces exactly what omp draws for a string-array widget (one `Text` per line), so non-native consumers of
- * the same component see no difference.
+ * `ui.setWidget` that publishes, on a TSP-capable host, a component carrying both `render` (identical to omp's string-array
+ * rendering: one `Text` per line) and `describe`; the host uses `describe` whenever its surface is live, including when TSP goes
+ * live after publication. Elsewhere it publishes the plain `lines` (`undefined` clears).
  */
 function setWidgetNative(ui: UiContext, key: string, lines: string[] | undefined, node: () => TspNode, options?: Parameters<UiContext["setWidget"]>[2]): void {
 	const mods = dialogModulesReady;
-	if (lines === undefined || !nativeLive() || !mods) {
+	if (lines === undefined || !nativeCapable() || !mods) {
 		ui.setWidget(key, lines, options);
 		return;
 	}
@@ -7298,6 +7302,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	/** Session-scoped trust grant (set by the session_start prompt; /verdict reloads must honor it) */
 	let sessionTrustedRoot: string | null = null;
+	/** Bumped on session_start/shutdown so a late dialog-module load never republishes into a stale session. */
+	let sessionEpoch = 0;
 
 	/** UI this factory instance published as the root's (see the registry at module level);
 	 *  session_shutdown clears the registry only if it still holds this one. */
@@ -7358,6 +7364,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	// session_start: reset the shadow cache (in-session memory state, settled in #5) + reload user rules (config changes take effect in a new session)
 	pi.on("session_start", async (_event, ctx) => {
+		const epoch = ++sessionEpoch;
 		// Project trust prompt: any await stays inside the prompt branch so the no-project path remains synchronous
 		sessionTrustedRoot = null;
 		// TUI probe (omp only): setWidget factories run synchronously with the host TUI, whose `nativeRendering` says whether TSP is live.
@@ -7372,7 +7379,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			} catch {
 				/* native stays off */
 			}
-			if (nativeLive()) void loadDialogModules(); // not awaited: the no-project path below stays synchronous
+			// Not awaited (the no-project path stays synchronous); once the modules are in, re-publish so the footer becomes a native-capable component.
+			if (nativeCapable()) void loadDialogModules().then((m) => { if (m && epoch === sessionEpoch) refreshStatus(ctx); });
 		}
 		const pp = findProjectConfig(ctx.cwd, agentDirPath());
 		if (pp) {
@@ -7424,6 +7432,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	});
 
 	pi.on("session_shutdown", () => {
+		sessionEpoch++;
 		if (ownRootUi !== null && rootUi === ownRootUi) rootUi = null;
 		ownRootUi = null;
 		const globals = globalThis as Record<symbol, unknown>;
