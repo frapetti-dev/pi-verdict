@@ -3408,6 +3408,7 @@ export interface NativeHooks {
 	handleNativeEvent?(event: NativeEvent): void;
 	nativeOverlay?: { role?: string; head?: string; size?: "sm" | "md" | "lg" | "full"; anchor?: "center" | "top" | "bottom" };
 	nativeSheet?(cx: DescribeCtx): boolean;
+	describeScreen?(cx: DescribeCtx): { role?: string; main?: readonly object[]; dock?: readonly object[] };
 }
 
 /** Node builder: `{k, p, c, key}` with absent parts omitted. */
@@ -3466,6 +3467,8 @@ export function tnFramed(kids: readonly (TspNode | object)[], gap: "sm" | "md" |
 const NATIVE_MD_OVERLAY = { overlay: true, overlayOptions: { width: "60%" } } as const;
 /** Wider variant for the approval dialog, which holds a command or code diff and the script files it runs. Same undeclared-`md` mapping as `NATIVE_MD_OVERLAY`, just more columns. */
 const NATIVE_WIDE_OVERLAY = { overlay: true, overlayOptions: { width: "95%" } } as const;
+/** Full-pane viewer: on omp's TSP backend a fullscreen overlay without `nativeOverlay` becomes a Tern `screen` surface; `width` keeps pi's weak `OverlayOptions` type satisfied. */
+const NATIVE_SCREEN_OVERLAY = { overlay: true, overlayOptions: { fullscreen: true, width: "100%" } } as const;
 interface RadioGlyphs {
 	on: string;
 	off: string;
@@ -4915,19 +4918,153 @@ export function displaySafe(text: string): string {
 		.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2069\ufeff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
-const MAX_DIALOG_CODE_CHARS = 4000;
-const MAX_DIALOG_CODE_LINES = 40;
+/** Truncation budget of a fenced block: `lines`/`chars` kept (3/4 head + 1/4 tail lines, 60/40 head/tail chars). */
+interface CodeCap { lines: number; chars: number }
+/** Collapsed ask-dialog preview (the full text is one `View` away). */
+const DIALOG_CODE_CAP: CodeCap = { lines: 8, chars: 800 };
+/** Action detail sent to EXPLAIN-GATE (the previous dialog budget). */
+const EXPLAIN_CODE_CAP: CodeCap = { lines: 40, chars: 4000 };
 const MAX_DIALOG_EDIT_BLOCKS = 3;
 
-/** One fenced code block; the fence outgrows any backtick run in the body so the body cannot close it. */
-function fencedBlock(body: string, lang: string, full: boolean): string {
-	let text = displaySafe(body);
-	if (!full && text.length > MAX_DIALOG_CODE_CHARS) {
-		text = `${text.slice(0, 2400)}\n… [${text.length - MAX_DIALOG_CODE_CHARS} chars truncated] …\n${text.slice(-1600)}`;
+/** Display-only shell formatter: one line per top-level `&&` `||` `|` `|&` `;` segment. Quotes, backticks, `$(…)`/`(…)`/`[[…]]`, comments and `\`-escapes are never split; a command with `<<` (heredoc/here-string) or with nothing to split is returned unchanged. shortcut: a lexical scan, not a shell parser (`${a:-x|y}` or `case` bodies may split oddly), fine for a read-only view. */
+export function prettyShell(cmd: string): string {
+	if (cmd.includes("<<")) return cmd;
+	let out = "";
+	let depth = 0;
+	let backtick = false;
+	let split = false;
+	for (let i = 0; i < cmd.length; i++) {
+		const c = cmd[i]!;
+		const prev = i > 0 ? cmd[i - 1]! : "";
+		const two = cmd.slice(i, i + 2);
+		if (c === "'") {
+			const j = cmd.indexOf("'", i + 1);
+			const end = j < 0 ? cmd.length - 1 : j;
+			out += cmd.slice(i, end + 1);
+			i = end;
+			continue;
+		}
+		if (c === '"') {
+			let j = i + 1;
+			while (j < cmd.length && cmd[j] !== '"') j += cmd[j] === "\\" ? 2 : 1;
+			out += cmd.slice(i, j + 1);
+			i = Math.min(j, cmd.length - 1);
+			continue;
+		}
+		if (c === "\\") {
+			out += cmd.slice(i, i + 2);
+			i++;
+			continue;
+		}
+		if (c === "#" && (i === 0 || /[\s;|&(]/.test(prev))) {
+			const j = cmd.indexOf("\n", i);
+			const end = j < 0 ? cmd.length : j;
+			out += cmd.slice(i, end);
+			i = end - 1;
+			continue;
+		}
+		if (c === "`") {
+			backtick = !backtick;
+			out += c;
+			continue;
+		}
+		if (two === "[[") {
+			depth++;
+			out += two;
+			i++;
+			continue;
+		}
+		if (two === "]]") {
+			depth = Math.max(0, depth - 1);
+			out += two;
+			i++;
+			continue;
+		}
+		if (c === "(") {
+			depth++;
+			out += c;
+			continue;
+		}
+		if (c === ")") {
+			depth = Math.max(0, depth - 1);
+			out += c;
+			continue;
+		}
+		let op = "";
+		if (depth === 0 && !backtick) {
+			if (two === "&&" || two === "||" || two === "|&") op = two;
+			else if (c === "|" && prev !== ">") op = "|";
+			else if (c === ";") {
+				if (cmd[i + 1] === ";") {
+					out += ";;";
+					i++;
+					continue;
+				}
+				op = ";";
+			}
+		}
+		if (!op) {
+			out += c;
+			continue;
+		}
+		split = true;
+		out += op;
+		i += op.length - 1;
+		while (cmd[i + 1] === " " || cmd[i + 1] === "\t") i++;
+		if (i + 1 < cmd.length && cmd[i + 1] !== "\n") out += `\n${op === ";" ? "" : "  "}`;
+	}
+	return split ? out : cmd;
+}
+
+/** Display-only JSON re-indenter for a single-line `{…}`/`[…]` text. Token-level, no `JSON.parse`: parsing would reorder integer-like keys and collapse duplicate keys, so the reader would see a different document than the one being approved. */
+export function prettyJson(text: string): string {
+	const t = text.trim();
+	if (t.includes("\n") || (t[0] !== "{" && t[0] !== "[")) return text;
+	const nl = (l: number): string => `\n${"  ".repeat(Math.max(0, l))}`;
+	let out = "";
+	let level = 0;
+	for (let i = 0; i < t.length; i++) {
+		const c = t[i]!;
+		if (c === '"') {
+			let j = i + 1;
+			while (j < t.length && t[j] !== '"') j += t[j] === "\\" ? 2 : 1;
+			out += t.slice(i, j + 1);
+			i = Math.min(j, t.length - 1);
+		} else if (c === "{" || c === "[") {
+			let k = i + 1;
+			while (k < t.length && /\s/.test(t[k]!)) k++;
+			if (t[k] === (c === "{" ? "}" : "]")) {
+				out += c + t[k];
+				i = k;
+			} else {
+				level++;
+				out += c + nl(level);
+			}
+		} else if (c === "}" || c === "]") {
+			level--;
+			out += nl(level) + c;
+		} else if (c === ",") out += `,${nl(level)}`;
+		else if (c === ":") out += ": ";
+		else if (!/\s/.test(c)) out += c;
+	}
+	return out;
+}
+
+function beautify(body: string, lang: string): string {
+	if (/^(bash|sh|shell|zsh)$/.test(lang)) return prettyShell(body);
+	if (lang === "json") return prettyJson(body);
+	return body;
+}
+
+/** One fenced code block; the fence outgrows any backtick run in the body so the body cannot close it. `cap` null = no truncation; `pretty` applies the display-only formatter (`beautify`). */
+function fencedBlock(body: string, lang: string, cap: CodeCap | null, pretty = false): string {
+	let text = displaySafe(pretty ? beautify(body, lang) : body);
+	if (cap && text.length > cap.chars) {
+		text = `${text.slice(0, cap.chars * 0.6)}\n… [${text.length - cap.chars} chars truncated] …\n${text.slice(-(cap.chars * 0.4))}`;
 	}
 	const lines = text.split("\n");
-	if (!full && lines.length > MAX_DIALOG_CODE_LINES) {
-		text = [...lines.slice(0, 30), `… [${lines.length - MAX_DIALOG_CODE_LINES} lines omitted] …`, ...lines.slice(-10)].join("\n");
+	if (cap && lines.length > cap.lines) {
+		text = [...lines.slice(0, (cap.lines * 3) / 4), `… [${lines.length - cap.lines} lines omitted] …`, ...lines.slice(-(cap.lines / 4))].join("\n");
 	}
 	const longestRun = Math.max(0, ...(text.match(/`+/g) ?? []).map((r) => r.length));
 	const fence = "`".repeat(Math.max(3, longestRun + 1));
@@ -4936,21 +5073,22 @@ function fencedBlock(body: string, lang: string, full: boolean): string {
 
 /** Code view of a tool call for the approve dialog: bash `command`, write `content`, or edit
  *  `newText` blocks, as Markdown with fenced code. null → the dialog shows the one-line action.
- *  `full` disables every truncation (long code, long lines, edit-block cap). */
+ *  `cap` null disables every truncation (long code, long lines, edit-block cap); `pretty` formats shell/JSON for display. */
 export function approveCodeMarkdown(
 	toolName: string,
 	input: Record<string, unknown>,
 	langFromPath: (p: string) => string | undefined,
-	full = false,
+	cap: CodeCap | null = DIALOG_CODE_CAP,
+	pretty = false,
 ): { header: string; markdown: string } | null {
 	if (typeof input.command === "string") {
-		return { header: displaySafe(toolName), markdown: fencedBlock(input.command, "bash", full) };
+		return { header: displaySafe(toolName), markdown: fencedBlock(input.command, "bash", cap, pretty) };
 	}
 	if (typeof input.code === "string") {
-		return { header: displaySafe(toolName), markdown: fencedBlock(input.code, input.language === "py" ? "python" : input.language === "js" ? "javascript" : "", full) };
+		return { header: displaySafe(toolName), markdown: fencedBlock(input.code, input.language === "py" ? "python" : input.language === "js" ? "javascript" : "", cap, pretty) };
 	}
 	if (typeof input.path === "string" && typeof input.content === "string") {
-		return { header: displaySafe(`${toolName}: ${input.path}`), markdown: fencedBlock(input.content, langFromPath(input.path) ?? "", full) };
+		return { header: displaySafe(`${toolName}: ${input.path}`), markdown: fencedBlock(input.content, langFromPath(input.path) ?? "", cap, pretty) };
 	}
 	if (typeof input.path === "string" && Array.isArray(input.edits)) {
 		const texts = input.edits.map((e) => (e as { newText?: unknown } | null)?.newText).filter((t): t is string => typeof t === "string");
@@ -4958,9 +5096,9 @@ export function approveCodeMarkdown(
 		const n = texts.length;
 		const lang = langFromPath(input.path) ?? "";
 		const parts: string[] = [];
-		const shown = full ? texts : texts.slice(0, MAX_DIALOG_EDIT_BLOCKS);
-		shown.forEach((t, i) => parts.push(`edit ${i + 1} of ${n}`, fencedBlock(t, lang, full)));
-		if (!full && n > MAX_DIALOG_EDIT_BLOCKS) parts.push(`… ${n - MAX_DIALOG_EDIT_BLOCKS} more edits not shown`);
+		const shown = cap ? texts.slice(0, MAX_DIALOG_EDIT_BLOCKS) : texts;
+		shown.forEach((t, i) => parts.push(`edit ${i + 1} of ${n}`, fencedBlock(t, lang, cap, pretty)));
+		if (cap && n > MAX_DIALOG_EDIT_BLOCKS) parts.push(`… ${n - MAX_DIALOG_EDIT_BLOCKS} more edits not shown`);
 		return { header: displaySafe(`${toolName}: ${input.path} (${n} edit${n === 1 ? "" : "s"})`), markdown: parts.join("\n\n") };
 	}
 	return null;
@@ -5347,19 +5485,25 @@ function dialogLineAtRow(tui: unknown, root: PiTui.Component, width: number, scr
 	}
 }
 
-/** One code block of the ask dialog: the action itself, or a file of the file context. `collapsed` is the in-dialog view, `full` the untruncated one the viewer shows. */
-interface DialogBlock { kind: "action" | "file"; header: string; collapsed: string; full: string }
+/** One code block of the ask dialog: the action itself, or a file of the file context. `collapsed` is the in-dialog view, `full` the untruncated one the viewer shows, `pretty` that full text formatted for reading (null when formatting changes nothing). */
+interface DialogBlock { kind: "action" | "file"; header: string; collapsed: string; full: string; pretty: string | null }
 
 /** The dialog's code blocks in display order; the index is the `view` target. Files appear in the ask variant only. */
 function dialogViewBlocks(spec: ApproveDialogSpec, langFromPath: (p: string) => string | undefined): DialogBlock[] {
 	const blocks: DialogBlock[] = [];
 	const code = approveCodeMarkdown(spec.toolName, spec.input, langFromPath);
-	if (code) blocks.push({ kind: "action", header: code.header, collapsed: code.markdown, full: approveCodeMarkdown(spec.toolName, spec.input, langFromPath, true)!.markdown });
+	if (code) {
+		const full = approveCodeMarkdown(spec.toolName, spec.input, langFromPath, null)!.markdown;
+		const pretty = approveCodeMarkdown(spec.toolName, spec.input, langFromPath, null, true)!.markdown;
+		blocks.push({ kind: "action", header: code.header, collapsed: code.markdown, full, pretty: pretty === full ? null : pretty });
+	}
 	if (spec.variant !== "grant") {
 		for (const f of spec.files ?? []) {
 			const lang = f.lang || langFromPath(f.path) || "";
 			const header = displaySafe(`${f.origin === "script" ? "script" : "file"} ${f.path}${f.truncated ? ` (truncated at ${MAX_FILE_CONTEXT_BYTES / 1024} KB)` : ""}`);
-			blocks.push({ kind: "file", header, collapsed: fencedBlock(f.content, lang, false), full: fencedBlock(f.content, lang, true) });
+			const full = fencedBlock(f.content, lang, null);
+			const pretty = fencedBlock(f.content, lang, null, true);
+			blocks.push({ kind: "file", header, collapsed: fencedBlock(f.content, lang, DIALOG_CODE_CAP), full, pretty: pretty === full ? null : pretty });
 		}
 	}
 	return blocks;
@@ -5742,11 +5886,11 @@ async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSig
 	}
 }
 
-/** Full-size, scrollable code viewer (ANSI) / native overlay (TSP) over the ask dialog's code blocks. Esc/q/Enter close it; Tab switches block. */
+/** Full-size, scrollable code viewer over the ask dialog's code blocks: ANSI inline view, or a full-pane Tern `screen` surface (TSP; no `nativeOverlay`, so omp's backend uses `describeScreen`). Shows the formatted text (`pretty`) by default, `r` toggles the exact text. Esc/q/Enter close it; Tab switches block. */
 export function buildCodeViewer(
 	mods: DialogModules,
 	tui: { requestRender(): void },
-	blocks: ReadonlyArray<{ header: string; markdown: string }>,
+	blocks: ReadonlyArray<{ header: string; markdown: string; pretty: string | null }>,
 	start: number,
 	done: () => void,
 ): PiTui.Component & { handleInput(data: string): void; focused: boolean } & NativeHooks {
@@ -5756,10 +5900,14 @@ export function buildCodeViewer(
 	const is = (data: string, key: keyof typeof RAW): boolean => (typeof mods.tui.matchesKey === "function" ? mods.tui.matchesKey(data, key) : data === RAW[key]);
 	const n = blocks.length;
 	const mds = blocks.map((b) => new Markdown(b.markdown, 1, 0, getMarkdownTheme()));
+	const prettyMds = blocks.map((b) => (b.pretty === null ? null : new Markdown(b.pretty, 1, 0, getMarkdownTheme())));
 	let i = Math.min(Math.max(0, start), n - 1);
+	let exact = false;
 	let offset = 0;
 	let total = 0;
 	let height = 5;
+	const hasPretty = (): boolean => blocks[i]!.pretty !== null;
+	const showPretty = (): boolean => !exact && hasPretty();
 	const rows = (): number => {
 		if (typeof tui !== "object" || tui === null || !("terminal" in tui)) return 40;
 		const t = tui.terminal;
@@ -5774,31 +5922,42 @@ export function buildCodeViewer(
 		offset = 0;
 		tui.requestRender();
 	};
-	return {
+	const toggleExact = (): void => {
+		exact = !exact;
+		offset = 0;
+		tui.requestRender();
+	};
+	const viewer = {
 		focused: false,
 		invalidate() {
 			for (const m of mds) m.invalidate();
+			for (const m of prettyMds) m?.invalidate();
 		},
 		render(w: number): string[] {
 			height = Math.max(5, rows() - 4);
-			const all = mds[i]!.render(w);
+			const all = (showPretty() ? prettyMds[i]! : mds[i]!).render(w);
 			total = all.length;
 			offset = Math.min(offset, Math.max(0, total - height));
+			const toggle = hasPretty() ? (exact ? " · r formatted" : " · r exact text") : "";
 			return [
-				truncateToWidth(`\x1b[1m${blocks[i]!.header}\x1b[22m  (${i + 1}/${n})`, w),
+				truncateToWidth(`\x1b[1m${blocks[i]!.header}\x1b[22m  (${i + 1}/${n})${showPretty() ? " · formatted" : ""}`, w),
 				...all.slice(offset, offset + height),
-				truncateToWidth("↑↓ PgUp/PgDn scroll · Tab next block · Esc close", w),
+				truncateToWidth(`↑↓ PgUp/PgDn scroll · Tab next block${toggle} · Esc close`, w),
 			];
 		},
-		get nativeOverlay() {
-			return { role: "pi-verdict.view", head: blocks[i]!.header, anchor: "center" as const };
-		},
+		describeScreen: () => ({ role: "pi-verdict.view", main: [viewer] }),
 		describe(): TspNode {
 			return tn("col", { role: "pi-verdict.view", gap: "md" }, [
 				tnFramed(
 					[
-						tn("md", { text: blocks[i]!.markdown }, undefined, `view${i}`),
-						tnBar([...(n > 1 ? [tnButton("Previous", "prev"), tnButton("Next", "next", { keys: "tab" })] : []), null, tnButton("Close", "close", { keys: "escape" })]),
+						tnHeading(`${blocks[i]!.header}${showPretty() ? " · formatted" : ""}`, "head"),
+						tn("md", { text: showPretty() ? blocks[i]!.pretty! : blocks[i]!.markdown }, undefined, `view${i}`),
+						tnBar([
+							...(n > 1 ? [tnButton("Previous", "prev"), tnButton("Next", "next", { keys: "tab" })] : []),
+							...(hasPretty() ? [tnButton(exact ? "Formatted" : "Exact text", "exact", { keys: "r" })] : []),
+							null,
+							tnButton("Close", "close", { keys: "escape" }),
+						]),
 					],
 					"md",
 				),
@@ -5809,6 +5968,7 @@ export function buildCodeViewer(
 			if (e.act === "close") done();
 			else if (e.act === "next") switchTo(i + 1);
 			else if (e.act === "prev") switchTo(i - 1);
+			else if (e.act === "exact" && hasPretty()) toggleExact();
 		},
 		handleInput(data: string): void {
 			if (data.startsWith("\x1b[M") || /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data)) return; // mouse: ignored
@@ -5820,13 +5980,15 @@ export function buildCodeViewer(
 			else if (is(data, "end")) scrollTo(total);
 			else if (is(data, "tab") && n > 1) switchTo(i + 1);
 			else if (is(data, "shift+tab") && n > 1) switchTo(i - 1);
+			else if (data === "r" && hasPretty()) toggleExact();
 			else if (is(data, "escape") || data === "q" || data === "\r" || data === "\n") done();
 		},
 	};
+	return viewer;
 }
 
 /** Opens the viewer over `blocks` starting at `start`; resolves when it closes (also when `signal` aborts). A host without `ui.custom` shows nothing. */
-async function viewCode(ui: UiContext, blocks: ReadonlyArray<{ header: string; markdown: string }>, start: number, signal?: AbortSignal): Promise<void> {
+async function viewCode(ui: UiContext, blocks: ReadonlyArray<{ header: string; markdown: string; pretty: string | null }>, start: number, signal?: AbortSignal): Promise<void> {
 	if (typeof ui.custom !== "function" || blocks.length === 0) return;
 	const mods = await loadDialogModules();
 	if (!mods || signal?.aborted) return;
@@ -5839,7 +6001,7 @@ async function viewCode(ui: UiContext, blocks: ReadonlyArray<{ header: string; m
 			finish = () => done(undefined);
 			if (signal?.aborted) queueMicrotask(() => done(undefined));
 			return buildCodeViewer(mods, tui, blocks, start, () => done(undefined));
-		}, nativeLive() ? NATIVE_WIDE_OVERLAY : undefined);
+		}, nativeLive() ? NATIVE_SCREEN_OVERLAY : undefined);
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
 	}
@@ -6313,7 +6475,7 @@ async function confirmAsk(ui: UiContext, spec: ApproveDialogSpec, opts: { signal
 			}
 			if (typeof pick === "object" && "view" in pick) {
 				const mods = await loadDialogModules();
-				const viewBlocks = mods ? dialogViewBlocks(spec, mods.agent.getLanguageFromPath).map((b) => ({ header: b.header, markdown: b.full })) : [];
+				const viewBlocks = mods ? dialogViewBlocks(spec, mods.agent.getLanguageFromPath).map((b) => ({ header: b.header, markdown: b.full, pretty: b.pretty })) : [];
 				await viewCode(ui, viewBlocks, pick.view, signal);
 				continue;
 			}
@@ -8717,7 +8879,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		promptGuidelines: ["When a command runs a local script you wrote (bun x.ts, python tool.py), or the gate blocked a call for lack of file context, call execute_gated_tool first with the scripts and files it depends on, then make the real call with exactly the same input."],
 		parameters: gatedToolParameters,
 		...(isOmpHost ? { approval: "write" } : {}),
-		execute: async (_toolCallId: string, params: Record<string, unknown>, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) => {
+		execute: async (toolCallId: string, params: Record<string, unknown>, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) => {
 			if (state.userRules.mode === "off") return settingsToolText("NA: the pi-verdict permission gate is disabled (approval mode off) — call the tool directly.");
 			const { tool, input, files = [], explanation } = params;
 			if (typeof tool !== "string" || tool === "" || tool === EXEC_GATED_TOOL_NAME || tool === GRANT_TOOL_NAME || tool === SETTINGS_TOOL_NAME) {
@@ -8731,13 +8893,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				return settingsToolText(`Invalid explanation: a string of at most ${MAX_GATED_EXPLANATION_CHARS} characters.`);
 			}
 			const out: { verdict?: Verdict } = {};
-			const blocked = await gateCall({ toolName: tool, input: input as Record<string, unknown> }, ctx, undefined, { files: files as string[], explanation: explanation ?? null }, out);
+			const blocked = await gateCall({ toolName: tool, input: input as Record<string, unknown> }, ctx, toolCallId, { files: files as string[], explanation: explanation ?? null }, out);
 			if (blocked) return settingsToolText(blocked.reason);
 			const v = out.verdict;
 			if (!v) return settingsToolText(`NA: the pi-verdict gate is not active here — call ${tool} directly.`);
 			if (!v.clearKey) return settingsToolText(`Allowed by rule: call ${tool} directly.`);
 			state.addClearance(v.clearKey.key, v.clearKey.files, v.clearKey.digest);
-			return settingsToolText(`Cleared: call ${tool} now with exactly the same input (one use, expires in ${CLEARANCE_TTL_MS / 60_000} minutes). Gate: ${v.reason}`);
+			return settingsToolText(`Cleared: call ${tool} now with exactly the same input (one use, expires in ${CLEARANCE_TTL_MS / 60_000} minutes).`);
 		},
 	} as unknown as Parameters<ExtensionAPI["registerTool"]>[0]);
 
@@ -9486,7 +9648,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			model: role.model,
 			thinking: role.thinking,
 			actionLine: action,
-			actionDetail: approveCodeMarkdown(call.toolName, call.input, () => undefined)?.markdown ?? displaySafe(action),
+			actionDetail: approveCodeMarkdown(call.toolName, call.input, () => undefined, EXPLAIN_CODE_CAP)?.markdown ?? displaySafe(action),
 			reasonLine,
 			defaultPrompt: state.userRules.explainGatePrompt,
 			question,
@@ -9576,6 +9738,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 		const input = call.input;
 		const action = describeAction(call.toolName, input);
+		// The wrapper (only caller passing `extra`) is labelled by its own name: the wrapped tool has not run yet, so "bash allowed" would be premature.
+		const labelTool = extra ? EXEC_GATED_TOOL_NAME : call.toolName;
 		const noteAllowed = (label: VerdictLabel): void => {
 			if (callId !== undefined) state.noteLabel(callId, label);
 		};
@@ -9651,13 +9815,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}
 			const presented = r === "aborted" ? { block: true as const, reason: blockedReason("user-declined", "user declined") } : r;
 			finalize(answerAudit(presented));
-			if (presented === undefined) noteAllowed(verdictLabelFor(call.toolName, allowedHow(verdict), verdict.reason));
+			if (presented === undefined) noteAllowed(verdictLabelFor(labelTool, allowedHow(verdict), verdict.reason));
 			return presented;
 		}
 
 		if (verdict.verdict !== "ask") {
 			const r = await present();
-			if (r === undefined) noteAllowed(verdictLabelFor(call.toolName, allowedHow(verdict), verdict.reason));
+			if (r === undefined) noteAllowed(verdictLabelFor(labelTool, allowedHow(verdict), verdict.reason));
 			return r === "aborted" ? undefined : r;
 		}
 
@@ -9668,7 +9832,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const notify = (ui ?? ctx.ui).notify.bind(ui ?? ctx.ui);
 			if (res.verdict === "allow") {
 				if (isDebug() || state.userRules.notifyAllows) notify(`🛡️ [${label}] allow (second model, no human): ${res.reason}\n  ${action}`, "info");
-				noteAllowed(verdictLabelFor(call.toolName, "second-model", res.reason));
+				noteAllowed(verdictLabelFor(labelTool, "second-model", res.reason));
 				return undefined;
 			}
 			// no path plaintext in notifications (PP-6): protected-path asks omit the action line
@@ -9682,7 +9846,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const r = await present(signal);
 			if (r !== "aborted") {
 				finalize({ ...answerAudit(r), subagent: { ...sub, resolution: "human" } });
-				if (r === undefined) noteAllowed(verdictLabelFor(call.toolName, "user", verdict.reason));
+				if (r === undefined) noteAllowed(verdictLabelFor(labelTool, "user", verdict.reason));
 				return r;
 			}
 			if (ctx.signal?.aborted) {

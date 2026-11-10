@@ -467,12 +467,14 @@ Pinned by: script and file context (SC-1–SC-6) › SC-6: editing a script inva
 
 #### SC-7: Viewing the code in the ask dialog
 
-An ask dialog that carries code (the command, plus each loaded script or file with the file's name when it is not protected) shows each block with a **View** control; `v` (ANSI) or the button (Tern) opens a full-size scrollable viewer of that block, Tab/Previous/Next switches block, Esc/Close returns to the ask with its state unchanged. The Tern dialog and viewer mount as overlays at 95% width. Protected files never appear as blocks (SC-2).
+An ask dialog that carries code (the command, plus each loaded script or file with the file's name when it is not protected) shows each block with a **View** control; `v` (ANSI) or the button (Tern) opens a full-size scrollable viewer of that block, Tab/Previous/Next switches block, Esc/Close returns to the ask with its state unchanged. The viewer shows the full text formatted for reading by default (one line per top-level shell `&&` `||` `|` `;` segment, single-line JSON re-indented; display only, token-level so key order and duplicates are preserved) and `r` / the Exact text button switches to the exact text. The collapsed in-dialog preview is capped at 8 lines / 800 chars. On Tern the dialog mounts as an overlay at 95% width and the viewer as a full-pane `screen` surface. Protected files never appear as blocks (SC-2).
 
 Why: the user is asked to approve code they could not read in the inline preview; a script of a few hundred lines needs a real viewer.
-Code: `buildApproveDialog`, `buildCodeViewer`, `viewCode`, `dialogViewBlocks`, `NATIVE_WIDE_OVERLAY`
+Code: `buildApproveDialog`, `buildCodeViewer`, `viewCode`, `dialogViewBlocks`, `prettyShell`, `prettyJson`, `NATIVE_WIDE_OVERLAY`, `NATIVE_SCREEN_OVERLAY`
 Pinned by: script and file context (SC-1–SC-6) › ask dialog: the script is a second code block; v opens the viewer, Tab switches block, Esc returns to the ask
-Pinned by (native nodes): Tern-native UI (TSP) › ask dialog › SC: a script's file context gets a View button; View opens the 95% viewer overlay and closing re-opens the ask
+Pinned by: script and file context (SC-1–SC-6) › ask dialog: the viewer shows formatted code by default and r toggles the exact text
+Pinned by: approve dialog helpers › prettyShell splits top-level operators only; prettyJson re-indents without reordering
+Pinned by (native nodes): Tern-native UI (TSP) › ask dialog › SC: a script's file context gets a View button; View opens the full-pane viewer screen and closing re-opens the ask
 
 ## MD: Approval modes
 

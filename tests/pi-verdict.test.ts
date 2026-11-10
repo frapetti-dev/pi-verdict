@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, buildChoiceScreen, collectProjectContext, declineDetail, detectLocalScripts, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, grantLine, grantRevokeScreen, grantsScreen, renderFooter, renderJevBar, resolveAgentDir, RULE_SAVE_CHOICE, ruleReviewScreen, ruleSaveScreen, SessionState, settingsChangeScreen, settingValueLines, statusNode, trustScreen, verdictLabelNode, type ChoiceScreenSpec } from "../extensions/pi-verdict.ts";
+import { prettyJson, prettyShell } from "../extensions/pi-verdict.ts";
 import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
 
 // ── Stub infrastructure ─────────────────────────────────
@@ -3521,18 +3522,28 @@ describe("approve dialog helpers", () => {
 		expect(approveCodeMarkdown("edit", { path: "a.ts", edits: [{ oldText: "o" }] }, lang)).toBeNull();
 		expect(approveCodeMarkdown("read", { path: "a.ts" }, lang)).toBeNull();
 		const long = approveCodeMarkdown("bash", { command: Array.from({ length: 100 }, (_, i) => `l${i}`).join("\n") }, lang)!;
-		expect(long.markdown).toContain("[60 lines omitted]");
+		expect(long.markdown).toContain("[92 lines omitted]");
 		expect(long.markdown).toContain("l0\n");
 		expect(long.markdown).toContain("l99\n");
 		const wide = approveCodeMarkdown("bash", { command: "x".repeat(10_000) }, lang)!;
-		expect(wide.markdown).toContain("[6000 chars truncated]");
-		const fullLong = approveCodeMarkdown("bash", { command: Array.from({ length: 100 }, (_, i) => `l${i}`).join("\n") }, lang, true)!;
+		expect(wide.markdown).toContain("[9200 chars truncated]");
+		const fullLong = approveCodeMarkdown("bash", { command: Array.from({ length: 100 }, (_, i) => `l${i}`).join("\n") }, lang, null)!;
 		expect(fullLong.markdown).toContain("l50\n");
 		expect(fullLong.markdown).not.toContain("omitted");
-		expect(approveCodeMarkdown("bash", { command: "x".repeat(10_000) }, lang, true)!.markdown).not.toContain("truncated");
-		const fullEdits = approveCodeMarkdown("edit", { path: "a.ts", edits }, lang, true)!;
+		expect(approveCodeMarkdown("bash", { command: "x".repeat(10_000) }, lang, null)!.markdown).not.toContain("truncated");
+		const fullEdits = approveCodeMarkdown("edit", { path: "a.ts", edits }, lang, null)!;
 		expect(count(fullEdits.markdown, "```typescript")).toBe(5);
 		expect(fullEdits.markdown).not.toContain("more edits not shown");
+	});
+
+	test("prettyShell splits top-level operators only; prettyJson re-indents without reordering", () => {
+		expect(prettyShell('cd /x && npm ci 2>&1 | tee "a|b"; echo $(a && b)')).toBe('cd /x &&\n  npm ci 2>&1 |\n  tee "a|b";\necho $(a && b)');
+		expect(prettyShell("cat <<EOF\na && b\nEOF")).toBe("cat <<EOF\na && b\nEOF");
+		expect(prettyShell("echo 'a && b'")).toBe("echo 'a && b'");
+		expect(prettyShell("a;;b")).toBe("a;;b");
+		expect(prettyShell("[[ a || b ]] && c")).toBe("[[ a || b ]] &&\n  c");
+		expect(prettyJson('{"b":1,"2":[],"b":{"x":"a,b"}}')).toBe('{\n  "b": 1,\n  "2": [],\n  "b": {\n    "x": "a,b"\n  }\n}');
+		expect(prettyJson('{\n"a": 1}')).toBe('{\n"a": 1}');
 	});
 
 	test("displaySafe: control / bidi characters become visible escapes; tab and newline survive", () => {
@@ -5985,6 +5996,7 @@ describe("Tern-native UI (TSP)", () => {
 	const cx = { cols: 100, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
 	const NATIVE_MD = { overlay: true, overlayOptions: { width: "60%" } };
 	const NATIVE_WIDE = { overlay: true, overlayOptions: { width: "95%" } };
+	const NATIVE_SCREEN = { overlay: true, overlayOptions: { fullscreen: true, width: "100%" } };
 	const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 	type NativeComponent = DialogComponent & { describe?(cx: unknown): unknown; handleNativeEvent?(e: unknown): void };
 	interface Snap { k: string; key?: string; p: Record<string, unknown>; c?: Snap[] }
@@ -6178,7 +6190,7 @@ describe("Tern-native UI (TSP)", () => {
 			expect(text).not.toContain('"explain"');
 		});
 
-		test("SC: a script's file context gets a View button; View opens the 95% viewer overlay and closing re-opens the ask", async () => {
+		test("SC: a script's file context gets a View button; View opens the full-pane viewer screen and closing re-opens the ask", async () => {
 			const dir = fs.mkdtempSync(path.join(os.homedir(), ".pv-sc-nat-"));
 			try {
 				fs.writeFileSync(path.join(dir, "scratch.ts"), "console.log('NATIVE-VIEW')");
@@ -6196,7 +6208,7 @@ describe("Tern-native UI (TSP)", () => {
 					run,
 				);
 				expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
-				expect(run.options).toEqual([NATIVE_WIDE, NATIVE_WIDE, NATIVE_WIDE]);
+				expect(run.options).toEqual([NATIVE_WIDE, NATIVE_SCREEN, NATIVE_WIDE]);
 				expect(run.nodes.map((n) => n.p.role)).toEqual(["pi-verdict.ask", "pi-verdict.view", "pi-verdict.ask"]);
 				expect(JSON.stringify(run.nodes[0])).toContain("view:1");
 				expect(JSON.stringify(run.nodes[0])).toContain("view:0");
@@ -6720,6 +6732,20 @@ describe("script and file context (SC-1–SC-6)", () => {
 		expect(h.calls).toHaveLength(2);
 	});
 
+	test("ask dialog: the viewer shows formatted code by default and r toggles the exact text", async () => {
+		const h = session({}, { cwd: root });
+		h.responses = [ASK];
+		const rendered: string[] = [];
+		const after: string[] = [];
+		driveDialogs(h, [["v"], ["r", "\x1b"], ["\r"]], rendered, after);
+		expect(await toolCall(h, "bash", { command: "cd a && echo PRETTY-X" })).toBeUndefined();
+		expect(rendered[1]).toContain("· formatted");
+		expect(rendered[1]).toMatch(/cd a &&\s*\n/);
+		expect(rendered[1]).not.toContain("cd a && echo PRETTY-X");
+		expect(after[1]).not.toContain("· formatted");
+		expect(after[1]).toContain("cd a && echo PRETTY-X");
+	});
+
 	test("ask dialog: the script is a second code block; v opens the viewer, Tab switches block, Esc returns to the ask", async () => {
 		put("scratch.ts", "console.log('SCRATCH-VIEW')");
 		const h = session({}, { cwd: root });
@@ -6826,6 +6852,15 @@ describe("gated execution (EG-1–EG-4)", () => {
 		put("helper.ts", "v2");
 		expect((await adjudicate(state, call, env)).cleared).toBeUndefined();
 		expect(n).toBe(5);
+	});
+
+	test("an approved execute_gated_tool call gets a verdict label named after the wrapper", async () => {
+		put("scratch.ts", "console.log(1)");
+		const h = session({}, { cwd: root });
+		h.responses = [ALLOW];
+		await wrap(h, { tool: "bash", input: RUN, files: ["scratch.ts"] });
+		await h.handlers.tool_result({ toolCallId: "t1" }, h.ctx);
+		expect(h.entries.at(-1)).toEqual(["pi-verdict-label", { tool: "execute_gated_tool", how: "classifier", jev: null }]);
 	});
 
 	test("EG-3: a subagent may use the wrapper", async () => {
