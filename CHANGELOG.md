@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-10
+
 ### Added
 
 - **Trust this project from the settings menus** ([CF-3](docs/adjudication-rules.md#cf-3-project-discovery-and-trust)): the `local` tab of `/automode`, `/automode-setup` and `/verdict` shows a **trust this project** action (a `project` section at the end of the main page) while the project is untrusted (undecided, Not now or Never). It runs the same `recordTrust(root, "trusted")` as the session-start Trust choice (also lifting an earlier Never), reloads the rules and footer at once and drops the `local · untrusted` badge; no confirmation step, no untrust action. The local tab of an untrusted project is two rows taller than the other tabs.
