@@ -2731,20 +2731,28 @@ describe("/verdict config editor", () => {
 	}
 
 	test("menu height stays constant across rows, values and scopes on one page", async () => {
-		const h = session({});
-		const rendered: string[] = [];
-		const after: string[] = [];
-		await run(h, "", [...times(8, DOWN), TAB, ...times(8, DOWN), TAB, ...times(8, DOWN), RIGHT, LEFT], rendered, after);
-		const heights = [rendered[0]!, ...after].map((s) => s.split("\n").length);
-		expect(new Set(heights).size).toBe(1);
+		// the trust row (CF-3) adds rows to the local tab of an untrusted project, so measure a trusted one
+		const trust = path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
+		fs.mkdirSync(path.dirname(trust), { recursive: true });
+		fs.writeFileSync(trust, JSON.stringify({ trusted: ["/proj"], untrusted: [] }));
+		try {
+			const h = session({});
+			const rendered: string[] = [];
+			const after: string[] = [];
+			await run(h, "", [...times(8, DOWN), TAB, ...times(8, DOWN), TAB, ...times(8, DOWN), RIGHT, LEFT], rendered, after);
+			const heights = [rendered[0]!, ...after].map((s) => s.split("\n").length);
+			expect(new Set(heights).size).toBe(1);
 
-		const r2: string[] = [];
-		const a2: string[] = [];
-		driveMenu(h, [...times(12, DOWN), RIGHT, LEFT, TAB, ...times(12, DOWN), TAB, ...times(12, DOWN)], r2, a2);
-		await h.commands.automode.handler("", h.ctx);
-		expect(r2.length).toBe(1);
-		const heights2 = [r2[0]!, ...a2].map((s) => s.split("\n").length);
-		expect(new Set(heights2).size).toBe(1);
+			const r2: string[] = [];
+			const a2: string[] = [];
+			driveMenu(h, [...times(12, DOWN), RIGHT, LEFT, TAB, ...times(12, DOWN), TAB, ...times(12, DOWN)], r2, a2);
+			await h.commands.automode.handler("", h.ctx);
+			expect(r2.length).toBe(1);
+			const heights2 = [r2[0]!, ...a2].map((s) => s.split("\n").length);
+			expect(new Set(heights2).size).toBe(1);
+		} finally {
+			fs.rmSync(trust, { force: true });
+		}
 	});
 
 	test("add persists to the global file and takes effect immediately (no classifier call)", async () => {
@@ -6883,5 +6891,76 @@ describe("gated execution (EG-1–EG-4)", () => {
 		const rule = session({}, { cwd: root });
 		const danger = await toolCall(rule, "bash", { command: "rm " + "-rf /opt/x" });
 		expect(danger.reason).not.toContain("execute_gated_tool");
+	});
+});
+
+describe("project trust from the settings menus (CF-3)", () => {
+	const trustFile = () => path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
+	const readTrust = () => JSON.parse(fs.readFileSync(trustFile(), "utf8")) as { trusted: string[]; untrusted: string[] };
+	/** An untrusted project (previous "Never") whose local config denies `echo SECRET`. */
+	const untrustedProject = async (dir: string, trusted: string[] = []) => {
+		const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
+		fs.mkdirSync(path.join(dir, dot), { recursive: true });
+		fs.writeFileSync(path.join(dir, dot, "pi-verdict.json"), JSON.stringify({ deny: ["^echo SECRET"] }));
+		fs.mkdirSync(path.dirname(trustFile()), { recursive: true });
+		fs.writeFileSync(trustFile(), JSON.stringify({ trusted, untrusted: trusted.length ? [] : [dir] }));
+		const h = session({}, { cwd: dir });
+		await h.handlers.session_start({}, h.ctx);
+		return h;
+	};
+
+	test("/verdict local: trust this project records trust, applies the local config and drops the untrusted badge", async () => {
+		await withTempDir("pv-trust-btn-", async (dir) => {
+			try {
+				const h = await untrustedProject(dir);
+				h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+				expect(await toolCall(h, "bash", { command: "echo SECRET" })).toBeUndefined();
+				const rendered: string[] = [];
+				const after: string[] = [];
+				driveMenu(h, [MENU.UP, MENU.ENTER], rendered, after); // wraps from the first row to the last: the trust row
+				await h.commands.verdict.handler("local", h.ctx);
+				expect(rendered[0]).toContain("trust this project");
+				expect(readTrust().trusted).toContain(dir);
+				expect(readTrust().untrusted).toEqual([]);
+				expect(after.at(-1)).not.toContain("local · untrusted");
+				expect(h.notifies.some(([m, l]) => l === "info" && m.includes("trusted — its config is applied"))).toBe(true);
+				expect((await toolCall(h, "bash", { command: "echo SECRET" }))?.block).toBe(true);
+			} finally {
+				fs.rmSync(trustFile(), { force: true });
+			}
+		});
+	});
+
+	test("the trust row is shown only on the local tab of an untrusted project", async () => {
+		await withTempDir("pv-trust-row-", async (dir) => {
+			try {
+				const h = await untrustedProject(dir);
+				const after: string[] = [];
+				driveMenu(h, [MENU.TAB, MENU.TAB], [], after); // session → global → local
+				await h.commands.automode.handler("", h.ctx);
+				expect(after[0]).not.toContain("trust this project");
+				expect(after[1]).toContain("trust this project");
+				const h2 = await untrustedProject(dir, [dir]);
+				const after2: string[] = [];
+				driveMenu(h2, [MENU.TAB, MENU.TAB], [], after2);
+				await h2.commands.automode.handler("", h2.ctx);
+				expect(after2[1]).not.toContain("trust this project");
+			} finally {
+				fs.rmSync(trustFile(), { force: true });
+			}
+		});
+	});
+
+	test("/automode-setup local: trust this project works from the root-rule menu", async () => {
+		await withTempDir("pv-trust-root-", async (dir) => {
+			try {
+				const h = await untrustedProject(dir);
+				driveMenu(h, [MENU.UP, MENU.ENTER]);
+				await h.commands["automode-setup"].handler("local", h.ctx);
+				expect(readTrust().trusted).toContain(dir);
+			} finally {
+				fs.rmSync(trustFile(), { force: true });
+			}
+		});
 	});
 });

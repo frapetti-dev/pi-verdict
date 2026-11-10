@@ -7454,6 +7454,34 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const root = projectRootOf(file);
 		return (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, readTrustStore().trusted);
 	};
+	/** Action-row id of the "trust this project" button (local tab of the settings menus, while untrusted). */
+	const TRUST_ROW_ID = "trust-project";
+	/** Main-page rows offering to trust the project: a section + one action, on the local tab while `untrusted`; [] otherwise. */
+	const trustRows = (scope: MenuScope, localFile: string | null, untrusted: boolean): MenuRow[] =>
+		scope === "local" && localFile !== null && untrusted
+			? [
+					{ kind: "section", label: "project" },
+					{
+						kind: "action",
+						id: TRUST_ROW_ID,
+						label: "▸ trust this project",
+						info: () => [
+							{ tone: "text", text: `Apply ${displaySafe(projectRootOf(localFile))}'s pi-verdict config from now on (remembered; same as Trust at session start).` },
+							{ tone: "muted", text: "Its config can override your global settings: allow rules, builtinDenyFloor, mode, …" },
+						],
+					},
+				]
+			: [];
+	/** Trust the project of `localFile` permanently (as the session_start Trust choice), reload rules and the footer. */
+	const trustProject = (ctx: ExtensionContext, localFile: string): void => {
+		const root = projectRootOf(localFile);
+		sessionTrustedRoot = root;
+		const err = recordTrust(root, "trusted");
+		if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
+		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
+		refreshStatus(ctx);
+		ctx.ui.notify(`pi-verdict: project ${root} trusted — its config is applied`, "info");
+	};
 	/** Precedence of a setting's source: session > local > global > default. */
 	const SOURCE_RANK: Record<SettingSource, number> = { default: 0, global: 1, local: 2, session: 3 };
 
@@ -7533,7 +7561,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			return;
 		}
 		const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
-		const untrusted = localFile !== null && !projectTrusted(localFile);
+		let untrusted = localFile !== null && !projectTrusted(localFile);
 		let showAll = false;
 		let closeMenu: (() => void) | undefined;
 		let openRoot = false;
@@ -7606,10 +7634,16 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						info: () => [{ tone: "muted", text: "Clear this session's remembered approvals: identical calls ask again." }],
 					},
 				);
+				rows.push(...trustRows(scope, localFile, untrusted));
 				return rows;
 			},
 			change: (scope, id, value) => applySetting(ctx, scope, id as SessionKey, value, localFile),
 			action: (_scope, id) => {
+				if (id === TRUST_ROW_ID && localFile !== null) {
+					trustProject(ctx, localFile);
+					untrusted = false;
+					return;
+				}
 				if (id === "show-all") showAll = !showAll;
 				else if (id === "forget-approvals") forgetApprovals(ctx);
 				else if (id === "root-rule") {
@@ -7641,7 +7675,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			return;
 		}
 		const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
-		const untrusted = localFile !== null && !projectTrusted(localFile);
+		let untrusted = localFile !== null && !projectTrusted(localFile);
 		const scopes: MenuScope[] = localFile === null ? ["global", "session"] : ["global", "local", "session"];
 
 		const ownRootRule = (scope: MenuScope): RootRuleConfig | null => parseRootRule(storedAt(scope, localFile).rootRule, []);
@@ -7846,6 +7880,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					if (ownRootRule(s) !== null) {
 						rows.push({ kind: "action", id: "remove", label: "remove root rule at this scope", confirm: true, info: () => [{ tone: "text", text: "Deletes this scope's root rule and its inputs; a lower scope's root rule applies again." }] });
 					}
+					rows.push(...trustRows(s, localFile, untrusted));
 					return rows;
 				},
 				change: (s, id, value) => {
@@ -7853,6 +7888,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					else if (id === "history" || id === "codebase") updateRootRule(s, { [id]: value === "on" });
 				},
 				action: (s, id) => {
+					if (id === TRUST_ROW_ID && localFile !== null) {
+						trustProject(ctx, localFile);
+						untrusted = false;
+						return;
+					}
 					if (id === "text") out.pending = { kind: "edit", scope: s };
 					else if (id === "generate") out.pending = { kind: "generate", scope: s };
 					else if (id === "remove") {
@@ -7974,7 +8014,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				return;
 			}
 		}
-		const untrusted = localFile !== null && !projectTrusted(localFile);
+		let untrusted = localFile !== null && !projectTrusted(localFile);
 		const rolesTarget = ompRolesTarget();
 		if (rolesTarget) {
 			const rc = readOmpConfig(rolesTarget.file, rolesTarget.yaml);
@@ -8199,6 +8239,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 							},
 						);
 					}
+					rows.push(...trustRows(scope, localFile, untrusted));
 					return rows;
 				}
 				if (page === BUILTIN_PAGE) return builtinRows(scope);
@@ -8236,6 +8277,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				if (id === "gateOmpDir" || id === "footer" || id === "modeStatus" || id === "grantStatus") applySetting(ctx, scope, id, value, localFile);
 			},
 			action: (scope, id) => {
+				if (id === TRUST_ROW_ID && localFile !== null) {
+					trustProject(ctx, localFile);
+					untrusted = false;
+					return;
+				}
 				if (id.startsWith("unset:")) saveList(scope, id.slice("unset:".length) as EditableListKey, undefined);
 			},
 			submit: (scope, page, id, text) => {
