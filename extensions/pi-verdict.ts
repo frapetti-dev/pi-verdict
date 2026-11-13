@@ -2594,6 +2594,8 @@ export class SessionState {
 	verdictCounts = { allow: 0, ask: 0, deny: 0 };
 	/** Verdict label per allowed tool call, consumed once by `tool_result`. */
 	private readonly labels = new Map<string, VerdictLabel>();
+	/** Grant invitation text per allowed tool call (PR-10), consumed once by `tool_result`. */
+	private readonly invites = new Map<string, string>();
 	/** Remembered approvals (PR-9): `approvalKey`s the user answered "Yes, and don't ask again this session"; memory only, cleared by `reset`. */
 	private readonly approvals = new Set<string>();
 	/** One-shot pre-clearances issued by `execute_gated_tool` (EG-2): `approvalKey` → expiry, the agent-listed files and the file-context digest the clearance was judged on. Memory only, cleared by `reset`. */
@@ -2626,6 +2628,17 @@ export class SessionState {
 		return label;
 	}
 
+	noteInvite(id: string, text: string): void {
+		this.remember(this.invites, id, text);
+	}
+
+	/** Get-and-delete the grant invitation of tool call `id`. */
+	takeInvite(id: string): string | undefined {
+		const t = this.invites.get(id);
+		this.invites.delete(id);
+		return t;
+	}
+
 	/** #54: the audit flag follows the rules (applies to new sessions); the dir is anchored to the install path */
 	private makeAudit(rules: UserRules): AuditLog | null {
 		return rules.audit && this.agentDir ? new AuditLog(path.join(this.agentDir, "verdicts")) : null;
@@ -2655,6 +2668,7 @@ export class SessionState {
 		this.fallback.reset();
 		this.verdictCounts = { allow: 0, ask: 0, deny: 0 };
 		this.labels.clear();
+		this.invites.clear();
 		this.approvals.clear();
 		this.clearances.clear();
 		return report;
@@ -2733,6 +2747,8 @@ export interface Verdict {
 	noExplain?: true;
 	/** PR-9: set on every ask — the key a "Yes, and don't ask again this session" answer is stored under; absent = the dialog offers no remember row. */
 	approvalKey?: string;
+	/** PR-10: set with approvalKey on every ask — what an invited grant must name: danger-rule ids hit by this call, and whether it touched a protected path / .omp dir / path tier. */
+	grantScope?: { rules: string[]; paths: boolean };
 	/** PR-9: this allow is a remembered approval (no classifier call, no dialog). */
 	remembered?: true;
 	/** The file context the classifier saw (loaded files only), for the ask dialog's code viewer; `lang` is resolved by the dialog. */
@@ -3228,6 +3244,14 @@ async function adjudicateRuled(
 	return { verdict: "deny", reason: effReason, source: effSource, degraded: true, shadow, ...ffields };
 }
 
+/** PR-10: text appended to an invited call's tool result. Names the tool and rule ids, never a path (PP-6). */
+export function grantInvitationText(toolName: string, scope: { rules: string[]; paths: boolean }): string {
+	const parts = [`[pi-verdict] The user approved this ${toolName} call and invites you to request a permission grant for similar operations so they need not approve each one. Call ${GRANT_TOOL_NAME} with action "request" now: describe the kind of operation this call is an instance of, as narrowly as the current work needs (broader than this exact call, never broader than the user's evident intent)`];
+	if (scope.rules.length > 0) parts.push(`list the danger rules ${scope.rules.join(", ")} in rules`);
+	if (scope.paths) parts.push("list the protected path(s) this call touched in paths with the access level it needs");
+	return `${parts.join("; ")}. The user reviews the scope in the grant dialog; nothing is granted until they approve.`;
+}
+
 const REMEMBERED_APPROVAL_REASON = "remembered approval (this session)";
 const PRECLEARED_REASON = "pre-cleared by execute_gated_tool (one use)";
 export const EXEC_GATED_TOOL_NAME = "execute_gated_tool";
@@ -3290,7 +3314,9 @@ export async function adjudicate(
 		return { verdict: "allow", reason: REMEMBERED_APPROVAL_REASON, source: allowSource, degraded: false, remembered: true, ...(clearKey ? { clearKey } : {}) };
 	}
 	const v = await adjudicateRuled(state, call, env, rule, { files: fc, explanation: extra?.explanation ?? null, digest, viaWrapper });
-	return { ...v, ...(v.verdict === "ask" ? { approvalKey: key } : {}), ...(clearKey ? { clearKey } : {}) };
+	const builtin = rule.builtin ?? [];
+	const grantScope = { rules: builtin.flatMap((b) => (b.kind === "danger" ? [b.id] : [])), paths: origin === "gate" || builtin.some((b) => b.kind === "path") };
+	return { ...v, ...(v.verdict === "ask" ? { approvalKey: key, grantScope } : {}), ...(clearKey ? { clearKey } : {}) };
 }
 
 // ============================================================================
@@ -5413,15 +5439,17 @@ interface ApproveDialogSpec {
 	scope?: GrantScope;
 	/** offer "Yes, and don't ask again this session" (PR-9); never in the grant variant */
 	remember?: boolean;
+	/** offer "Yes, and grant similar operations…" (PR-10); never in the grant variant */
+	invite?: boolean;
 	/** File context shown as extra code blocks, each with a View button (ask variant only). */
 	files?: DialogFile[];
 }
 
 /** The options the dialog lists. */
-type AskOption = "yes" | "always" | "no" | "explain" | "reject";
+type AskOption = "yes" | "always" | "invite" | "no" | "explain" | "reject";
 
-/** Interactive ask outcome. `reason` is the user's own explanation of a decline (forwarded to the agent). `remember`: the user chose the PR-9 row. */
-export type AskDecision = { allow: true; remember?: true } | { allow: false; reason?: string };
+/** Interactive ask outcome. `reason` is the user's own explanation of a decline (forwarded to the agent). `remember`: the user chose the PR-9 row; `invite`: the PR-10 row (never both). */
+export type AskDecision = { allow: true; remember?: true; invite?: true } | { allow: false; reason?: string };
 
 /** What the dialog resolves with: a final decision (No carries the inline text as `reason`), a request for the EXPLAIN-GATE follow-up, or a request to open code block `view` in the full-size viewer. */
 export type AskPick = AskDecision | "explain" | { view: number };
@@ -5429,6 +5457,7 @@ export type AskPick = AskDecision | "explain" | { view: number };
 const ASK_LABELS: Record<AskOption, string> = {
 	yes: "Yes",
 	always: "Yes, and don't ask again this session",
+	invite: "Yes, and grant similar operations…",
 	no: "No",
 	explain: "Explain… (optional question)",
 	reject: "Reject",
@@ -5445,6 +5474,7 @@ const GRANT_LABELS: Partial<Record<AskOption, string>> = {
 const ASK_DETAILS: Record<AskOption, string> = {
 	yes: "Run it this once",
 	always: "Same action, until the session ends",
+	invite: "Run it, then review a grant",
 	no: "Block it and tell the agent why",
 	explain: "",
 	reject: "Refuse it",
@@ -5463,7 +5493,11 @@ function isAskPick(x: unknown): x is AskPick {
 	if (x === "explain") return true;
 	if (typeof x === "object" && x !== null && "view" in x) return typeof x.view === "number";
 	if (typeof x !== "object" || x === null || !("allow" in x)) return false;
-	if (x.allow === true) return !("remember" in x) || x.remember === undefined || x.remember === true;
+	if (x.allow === true) {
+		const rem = !("remember" in x) || x.remember === undefined || x.remember === true;
+		const inv = !("invite" in x) || x.invite === undefined || x.invite === true;
+		return rem && inv && !("remember" in x && x.remember && "invite" in x && x.invite);
+	}
 	return x.allow === false && (!("reason" in x) || x.reason === undefined || typeof x.reason === "string");
 }
 
@@ -5588,7 +5622,7 @@ export function buildApproveDialog(
 		root.addChild(new Spacer(1));
 		root.addChild(new Text(theme.fg("text", spec.question), 1, 0));
 		const grant = spec.variant === "grant";
-		const choices: AskOption[] = grant ? ["yes", "reject", "no"] : ["yes", ...(spec.remember ? ["always" as const] : []), "no", ...(spec.explain ? ["explain" as const] : [])];
+		const choices: AskOption[] = grant ? ["yes", "reject", "no"] : ["yes", ...(spec.remember ? ["always" as const] : []), ...(spec.invite ? ["invite" as const] : []), "no", ...(spec.explain ? ["explain" as const] : [])];
 		const labelOf = (c: AskOption): string => (grant ? GRANT_LABELS[c] : undefined) ?? ASK_LABELS[c];
 		const rowLabel = grant ? GRANT_LABELS.no! : "No";
 		const rowPrefix = grant ? `${GRANT_LABELS.no}: ` : "No, ";
@@ -5602,6 +5636,7 @@ export function buildApproveDialog(
 		const resolve = (c: AskOption): void => {
 			if (c === "yes") done({ allow: true });
 			else if (c === "always") done({ allow: true, remember: true });
+			else if (c === "invite") done({ allow: true, invite: true });
 			else if (c === "reject") done({ allow: false });
 			else if (c === "no") {
 				const reason = noReason();
@@ -5800,22 +5835,23 @@ export function buildApproveDialog(
 			kids.push(tn("rule", undefined, undefined, "divider"));
 			// Selectable rows; Explain is a bar button on the native surfaces, never a row.
 			const rows = choices.filter((c) => c !== "explain").map((c) => ({ id: c, label: labelOf(c), detail: (grant ? GRANT_DETAILS[c] : undefined) ?? ASK_DETAILS[c] }));
-			// Radio cards (a list item is one text line; a card gives each choice room and a selected state).
+			// Radio cards in two columns (a list item is one text line; a card gives each choice a selected state). Paired cards get an equal `basis` (grow alone sizes by content); an odd last card spans the row.
+			const cards = rows.map((row, n) =>
+				tn(
+					"card",
+					{ grow: 1, ...(n < rows.length - (rows.length % 2) ? { basis: 0.5 } : {}), selected: choices[index] === row.id, actions: { click: "select", dblclick: "activate" } },
+					[
+						tnProse(radioLabel(radio, row.label, choices[index] === row.id).map((s, i) => (i === 1 && choices[index] === row.id ? { ...s, s: "strong" } : s))),
+						tnProse([{ t: row.detail, s: "muted" }]),
+					],
+					row.id,
+				),
+			);
 			kids.push(
 				tn(
 					"col",
 					{ gap: "xs" },
-					rows.map((row) =>
-						tn(
-							"card",
-							{ selected: choices[index] === row.id, actions: { click: "select", dblclick: "activate" } },
-							[
-								tnProse(radioLabel(radio, row.label, choices[index] === row.id).map((s, i) => (i === 1 && choices[index] === row.id ? { ...s, s: "strong" } : s))),
-								tnProse([{ t: row.detail, s: "muted" }]),
-							],
-							row.id,
-						),
-					),
+					Array.from({ length: Math.ceil(cards.length / 2) }, (_, i) => tn("row", { gap: "xs", align: "stretch" }, cards.slice(i * 2, i * 2 + 2), `pair${i}`)),
 					"choices",
 				),
 			);
@@ -7125,9 +7161,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Verdict -> UI (this extension's single verdict presentation point): look up the template by source x degraded, text is
 	 *  byte-identical to before the refactor. Notifications on the protected-path branch never carry path plaintext or the action line
 	 *  (PP-6: notifications and block reason flow back into the agent context). */
-	async function presentVerdict(v: Verdict, call: { toolName: string; input: Record<string, unknown> }, action: string, ui: UiContext, opts: { label: string | null; signal?: AbortSignal; ctx: ExtensionContext }): Promise<{ block: true; reason: string } | undefined | "aborted"> {
+	async function presentVerdict(v: Verdict, call: { toolName: string; input: Record<string, unknown> }, action: string, ui: UiContext, opts: { label: string | null; signal?: AbortSignal; ctx: ExtensionContext; callId?: string }): Promise<{ block: true; reason: string } | undefined | "aborted"> {
 		const note = (msg: string, level: "info" | "warning" | "error"): void => ui.notify(opts.label ? msg.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : msg, level);
 		const titled = (t: string): string => (opts.label ? t.replace(/^🛡️ /u, `🛡️ [${opts.label}] `) : t);
+		// PR-10: root sessions only (subagents cannot call verdict_grant); without a call id the invitation cannot be delivered
+		const invite = v.approvalKey !== undefined && opts.label === null && opts.callId !== undefined;
+		const noteInvite = (d: { allow: boolean; invite?: true }): void => {
+			if (d.allow && d.invite && opts.callId !== undefined) state.noteInvite(opts.callId, grantInvitationText(call.toolName, v.grantScope ?? { rules: [], paths: false }));
+		};
 		if (v.verdict === "allow") {
 			if (v.remembered) {
 				// PR-9: silent like mechanical allows (PR-3); no action line for gate hits (PP-6)
@@ -7185,6 +7226,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				detail: v.detail ?? "(see pi-verdict.json)",
 				question: "Allow this access?",
 				remember: v.approvalKey !== undefined,
+				invite,
 				jev: null,
 				minConfidence: null,
 				nerdFont: state.userRules.footer === "full",
@@ -7192,6 +7234,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			}, { signal: opts.signal });
 			if (d === "aborted") return "aborted";
 			if (d.allow && d.remember && v.approvalKey) rememberApproval(v.approvalKey, call.toolName, opts.ctx, note);
+			noteInvite(d);
 			if (d.allow) {
 				// debug notify carries no action line: same as above, notifications must not carry protected-path plaintext
 				if (isDebug()) note("🛡️ allow (protected-path confirm)", "info");
@@ -7210,6 +7253,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			question: "Allow execution?",
 			...(v.files ? { files: v.files } : {}),
 			remember: v.approvalKey !== undefined,
+			invite,
 			jev: v.source === "classifier" ? parseJevReason(v.reason) : null,
 			minConfidence: state.userRules.confidenceThreshold,
 			nerdFont: state.userRules.footer === "full",
@@ -7217,6 +7261,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		}, { signal: opts.signal, ...(v.noExplain ? {} : { explain: (question: string | null) => explainAsk(opts.ctx, call, action, reasonLine, question) }) });
 		if (d === "aborted") return "aborted";
 		if (d.allow && d.remember && v.approvalKey) rememberApproval(v.approvalKey, call.toolName, opts.ctx, note);
+		noteInvite(d);
 		return d.allow ? undefined : { block: true, reason: blockedReason("user-declined", declineDetail("user declined", d.reason) + (v.missingContext ? GATED_TOOL_HINT : "")) };
 	}
 
@@ -9123,7 +9168,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 							const reasonLine = `Classifier opinion: ${opinion}`;
 							const d = await confirmAsk(
 								ctx.ui,
-								{ ...askBase, toolName: "bash", input, action, reasonLine, jev: parseJevReason(opinion), minConfidence: 70, remember: true, fallbackMessage: `${action}\n\n${reasonLine}\n\nAllow execution?` },
+								{ ...askBase, toolName: "bash", input, action, reasonLine, jev: parseJevReason(opinion), minConfidence: 70, remember: true, invite: true, fallbackMessage: `${action}\n\n${reasonLine}\n\nAllow execution?` },
 								{
 									explain: async (q) => ({
 										ok: true,
@@ -9757,11 +9802,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 
 	// Verdict label after the block: a separate transcript row (pi: TUI-only custom entry; omp: aside custom message, model-visible). Rule-allow labels are recorded but not rendered (pi: renderer yields nothing; omp: display:false).
-	// No reason text, no path (PP-6). The result content stays untouched.
+	// No reason text, no path (PP-6). The result content stays untouched except for a PR-10 grant invitation appended as a text block.
 	pi.on("tool_result", (event) => {
 		const l = typeof event.toolCallId === "string" ? state.takeLabel(event.toolCallId) : undefined;
 		if (l && labelSink) labelSink(l);
-		return undefined;
+		const invite = typeof event.toolCallId === "string" ? state.takeInvite(event.toolCallId) : undefined;
+		if (invite === undefined) return undefined;
+		return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text" as const, text: invite }] };
 	});
 
 	// GR-7: brief the acting agent on the gate every turn (pi: systemPrompt string; omp: string[] of sections, chained).
@@ -9864,7 +9911,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		type Presented = { block: true; reason: string } | undefined | "aborted";
 		const present = async (signal?: AbortSignal): Promise<Presented> => {
 			try {
-				return await presentVerdict(verdict, call, action, ui ?? ctx.ui, { label, signal, ctx });
+				return await presentVerdict(verdict, call, action, ui ?? ctx.ui, { label, signal, ctx, callId });
 			} catch (err) {
 				if (verdict.pendingAudit) state.audit?.append(verdict.pendingAudit);
 				throw err;

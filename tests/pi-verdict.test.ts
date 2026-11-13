@@ -5837,6 +5837,79 @@ describe("remembered approval (PR-9)", () => {
 	});
 });
 
+describe("grant invitation (PR-10)", () => {
+	const { DOWN } = MENU;
+	const ASK = { text: "<verdict>ask</verdict> needs a human" };
+	const LABEL = "Yes, and grant similar operations…";
+	const SENS = path.join(TMP_AGENT, "sensitive-pr10");
+	fs.mkdirSync(SENS, { recursive: true });
+	const result = (h: Harness, id: string) => h.handlers.tool_result({ toolCallId: id, toolName: "bash", content: [{ type: "text", text: "out" }], isError: false }, h.ctx);
+
+	test("invite row on a gray ask: call allowed, invitation appended to its result, not remembered", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		const rendered: string[] = [];
+		driveDialogs(h, [[DOWN, DOWN, "\r"]], rendered);
+		expect(await toolCall(h, "bash", { command: "cargo build" }, "c1")).toBeUndefined();
+		expect(rendered[0]).toContain(LABEL);
+		const r = await result(h, "c1");
+		expect(r.content[0].text).toBe("out");
+		expect(r.content[1].text).toContain("verdict_grant");
+		expect(r.content[1].text).toContain('"request"');
+		expect(await result(h, "c1")).toBeUndefined();
+		driveDialogs(h, [["\r"]], rendered);
+		expect(await toolCall(h, "bash", { command: "cargo build" }, "c2")).toBeUndefined();
+		expect(rendered).toHaveLength(2);
+		expect(h.calls).toHaveLength(2);
+	});
+
+	test("plain Yes leaves the result untouched", async () => {
+		const h = session({});
+		h.responses = [ASK];
+		driveDialogs(h, [["\r"]], []);
+		expect(await toolCall(h, "bash", { command: "cargo build" }, "c1")).toBeUndefined();
+		expect(await result(h, "c1")).toBeUndefined();
+	});
+
+	test("danger-rule ask: invitation names the rule ids; protected-path ask: asks for paths without plaintext", async () => {
+		const h = session({ dangerRules: { "make-deploy": { pattern: "\\bmake\\s+deploy\\b", action: "ask" } }, denyPaths: [SENS] });
+		driveDialogs(h, [[DOWN, DOWN, "\r"]], []);
+		expect(await toolCall(h, "bash", { command: "make deploy" }, "d1")).toBeUndefined();
+		const rule = (await result(h, "d1")).content[1].text as string;
+		expect(rule).toContain("make-deploy");
+		expect(rule).not.toContain("protected path(s)");
+		driveDialogs(h, [[DOWN, DOWN, "\r"]], []);
+		expect(await toolCall(h, "read", { path: path.join(SENS, "secret.md") }, "p1")).toBeUndefined();
+		const prot = (await result(h, "p1")).content[1].text as string;
+		expect(prot).toContain("protected path(s)");
+		expect(prot).not.toContain(SENS);
+	});
+
+	test("subagents and the grant dialog never show the invite row", async () => {
+		const root = session({ subagentGate: "normal" });
+		await root.handlers["session_start"]({}, root.ctx);
+		const rendered: string[] = [];
+		driveDialogs(root, [["\r"]], rendered);
+		const r = await root.tools.verdict_grant.execute("t1", { action: "request", request: "deploy to staging" }, undefined, undefined, root.ctx);
+		expect(r.content[0].text.startsWith("Approved by the user")).toBe(true);
+		expect(rendered[0]).not.toContain(LABEL);
+		driveDialogs(root, [["\r"]], rendered);
+		const sub = makeHarness();
+		sub.install();
+		sub.ctx.agent = { kind: "sub", id: "Scout1", name: "scout" };
+		sub.ctx.hasUI = false;
+		try {
+			sub.responses = [ASK];
+			expect(await toolCall(sub, "bash", { command: "cargo build" }, "s1")).toBeUndefined();
+			expect(rendered).toHaveLength(2);
+			expect(rendered[1]).not.toContain(LABEL);
+			expect(await result(sub, "s1")).toBeUndefined();
+		} finally {
+			await root.handlers["session_shutdown"]({}, root.ctx);
+		}
+	});
+});
+
 describe("gate briefing (GR-7)", () => {
 	const BASE = "You are a coding agent.";
 	const HEADER = "## Permission gate (pi-verdict)";
@@ -6166,7 +6239,9 @@ describe("Tern-native UI (TSP)", () => {
 					(c) => {
 						const tree = c.describe!(cx) as Tree;
 						const list = rows(tree).find((n) => n.key === "choices")!;
-						const [first, second] = list.c as Card[];
+						// Cards sit two per row (`pairN` rows) under `choices`; the test-local tree type is asserted once here.
+						const pairs: Array<{ c: Card[] }> = list.c as Array<{ c: Card[] }>;
+						const [first, second] = pairs.flatMap((pair) => pair.c);
 						expect(first.p.selected).toBe(true);
 						expect(first.c[0].p.spans[0].t.startsWith("◉")).toBe(true);
 						expect(second.p.selected).toBe(false);

@@ -579,6 +579,7 @@ Pinned by: notifyAllows (#60) › notifyAllows: one classifier-allow notificatio
 
 An ask presents a dialog with Yes, No and (when allowed, PP-9) Explain…. While highlighted, No is an inline text field: non-empty text is sanitized to a single line and forwarded to the agent in the block reason as `, saying: "<text>"`; empty text or Escape declines plainly. A decline blocks with tag `user-declined`. Hosts without the rich dialog get a plain yes/no confirm. Dialogs are serialized process-wide. The dialog shows the code under review and, for a jev ask, its probability bar and concern.
 With PR-9 the dialog's second row is "Yes, and don't ask again this session" (never in the permission-grant dialog).
+With PR-10 a third row, "Yes, and grant similar operations…", follows it in root sessions.
 
 Why: not recorded.
 Code: `confirmAsk`, `buildApproveDialog`, `declineDetail`
@@ -625,6 +626,14 @@ Every interactive ask dialog except the permission-grant dialog offers "Yes, and
 Why: repeated identical calls (a build, a test run) otherwise prompt every time; keying on the origin keeps a later deny rule, `denyPaths` entry or built-in ask from being bypassed by an earlier approval.
 Code: `approvalKey`, `SessionState.rememberApproval`, `adjudicate`, `presentVerdict`
 Pinned by: remembered approval (PR-9) › remember row on a gray ask: identical call skips classifier and dialog; remembered approval (PR-9) › plain Yes is not remembered; remembered approval (PR-9) › protected-path ask offers the row; remembered without leaking the path; remembered approval (PR-9) › grant dialog has no remember row; remembered approval (PR-9) › applies in unattended: the identical call passes without a classifier call; remembered approval (PR-9) › rule deny wins outside supervised; the key carries the ask origin; remembered approval (PR-9) › built-in ask: remembered in auto, still passes in unattended for the exact call only; remembered approval (PR-9) › /automode forget clears the count and the call asks again; remembered approval (PR-9) › session_start forgets
+
+#### PR-10: Grant invitation
+
+In a root session every interactive ask dialog that offers the PR-9 row (never the permission-grant dialog; subagent asks and calls without a tool call id get no row) also offers "Yes, and grant similar operations…" after it. Choosing it allows the call exactly like Yes and stores no remembered approval. The gate then appends one text block to that call's tool result: an invitation for the agent to call `verdict_grant` with action `request` for the kind of operation approved, as narrow as the current work needs. The text names the tool and the danger-rule ids the call hit; when the call touched a protected path, a `.omp` directory or a path tier it asks the agent to list the touched protected path(s) in `paths` without naming them (PP-6). The grant itself is created only through the normal grant dialog (GR-2), where the user can approve, narrow or reject it.
+
+Why: a user who keeps approving the same kind of call wants a standing permission; letting the agent draft the scope through the existing grant flow keeps one place (GR-2) where grants are reviewed.
+Code: `grantInvitationText`, `SessionState.noteInvite`, `SessionState.takeInvite`, `adjudicate` (`grantScope`), `presentVerdict`, `buildApproveDialog`
+Pinned by: grant invitation (PR-10) › invite row on a gray ask: call allowed, invitation appended to its result, not remembered; grant invitation (PR-10) › plain Yes leaves the result untouched; grant invitation (PR-10) › danger-rule ask: invitation names the rule ids; protected-path ask: asks for paths without plaintext; grant invitation (PR-10) › subagents and the grant dialog never show the invite row
 
 ## SG: Subagent gate
 
