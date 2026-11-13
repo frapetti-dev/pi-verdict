@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 - **Grant invitation** ([PR-10](docs/adjudication-rules.md#pr-10-grant-invitation)): in the root session, every interactive ask dialog that offers the PR-9 row also offers "Yes, and grant similar operations…" (never in the permission-grant dialog or for subagent asks). It runs the call like Yes (no remembered approval is stored) and appends a text block to that call's tool result telling the agent to call `verdict_grant` with action `request` for the kind of operation just approved; the user still reviews or narrows the scope in the grant dialog (GR-2), so nothing is granted without it. The text names the tool and the danger-rule ids the call hit and, for protected-path, `.omp` gate and path-tier asks, asks the agent to list the touched protected path(s) in `paths` without ever naming them (PP-6). `Verdict` gains `grantScope`, `AskDecision` gains `invite`, `SessionState` gains `noteInvite` / `takeInvite`, and `grantInvitationText` is exported.
 
+### Changed
+
+- Tern-native ask and grant dialogs lay the choice cards out in two columns (pairs of cards per `pairN` row under `choices`; an odd last card spans the row) instead of one card per line, so the dialog takes about half the height now that the PR-10 row adds a fourth choice. Keyboard, click and double-click behavior is unchanged.
+
 ## [0.26.0] - 2026-11-10
 
 ### Added
@@ -30,7 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ### Changed
 
 - Tern-native ask dialog overlay width is now `"95%"` (was `"90%"`) so code reads with less wrapping; other medium dialogs keep `"60%"`.
-- Tern-native ask and grant dialogs lay the choice cards out in two columns (pairs of cards per `pairN` row under `choices`; an odd last card spans the row) instead of one card per line, so the dialog takes about half the height now that the PR-10 row adds a fourth choice. Keyboard, click and double-click behavior is unchanged.
 - The collapsed code preview in the ask dialog shows 8 lines (6 head + 2 tail) / 800 chars instead of 40 / 4000; the full text is one **View** away. The EXPLAIN-GATE action detail keeps the previous 40 line / 4000 char budget.
 - Remembered approvals and the shadow cache are keyed with the file-context digest ([SC-6](docs/adjudication-rules.md#sc-6-digest-in-approval-and-shadow-keys)): editing a script (or a file the call cited) invalidates the remembered approval of the command that runs it. `approvalKey` and `shadowCommandKey` take a digest argument (`""` when there is no file context); `AskPick` gains `{ view: number }` (an ask dialog asking to open a block, handled inside `confirmAsk`).
 - [PP-2](docs/adjudication-rules.md#pp-2-candidate-extraction) no longer says external script contents are never read: the extractor still does not read scripts, but local scripts reach the classifier as file context. `CS-6` shadow mode no longer applies to calls that carry file context.
