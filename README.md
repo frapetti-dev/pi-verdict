@@ -115,6 +115,7 @@ A minimal config (the first run writes a fuller starter template, including a st
 - `allow`/`deny` are JS regex arrays tested against the full command string (command tools) or the resolved path (file tools); **`deny` wins over `allow`**, both beat the classifier ([RL-2](docs/adjudication-rules.md#rl-2-evaluation-order), [RL-4](docs/adjudication-rules.md#rl-4-user-regexes)).
 - `denyPaths` are plain paths you declare **protected**: any touch triggers a terminal ask you adjudicate (non-interactive → deny). The classifier never learns the paths themselves, only that they exist ([PP-5](docs/adjudication-rules.md#pp-5-hit-is-a-terminal-ask), [PP-6](docs/adjudication-rules.md#pp-6-plaintext-confinement), [PP-7](docs/adjudication-rules.md#pp-7-existence-hint)).
 - There is no built-in **command** allowlist — every "always allow" claim for a command is yours ([why](docs/configuration.md#why-no-built-in-command-allowlist)); path grading does mechanically allow non-sensitive reads and in-project writes ([PG-4](docs/adjudication-rules.md#pg-4-reads), [PG-5](docs/adjudication-rules.md#pg-5-writes)).
+- Other installed extensions can contribute pre-approved tools, classifier rules, custom danger rules and `denyPaths` over the `pi.events` bus; they apply as the lowest config layer, show in `/automode status` (counts only), and you can opt out with `ignoreContributions` ([EX-1–EX-4](docs/adjudication-rules.md#ex-extension-contributions), [protocol and example](docs/configuration.md#extension-contributions)).
 
 Every key with its default, the approval modes, scopes (`session` > `local` > `global`), project trust, thresholds, the fallback cascade, the subagent gate, audit and the settings menus are in [docs/configuration.md](docs/configuration.md); the normative rules are in [docs/adjudication-rules.md](docs/adjudication-rules.md).
 
@@ -168,7 +169,7 @@ tool_call
   │     │   the classifier sees an existence hint only
   │     │   a permission grant that lists the path can lift the ask (grant coverage check:
   │     │   judge + fallback must both confirm the call is within the grant)
-  │     ├─ your allow rules / tools allowlist / settings tool / grant tool / gated-execution tool → allow
+  │     ├─ your allow rules / tools allowlist (+ tools contributed by extensions) / settings tool / grant tool / gated-execution tool → allow
   │     └─ no built-in command allowlist — every "always allow" claim for a command is yours
   │
   ├─ 2. Gray zone → model classifier (defaults to session model — "self-reflection")

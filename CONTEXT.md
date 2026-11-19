@@ -353,6 +353,10 @@ Rules: [CF-5](docs/adjudication-rules.md#cf-5-session-scope)
 The entries a session appends to the merged allow, deny, denyPaths, tools and rules lists.
 Rules: [CF-5](docs/adjudication-rules.md#cf-5-session-scope)
 
+**Contribution**:
+The tools, classifier rules, custom danger rules and `denyPaths` that another extension offers to the gate over the extension event bus; applied as the lowest configuration layer and identified by its source name.
+Rules: [EX-1](docs/adjudication-rules.md#ex-1-protocol), [EX-3](docs/adjudication-rules.md#ex-3-layering-and-opt-out)
+
 **Project trust**:
 The user's recorded decision whether a project's config may be applied.
 Rules: [CF-3](docs/adjudication-rules.md#cf-3-project-discovery-and-trust)

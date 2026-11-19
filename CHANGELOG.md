@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+
+- **Extension contributions** ([EX-1–EX-4](docs/adjudication-rules.md#ex-extension-contributions)): other extensions can contribute `tools` (mechanical allow), classifier `rules`, custom `dangerRules` (id `<source>-<id>`, action `deny` or `ask`) and `denyPaths` over the host's `pi.events` bus. pi-verdict emits `pi-verdict:collect` in `session_start` right before the rules reset; a contributor answers with `pi-verdict:contribute` (payload `{source, tools?, rules?, denyPaths?, dangerRules?}`), and a contribution emitted later applies immediately. Payloads are validated atomically (invalid ones are rejected whole and reported as warnings), the same `source` replaces its previous contribution, an empty payload withdraws it. Contributions are the lowest config layer (user, project and session `dangerRules` can re-action or remove a contributed rule), apply without a prompt, and are listed by `/automode status` with counts only; contributed `denyPaths` keep the PP-6 non-disclosure rule. The new config key `ignoreContributions` (`true` or a list of source names; global or project file only, not editable through `verdict_settings`) opts out. A host without `pi.events` leaves the feature inert.
+
 ## [0.27.0] - 2026-11-13
 
 ### Added

@@ -12,6 +12,7 @@ import * as path from "node:path";
 import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, buildChoiceScreen, collectProjectContext, declineDetail, detectLocalScripts, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, grantLine, grantRevokeScreen, grantsScreen, renderFooter, renderJevBar, resolveAgentDir, RULE_SAVE_CHOICE, ruleReviewScreen, ruleSaveScreen, SessionState, settingsChangeScreen, settingValueLines, statusNode, trustScreen, verdictLabelNode, type ChoiceScreenSpec } from "../extensions/pi-verdict.ts";
 import { prettyJson, prettyShell } from "../extensions/pi-verdict.ts";
 import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
+import { COLLECT_CHANNEL, CONTRIBUTE_CHANNEL } from "../extensions/pi-verdict.ts";
 
 // ── Stub infrastructure ─────────────────────────────────
 
@@ -64,6 +65,8 @@ interface Harness {
 	entryRenderers: Record<string, any>;
 	/** `pi.registerTool` definitions by name */
 	tools: Record<string, ToolDefinitionStub>;
+	/** Extension event bus shared by every listener of this harness (`pi.events`): synchronous dispatch, no replay. */
+	events: { emit: (channel: string, data: unknown) => void; on: (channel: string, fn: (data: unknown) => void) => () => void };
 	install: (opts?: { verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }>; ompHost?: boolean }) => void;
 	/** Sets a CLI flag value after install, as pi/omp do once the extension factory has loaded. */
 	setFlag: (name: string, value: unknown) => void;
@@ -85,6 +88,11 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 	const entryRenderers: Record<string, any> = {};
 	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectTitles: [] as string[], selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined, roles: undefined, ompAgentDir: undefined, ompReloads: 0 };
 	h.widgetSets = widgetSets;
+	const bus = new Map<string, Set<(d: unknown) => void>>();
+	h.events = {
+		emit: (c: string, d: unknown) => { for (const f of bus.get(c) ?? []) f(d); },
+		on: (c: string, f: (d: unknown) => void) => { (bus.get(c) ?? bus.set(c, new Set()).get(c)!).add(f); return () => bus.get(c)?.delete(f); },
+	};
 	const tools: Record<string, ToolDefinitionStub> = {};
 	h.tools = tools;
 	const rolesEnabled = opts?.roles === true; // install()'s own `opts` shadows this function's
@@ -137,6 +145,7 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 		const prev = process.env.PI_AUTO_MODE_DEBUG;
 		if (opts?.debug) process.env.PI_AUTO_MODE_DEBUG = "1"; else delete process.env.PI_AUTO_MODE_DEBUG;
 		autoMode({
+			events: h.events,
 			registerFlag: (n: string, d: any) => { if (!(n in flags)) flags[n] = d.default; },
 			getFlag: (n: string) => flags[n],
 			on: (e: string, fn: any) => { handlers[e] = fn; },
@@ -7069,5 +7078,161 @@ describe("project trust from the settings menus (CF-3)", () => {
 				fs.rmSync(trustFile(), { force: true });
 			}
 		});
+	});
+});
+
+// ── Extension contributions (EX-1–EX-4) ─────────────────────────────────────
+describe("extension contributions (EX-1–EX-4)", () => {
+	const SENS = path.join(TMP_AGENT, "acme-sensitive");
+	beforeAll(() => {
+		fs.mkdirSync(SENS, { recursive: true });
+		fs.writeFileSync(path.join(SENS, "secret.md"), "secret");
+	});
+
+	/** A contributor extension: answers every COLLECT with `payload` (registered before the session starts). */
+	const contribute = (h: Harness, payload: unknown) => h.events.on(COLLECT_CHANNEL, () => h.events.emit(CONTRIBUTE_CHANNEL, payload));
+	const start = (h: Harness) => h.handlers.session_start({}, h.ctx);
+	const lastNotify = (h: Harness) => h.notifies[h.notifies.length - 1][0];
+
+	test("collected tool is allowed without a classifier call", async () => {
+		const h = session({});
+		contribute(h, { source: "acme", tools: ["acme_deploy"] });
+		await start(h);
+		expect(await toolCall(h, "acme_deploy", {})).toBeUndefined();
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("contributed danger rule blocks; user config can re-action it", async () => {
+		const payload = { source: "acme", dangerRules: { "prod-delete": { pattern: "\\bkubectl\\s+delete\\b" } } };
+		const h = session({});
+		contribute(h, payload);
+		await start(h);
+		const r = await toolCall(h, "bash", { command: "kubectl delete pod x" });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).toContain("extension acme");
+		expect(h.calls).toHaveLength(0);
+
+		const h2 = session({ dangerRules: { "acme-prod-delete": "allow" } });
+		h2.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		contribute(h2, payload);
+		await start(h2);
+		await toolCall(h2, "bash", { command: "kubectl delete pod x" });
+		expect(h2.calls).toHaveLength(1);
+	});
+
+	test("contributed denyPaths ask without disclosing the path", async () => {
+		const h = session({});
+		h.confirmAnswer = false;
+		contribute(h, { source: "acme", denyPaths: [SENS] });
+		await start(h);
+		const r = await toolCall(h, "read", { path: path.join(SENS, "secret.md") });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).not.toContain("acme-sensitive");
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("contributed classifier rule reaches the prompt", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		contribute(h, { source: "acme", rules: ["deploys are fine"] });
+		await start(h);
+		await toolCall(h, "bash", { command: "echo hi" });
+		expect(h.calls[0].systemPrompt).toContain("[extension acme] deploys are fine");
+	});
+
+	test("ignoreContributions drops a source", async () => {
+		setConfig({});
+		const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
+		fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf8")), ignoreContributions: ["acme"] }));
+		const h = makeHarness();
+		h.install();
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		contribute(h, { source: "acme", tools: ["acme_deploy"] });
+		await start(h);
+		await toolCall(h, "acme_deploy", {});
+		expect(h.calls).toHaveLength(1);
+		await h.commands.automode.handler("status", h.ctx);
+		expect(lastNotify(h)).toContain("extension acme:");
+		expect(lastNotify(h)).toContain("(ignored)");
+	});
+
+	test("invalid payload is rejected whole and reported", async () => {
+		const h = session({});
+		contribute(h, { source: "acme", tools: ["acme_deploy"], dangerRules: { x: { pattern: "a", action: "allow" } } });
+		contribute(h, { source: "git", dangerRules: { "push-force": { pattern: "a" } } });
+		await start(h);
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("contribution acme") && m.includes("contribution git"))).toBe(true);
+		const r = await toolCall(h, "bash", { command: "git push " + "--force" });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).not.toContain("extension git");
+		h.responses = [{ text: "<verdict>deny</verdict> no" }];
+		await toolCall(h, "acme_deploy", {}); // rejected whole: the tool was not allow-listed
+		expect(h.calls).toHaveLength(1);
+	});
+
+	test("late contribution and withdrawal apply immediately", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		await start(h);
+		h.events.emit(CONTRIBUTE_CHANNEL, { source: "acme", tools: ["late_tool"] });
+		expect(await toolCall(h, "late_tool", {})).toBeUndefined();
+		expect(h.calls).toHaveLength(0);
+		h.events.emit(CONTRIBUTE_CHANNEL, { source: "acme" });
+		await toolCall(h, "late_tool", {});
+		expect(h.calls).toHaveLength(1);
+	});
+
+	const patchConfig = (extra: Record<string, unknown>) => {
+		const p = path.join(TMP_AGENT, "config", "pi-verdict.json");
+		fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf8")), ...extra }));
+	};
+	const KUBECTL = { source: "acme", tools: ["acme_deploy"], dangerRules: { "prod-delete": { pattern: "\\bkubectl\\s+delete\\b" } } };
+
+	test("ignoreContributions true ignores every source", async () => {
+		setConfig({});
+		patchConfig({ ignoreContributions: true });
+		const h = makeHarness();
+		h.install();
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		contribute(h, KUBECTL);
+		await start(h);
+		await toolCall(h, "bash", { command: "kubectl delete pod x" });
+		expect(h.calls).toHaveLength(1); // no contributed rule: straight to the classifier
+	});
+
+	test("malformed ignoreContributions is reported and contributions stay active", async () => {
+		setConfig({});
+		patchConfig({ ignoreContributions: "acme" });
+		const h = makeHarness();
+		h.install();
+		contribute(h, KUBECTL);
+		await start(h);
+		expect(h.notifies.some(([m, l]) => l === "warning" && m.includes("ignoreContributions"))).toBe(true);
+		const r = await toolCall(h, "bash", { command: "kubectl delete pod x" });
+		expect(r?.block).toBe(true);
+	});
+
+	test("contributed danger rule stays active under builtinDenyFloor false", async () => {
+		const h = session({ builtinDenyFloor: false });
+		contribute(h, KUBECTL);
+		await start(h);
+		const r = await toolCall(h, "bash", { command: "kubectl delete pod x" });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).toContain("extension acme");
+	});
+
+	test("/verdict built-in rules page shows a contributed rule inheriting its contributed action, not off", async () => {
+		const h = session({});
+		contribute(h, KUBECTL);
+		await start(h);
+		const after: string[] = [];
+		driveMenu(h, [...times(9, MENU.DOWN), MENU.ENTER], [], after);
+		await h.commands.verdict.handler("session", h.ctx);
+		const page = after[after.length - 1];
+		expect(page).toContain("acme-prod-delete");
+		const row = page.split("\n").find((l) => l.includes("acme-prod-delete")) ?? "";
+		expect(row).toMatch(/inherit/);
+		expect(row).toContain("deny");
+		expect(row).not.toContain("off");
 	});
 });

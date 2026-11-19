@@ -517,9 +517,11 @@ interface UserRules {
 	grantStatus: boolean;
 	/** Root rule: the single baseline classifier policy (config key "rootRule"); highest scope wins wholesale; null = none. */
 	rootRule: RootRuleConfig | null;
+	/** Sources of the extension contributions applied by this load (EX-3). */
+	contributionSources: string[];
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, dangerRules: DEFAULT_DANGER_RULES(), pathRules: { ...PATH_TIER_DEFAULTS }, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", modeStatus: true, grantStatus: true, confidenceThreshold: null, autoDenyThreshold: null, autoAllowThreshold: null, unattendedDenyThreshold: null, supervisedAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, mode: "auto", unattendedDenyPaths: "deny", unattendedOmpDir: "deny", classifierRules: [], rootRule: null };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, dangerRules: DEFAULT_DANGER_RULES(), pathRules: { ...PATH_TIER_DEFAULTS }, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", modeStatus: true, grantStatus: true, confidenceThreshold: null, autoDenyThreshold: null, autoAllowThreshold: null, unattendedDenyThreshold: null, supervisedAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, mode: "auto", unattendedDenyPaths: "deny", unattendedOmpDir: "deny", classifierRules: [], rootRule: null, contributionSources: [] };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -754,7 +756,7 @@ function pruneSessionOverrides(): void {
 const DEFAULT_ALLOWED_TOOLS = ["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"];
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. dangerRules: per-id action for built-in danger rules (\"deny\" | \"ask\" | \"allow\" = classifier decides), false removes a rule, {\"pattern\",\"action\",\"reason\",\"flags\"} adds a custom rule; pathRules: action per path tier (s0-secret, s1-system-read, s1-system-write, s2-user-rc-write, s3-git-meta-write); entries merge per id across global, project and session. builtinDenyFloor=false sets every built-in rule to allow (classifier decides) at your own risk; custom rules stay active. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: auto (deny/ask/allow) | unattended (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | supervised (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. autoDenyThreshold/autoAllowThreshold, unattendedDenyThreshold, supervisedAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). unattendedDenyPaths/unattendedOmpDir (deny|allow): what unattended does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status). modeStatus (default true): approval-mode chip (🛡 AUTO / 🌙 UNATT / 👁 SUPV / ⚠ OFF) in the prompt status bar — on omp it appears in the status line's \"status\" segment; hidden on pi while the footer is on (the footer already shows the mode). grantStatus (default true): active permission-grant count (🔑 N) in the prompt status bar; hidden when there are none, and on pi while the footer is on. rootRule: the root rule — one baseline policy for the classifier, drafted with /automode-setup ({text, strictness: relaxed|balanced|strict, history, codebase, clarifications}); the highest scope that sets it wins as a whole; classification rules apply on top of it.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. dangerRules: per-id action for built-in danger rules (\"deny\" | \"ask\" | \"allow\" = classifier decides), false removes a rule, {\"pattern\",\"action\",\"reason\",\"flags\"} adds a custom rule; pathRules: action per path tier (s0-secret, s1-system-read, s1-system-write, s2-user-rc-write, s3-git-meta-write); entries merge per id across global, project and session. builtinDenyFloor=false sets every built-in rule to allow (classifier decides) at your own risk; custom rules stay active. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: auto (deny/ask/allow) | unattended (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | supervised (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. autoDenyThreshold/autoAllowThreshold, unattendedDenyThreshold, supervisedAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). unattendedDenyPaths/unattendedOmpDir (deny|allow): what unattended does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status). modeStatus (default true): approval-mode chip (🛡 AUTO / 🌙 UNATT / 👁 SUPV / ⚠ OFF) in the prompt status bar — on omp it appears in the status line's \"status\" segment; hidden on pi while the footer is on (the footer already shows the mode). grantStatus (default true): active permission-grant count (🔑 N) in the prompt status bar; hidden when there are none, and on pi while the footer is on. rootRule: the root rule — one baseline policy for the classifier, drafted with /automode-setup ({text, strictness: relaxed|balanced|strict, history, codebase, clarifications}); the highest scope that sets it wins as a whole; classification rules apply on top of it. ignoreContributions (not in the template; global or project config only): true to ignore every extension contribution (tools, rules, danger rules, denyPaths offered by other extensions), or a list of contributor source names to ignore.",
 	allow: ["^ls\\b"],
 	deny: [],
 	tools: DEFAULT_ALLOWED_TOOLS,
@@ -973,6 +975,89 @@ function mergeRuleMaps(key: SessionMapKey, layers: unknown[], skipped: string[])
 	return out;
 }
 
+// ---- Extension contributions (EX-1–EX-4) ----
+
+export const COLLECT_CHANNEL = "pi-verdict:collect";
+export const CONTRIBUTE_CHANNEL = "pi-verdict:contribute";
+const CONTRIBUTION_SOURCE_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const CONTRIBUTION_MAX_ENTRIES = 64;
+const CONTRIBUTION_MAX_CHARS = 2000;
+const CONTRIBUTION_KEYS = ["source", "tools", "rules", "denyPaths", "dangerRules"];
+
+export interface Contribution {
+	source: string;
+	tools: string[];
+	rules: string[];
+	denyPaths: string[];
+	dangerRules: Record<string, { pattern: string; flags?: string; reason: string; action: "deny" | "ask" }>;
+}
+
+/** Validate one extension contribution payload (EX-2). Atomic: the first error rejects the whole payload. */
+export function parseContribution(data: unknown): { ok: Contribution } | { error: string } {
+	if (!isPlainObject(data)) return { error: "contribution: payload must be an object" };
+	const source = data.source;
+	if (typeof source !== "string" || !CONTRIBUTION_SOURCE_RE.test(source)) return { error: `contribution: invalid source ${JSON.stringify(source)}` };
+	const err = (m: string) => ({ error: `contribution ${source}: ${m}` });
+	for (const k of Object.keys(data)) if (!CONTRIBUTION_KEYS.includes(k)) return err(`unknown key ${k}`);
+	const list = (key: "tools" | "rules" | "denyPaths"): string[] | { error: string } => {
+		const v = data[key];
+		if (v === undefined) return [];
+		if (!Array.isArray(v)) return err(`${key}: must be an array of strings`);
+		if (v.length > CONTRIBUTION_MAX_ENTRIES) return err(`${key}: more than ${CONTRIBUTION_MAX_ENTRIES} entries`);
+		const out: string[] = [];
+		for (const x of v) {
+			if (typeof x !== "string" || !x.trim()) return err(`${key}: entries must be non-empty strings`);
+			if (x.trim().length > CONTRIBUTION_MAX_CHARS) return err(`${key}: entry longer than ${CONTRIBUTION_MAX_CHARS} characters`);
+			out.push(key === "rules" ? `[extension ${source}] ${x.trim()}` : x.trim());
+		}
+		return [...new Set(out)];
+	};
+	const tools = list("tools");
+	if ("error" in tools) return tools;
+	const rules = list("rules");
+	if ("error" in rules) return rules;
+	const denyPaths = list("denyPaths");
+	if ("error" in denyPaths) return denyPaths;
+	const dangerRules: Contribution["dangerRules"] = {};
+	const dr = data.dangerRules;
+	if (dr !== undefined) {
+		if (!isPlainObject(dr)) return err("dangerRules: must be an object");
+		const entries = Object.entries(dr);
+		if (entries.length > CONTRIBUTION_MAX_ENTRIES) return err(`dangerRules: more than ${CONTRIBUTION_MAX_ENTRIES} entries`);
+		for (const [id, v] of entries) {
+			const eff = `${source}-${id}`;
+			if (BASH_DANGER_RULES.some((r) => r.id === eff)) return err(`dangerRules.${id}: would replace built-in rule ${eff}`);
+			if (!isPlainObject(v)) return err(`dangerRules.${id}: must be an object {"pattern": …}`);
+			if (v.action !== undefined && v.action !== "deny" && v.action !== "ask") return err(`dangerRules.${id}.action: ${JSON.stringify(v.action)} (deny | ask)`);
+			const r = parseDangerRuleEntry(eff, v, new Set());
+			if ("error" in r) return err(r.error);
+			const reason = typeof v.reason === "string" && v.reason.trim() ? `${v.reason.trim()} (extension ${source})` : `danger rule from extension ${source}`;
+			dangerRules[eff] = { pattern: v.pattern as string, ...(v.flags !== undefined ? { flags: v.flags as string } : {}), reason, action: v.action === "ask" ? "ask" : "deny" };
+		}
+	}
+	return { ok: { source, tools, rules, denyPaths, dangerRules } };
+}
+
+/** Contributions left after the `ignoreContributions` config key (true | list of sources); a malformed value is reported and ignored (deny-side contributions stay). */
+function activeContributions(all: readonly Contribution[], ignore: unknown, skipped: string[]): Contribution[] {
+	if (ignore === undefined || ignore === false) return [...all];
+	if (ignore === true) return [];
+	if (Array.isArray(ignore) && ignore.every((x) => typeof x === "string")) return all.filter((c) => !ignore.includes(c.source));
+	skipped.push(`ignoreContributions: ${JSON.stringify(ignore)} (true or an array of source names)`);
+	return [...all];
+}
+
+function withContributedLists(rules: Omit<UserRules, "contributionSources">, active: readonly Contribution[]): UserRules {
+	const union = (a: string[], pick: (c: Contribution) => string[]) => [...new Set([...a, ...active.flatMap(pick)])];
+	return {
+		...rules,
+		tools: union(rules.tools, (c) => c.tools),
+		classifierRules: union(rules.classifierRules, (c) => c.rules),
+		denyPaths: union(rules.denyPaths, (c) => c.denyPaths),
+		contributionSources: active.map((c) => c.source),
+	};
+}
+
 /** Session overrides restricted to the session keys, the per-id rule maps, `rootRule` and `ruleAdditions`; anything else is reported and dropped. */
 function sanitizeSessionRaw(sessionRaw: Record<string, unknown>, skipped: string[]): Record<string, unknown> {
 	const out: Record<string, unknown> = {};
@@ -1013,7 +1098,7 @@ function settingSourcesOf(sessionKeys: string[], localKeys: string[], globalKeys
 }
 
 /** Rules when the user config is missing or unreadable: empty rules with the floor ON unless the session turns it off, session keys still applied. */
-function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[]): LoadedRules {
+function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[], contributions: readonly Contribution[] = []): LoadedRules {
 	const session = sanitizeSessionRaw(sessionRaw, skipped);
 	if (session.ruleAdditions !== undefined) skipped.push("session ruleAdditions: not applied — user config not loaded");
 	if (session.rootRule !== undefined) skipped.push("session rootRule: not applied — user config not loaded");
@@ -1035,7 +1120,7 @@ function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[])
 	if (typeof session.grantStatus === "boolean") grantStatus = session.grantStatus;
 	else if (session.grantStatus !== undefined) skipped.push(`grantStatus: ${JSON.stringify(session.grantStatus)}`);
 	return {
-		rules: {
+		rules: withContributedLists({
 			...EMPTY_RULES,
 			...parseApprovalKeys(session, skipped),
 			classifierFallbackMode: fbMode === "enforce" ? "enforce" : "shadow",
@@ -1044,9 +1129,9 @@ function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[])
 			modeStatus,
 			grantStatus,
 			footer: footerOk ? footer : EMPTY_RULES.footer,
-			dangerRules: parseDangerRules(mergeRuleMaps("dangerRules", [session.dangerRules], skipped), floorOn, skipped),
+			dangerRules: parseDangerRules(mergeRuleMaps("dangerRules", [Object.assign({}, ...contributions.map((c) => c.dangerRules)), session.dangerRules], skipped), floorOn, skipped),
 			pathRules: parsePathRules(mergeRuleMaps("pathRules", [session.pathRules], skipped), floorOn, skipped),
-		},
+		}, contributions),
 		skipped,
 		shortcutWarning: null,
 		project: null,
@@ -1059,7 +1144,7 @@ function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[])
  * missing/corrupt config or invalid fields always fall back to empty rules (safe default, no failure), invalid regexes are collected and reported,
  * an invalid toggleShortcut collects warning text (emitted via session_start, same as skipped).
  */
-function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | null = null, sessionRaw: Record<string, unknown> = {}): LoadedRules {
+function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | null = null, sessionRaw: Record<string, unknown> = {}, contributions: readonly Contribution[] = []): LoadedRules {
 	try {
 		const p = userConfigPath();
 		if (!fs.existsSync(p)) {
@@ -1067,7 +1152,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 				fs.mkdirSync(path.dirname(p), { recursive: true });
 				fs.writeFileSync(p, USER_CONFIG_TEMPLATE);
 			} catch { /* read-only environment: skip silently */ }
-			return sessionOnlyLoad(sessionRaw, []);
+			return sessionOnlyLoad(sessionRaw, [], contributions);
 		}
 		let raw: Record<string, unknown>;
 		try {
@@ -1076,7 +1161,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 			// Invalid config never silently disables the gate (#25): a parse failure
 			// loads empty user rules (the floor stays on) and reports through the
 			// session_start skip channel, same as invalid regexes
-			return sessionOnlyLoad(sessionRaw, [`config parse failed: ${err instanceof Error ? err.message : String(err)} — user rules not loaded (${p})`]);
+			return sessionOnlyLoad(sessionRaw, [`config parse failed: ${err instanceof Error ? err.message : String(err)} — user rules not loaded (${p})`], contributions);
 		}
 		const skipped: string[] = [];
 		// "off" is session-only: a file can never ungate the tool calls
@@ -1133,8 +1218,9 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 		raw = { ...raw, ...session };
 		dangerLayers.push(session.dangerRules);
 		pathLayers.push(session.pathRules);
+		const active = activeContributions(contributions, raw.ignoreContributions, skipped);
 		const floorOn = raw.builtinDenyFloor !== false;
-		const dangerRules = parseDangerRules(mergeRuleMaps("dangerRules", dangerLayers, skipped), floorOn, skipped);
+		const dangerRules = parseDangerRules(mergeRuleMaps("dangerRules", [Object.assign({}, ...active.map((c) => c.dangerRules)), ...dangerLayers], skipped), floorOn, skipped);
 		const pathRules = parsePathRules(mergeRuleMaps("pathRules", pathLayers, skipped), floorOn, skipped);
 		applyRuleAdditions(raw, skipped);
 		if (raw.autoDeny !== undefined) skipped.push('autoDeny: replaced by mode ("supervised") — key ignored');
@@ -1194,7 +1280,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 		const satOk = typeof satRaw === "number" && Number.isInteger(satRaw) && satRaw >= 1;
 		if (satRaw !== undefined && !satOk) skipped.push(`subagentAskTimeoutMs: ${JSON.stringify(satRaw)}`);
 		return {
-			rules: {
+			rules: withContributedLists({
 				allow: compile(raw.allow),
 				deny: compile(raw.deny),
 				denyPaths,
@@ -1219,14 +1305,14 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 				subagentAskTimeoutMs: satOk ? satRaw : 60_000,
 				classifierRules,
 				rootRule: parseRootRule(raw.rootRule, skipped),
-			},
+			}, active),
 			skipped,
 			shortcutWarning: shortcut.warning,
 			project,
 			settingSources: settingSourcesOf(Object.keys(session), projectKeys, userKeys),
 		};
 	} catch {
-		return sessionOnlyLoad(sessionRaw, []);
+		return sessionOnlyLoad(sessionRaw, [], contributions);
 	}
 }
 
@@ -2600,6 +2686,8 @@ export class SessionState {
 	private readonly approvals = new Set<string>();
 	/** One-shot pre-clearances issued by `execute_gated_tool` (EG-2): `approvalKey` → expiry, the agent-listed files and the file-context digest the clearance was judged on. Memory only, cleared by `reset`. */
 	readonly clearances = new Map<string, { expires: number; files: string[]; digest: string }>();
+	/** Extension contributions by source (EX-2); extension-lifetime, deliberately NOT cleared by `reset` (contributors answer COLLECT on every session start). */
+	readonly contributions = new Map<string, Contribution>();
 
 	constructor(userRules: UserRules = loadUserRules().rules, agentDir: string | null = null) {
 		this.userRules = userRules;
@@ -2647,7 +2735,7 @@ export class SessionState {
 	/** Reload user (+ trusted project) rules and re-anchor denyPaths to `cwd` (PP-1: once per session
 	 *  start; /verdict re-anchors after a config edit). Leaves shadow-cache / fallback stats untouched. */
 	reloadRules(cwd: string, sessionTrustedRoot: string | null = null): RulesLoadReport {
-		const loaded = loadUserRules(cwd, sessionTrustedRoot, this.sessionOverrides);
+		const loaded = loadUserRules(cwd, sessionTrustedRoot, this.sessionOverrides, [...this.contributions.values()]);
 		this.userRules = loaded.rules;
 		this.settingSources = loaded.settingSources;
 		this.denyPathBases = anchorDenyPaths(loaded.rules.denyPaths, cwd); // anchored to the session cwd, once (PP-1)
@@ -7407,10 +7495,31 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		refreshStatus(ctx);
 	}
 
+	// Extension contributions (EX-1/EX-2): contributors answer COLLECT (emitted right before the reset in session_start) or emit at any later time.
+	// `liveCtx` is non-null only between the end of session_start and session_shutdown; before that, rules are rebuilt by the reset and errors queue up.
+	let liveCtx: ExtensionContext | null = null;
+	const contributionErrors: string[] = [];
+	pi.events?.on(CONTRIBUTE_CHANNEL, (data) => {
+		const parsed = parseContribution(data);
+		if ("error" in parsed) {
+			if (liveCtx !== null) liveCtx.ui.notify(`pi-verdict: ${parsed.error}`, "warning");
+			else contributionErrors.push(parsed.error);
+			return;
+		}
+		const c = parsed.ok;
+		if (!c.tools.length && !c.rules.length && !c.denyPaths.length && !Object.keys(c.dangerRules).length) state.contributions.delete(c.source);
+		else state.contributions.set(c.source, c);
+		if (liveCtx !== null) {
+			reportLoadWarnings(state.reloadRules(liveCtx.cwd, sessionTrustedRoot), liveCtx);
+			refreshStatus(liveCtx);
+		}
+	});
+
 	// session_start: reset the shadow cache (in-session memory state, settled in #5) + reload user rules (config changes take effect in a new session)
 	pi.on("session_start", async (_event, ctx) => {
 		const epoch = ++sessionEpoch;
 		// Project trust prompt: any await stays inside the prompt branch so the no-project path remains synchronous
+		liveCtx = null;
 		sessionTrustedRoot = null;
 		// TUI probe (omp only): setWidget factories run synchronously with the host TUI, whose `nativeRendering` says whether TSP is live.
 		// Runs before the trust prompt so that prompt can already be native; a failure leaves native mode off.
@@ -7466,7 +7575,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				else ctx.ui.notify(`pi-verdict: --verdict-mode "${flagMode}" is not one of auto|unattended|supervised|off — ignored`, "warning");
 			}
 		}
+		pi.events?.emit(COLLECT_CHANNEL, {});
 		const report = state.reset(ctx.cwd, sessionTrustedRoot, sessionRaw);
+		report.skipped.push(...contributionErrors.splice(0));
 		if (sessionError) ctx.ui.notify(`pi-verdict: ${sessionError}`, "warning");
 		pruneSessionOverrides();
 		state.audit?.prune(); // #54: converge to the AUDIT_KEEP_SESSIONS most recent files at session start
@@ -7474,10 +7585,12 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if (report.project?.applied) ctx.ui.notify(`pi-verdict: project overrides applied from ${report.project.path}`, "info");
 		if (report.project && !report.project.trusted) ctx.ui.notify(`pi-verdict: project config ${report.project.path} ignored — project not trusted (decisions: ${trustStorePath()})`, "info");
 		refreshStatus(ctx);
+		liveCtx = ctx;
 	});
 
 	pi.on("session_shutdown", () => {
 		sessionEpoch++;
+		liveCtx = null;
 		if (ownRootUi !== null && rootUi === ownRootUi) rootUi = null;
 		ownRootUi = null;
 		const globals = globalThis as Record<symbol, unknown>;
@@ -8193,7 +8306,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					values: value === "invalid" ? ["invalid"] : scope === "global" ? base : ["inherit", ...base],
 					value,
 					...(value === "invalid" ? { locked: "fix by hand" } : {}),
-					...(value === "inherit" ? { inherited: inheritedBuiltin(scope, "dangerRules", id, BASH_DANGER_RULES.some((r) => r.id === id) ? "deny" : "off") } : {}),
+					...(value === "inherit" ? { inherited: inheritedBuiltin(scope, "dangerRules", id, BASH_DANGER_RULES.some((r) => r.id === id) ? "deny" : ([...state.contributions.values()].find((c) => id in c.dangerRules)?.dangerRules[id].action ?? "off")) } : {}),
 					info: () => [
 						{ tone: "text", text: live ? live.reason : "(removed at this or a lower scope)" },
 						...(live ? [{ tone: "muted" as const, text: `pattern: /${live.pattern.source}/${live.pattern.flags}` }] : []),
@@ -8411,6 +8524,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			lines.push(`protected paths: denyPaths ${r.unattendedDenyPaths} (${src.unattendedDenyPaths}), .omp ${r.unattendedOmpDir} (${src.unattendedOmpDir})`);
 		}
 		if (r.mode === "supervised") lines.push(`thresholds: allow ${pct(r.supervisedAllowThreshold)} (${src.supervisedAllowThreshold})`);
+		for (const c of state.contributions.values()) lines.push(`extension ${c.source}: ${c.tools.length} tools, ${c.rules.length} rules, ${Object.keys(c.dangerRules).length} danger rules, ${c.denyPaths.length} denyPaths${r.contributionSources.includes(c.source) ? "" : " (ignored)"}`);
 		const remembered = state.rememberedApprovals > 0 ? `\nremembered approvals: ${state.rememberedApprovals} (this session)` : "";
 		return `${lines.join("\n")}\n${state.shadow.summary()}${denyPathsHint()}${auditHint()}${fallbackHint()}${remembered}\nUsage: /automode [status|auto|unattended|supervised|off|forget]${toggleHint()}`;
 	};

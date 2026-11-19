@@ -4,7 +4,7 @@ This document is the normative definition of pi-verdict's gate behavior. The key
 
 Each rule is a `####` heading followed by a normative statement, then `Why:` (the reason, with a link when the reason is a measurement), `Code:` (implementing symbols, no line numbers) and `Pinned by:` (the `describe › test` titles in `tests/` that assert the rule, or `unpinned`).
 
-Contents: [RL Rule layer](#rl-rule-layer) · [PG Path grading](#pg-path-grading) · [PP Protected paths and the forced .omp gate](#pp-protected-paths-and-the-forced-omp-gate) · [CL Classifier](#cl-classifier) · [JV jev adapter](#jv-jev-adapter) · [CS Confidence floor, mode thresholds, fallback cascade](#cs-confidence-floor-mode-thresholds-fallback-cascade) · [SC Script and file context](#sc-script-and-file-context) · [MD Approval modes](#md-approval-modes) · [PR Outcome and presentation](#pr-outcome-and-presentation) · [SG Subagent gate](#sg-subagent-gate) · [CF Configuration, scopes, trust](#cf-configuration-scopes-trust) · [AU Audit log and shadow cache](#au-audit-log-and-shadow-cache) · [RG Rule generator](#rg-rule-generator) · [RR Root rule](#rr-root-rule) · [ST Settings tool](#st-settings-tool) · [EG Gated execution](#eg-gated-execution) · [Decision tables](#decision-tables)
+Contents: [RL Rule layer](#rl-rule-layer) · [PG Path grading](#pg-path-grading) · [PP Protected paths and the forced .omp gate](#pp-protected-paths-and-the-forced-omp-gate) · [CL Classifier](#cl-classifier) · [JV jev adapter](#jv-jev-adapter) · [CS Confidence floor, mode thresholds, fallback cascade](#cs-confidence-floor-mode-thresholds-fallback-cascade) · [SC Script and file context](#sc-script-and-file-context) · [MD Approval modes](#md-approval-modes) · [PR Outcome and presentation](#pr-outcome-and-presentation) · [SG Subagent gate](#sg-subagent-gate) · [CF Configuration, scopes, trust](#cf-configuration-scopes-trust) · [AU Audit log and shadow cache](#au-audit-log-and-shadow-cache) · [RG Rule generator](#rg-rule-generator) · [RR Root rule](#rr-root-rule) · [ST Settings tool](#st-settings-tool) · [EG Gated execution](#eg-gated-execution) · [EX Extension contributions](#ex-extension-contributions) · [Decision tables](#decision-tables)
 
 ## RL: Rule layer
 
@@ -857,7 +857,7 @@ Pinned by: root rule (RR-1–RR-4) › critic revise feeds the next attempt; ove
 
 #### ST-1: Actions and keys
 
-The tool `verdict_settings` takes `action` = `get`, `set`, `unset`, `add` or `remove`; `key` from `SETTINGS_TOOL_KEYS` (every config key except `_hint`); `scope` = `global`, `local` or `session`; `value`; and `reason`. `set` replaces a key's whole value and validates it like the config loader (lists via `validateRule`, booleans, enums, percent keys 0–100 or `null`, model and prompt strings, `toggleShortcut`, `subagentAskTimeoutMs` integer ≥ 1, `rootRule` object with no skipped fields); the rule maps `dangerRules` and `pathRules` take an object and `set` merges it per id into that scope's stored map (an id with value `null` is dropped from the scope, restoring the lower scope's or default entry; an empty result is removed; entries are validated by `parseDangerRuleEntry` / the path-tier parser, unknown ids rejected); `unset` drops a key at one scope; `add`/`remove` take one entry of a list key (`allow`, `deny`, `denyPaths`, `tools`, `rules`). `get` returns the effective `dangerRules` as `{id: {action, reason, pattern, flags, builtin}}`. Scope rules, first violated one wins: `add`/`remove` apply only to list keys; `session` takes only `SESSION_KEYS`, `dangerRules`, `pathRules`, list keys (entries are appended to the effective list) and `rootRule`; `toggleShortcut` is not overridable at `local`; `mode` `off` is session-only. `reason` is required for changes (at most 500 characters). Invalid input is rejected before any dialog.
+The tool `verdict_settings` takes `action` = `get`, `set`, `unset`, `add` or `remove`; `key` from `SETTINGS_TOOL_KEYS` (every config key except `_hint` and `ignoreContributions`); `scope` = `global`, `local` or `session`; `value`; and `reason`. `set` replaces a key's whole value and validates it like the config loader (lists via `validateRule`, booleans, enums, percent keys 0–100 or `null`, model and prompt strings, `toggleShortcut`, `subagentAskTimeoutMs` integer ≥ 1, `rootRule` object with no skipped fields); the rule maps `dangerRules` and `pathRules` take an object and `set` merges it per id into that scope's stored map (an id with value `null` is dropped from the scope, restoring the lower scope's or default entry; an empty result is removed; entries are validated by `parseDangerRuleEntry` / the path-tier parser, unknown ids rejected); `unset` drops a key at one scope; `add`/`remove` take one entry of a list key (`allow`, `deny`, `denyPaths`, `tools`, `rules`). `get` returns the effective `dangerRules` as `{id: {action, reason, pattern, flags, builtin}}`. Scope rules, first violated one wins: `add`/`remove` apply only to list keys; `session` takes only `SESSION_KEYS`, `dangerRules`, `pathRules`, list keys (entries are appended to the effective list) and `rootRule`; `toggleShortcut` is not overridable at `local`; `mode` `off` is session-only. `reason` is required for changes (at most 500 characters). Invalid input is rejected before any dialog.
 
 Why: one validation path means an approved change is always one the loader accepts; the per-scope limits mirror what the menus offer.
 Code: `SETTINGS_TOOL_KEYS`, `validateSettingValue`, `settingScopeError`
@@ -994,6 +994,42 @@ When a classifier deny, or a user decline, concerns a call whose file context wa
 Why: a deny made on partial context is the one deny the agent can legitimately repair by supplying more context.
 Code: `GATED_TOOL_HINT`, `presentVerdict`, `Verdict.missingContext`
 Pinned by: gated execution (EG-1–EG-4) › EG-4: a classifier deny with missing file context points at the wrapper; a wrapper call does not
+
+## EX: Extension contributions
+
+Other extensions of the same host session can offer pre-approved tools, classifier rules, custom danger rules and `denyPaths` to the gate. Path tiers (`pathRules`) have fixed ids and regexes, so there are no custom tiers to contribute.
+
+#### EX-1: Protocol
+
+The channels are `pi-verdict:collect` (`COLLECT_CHANNEL`) and `pi-verdict:contribute` (`CONTRIBUTE_CHANNEL`) on the host's shared `pi.events` bus (synchronous dispatch, no replay). pi-verdict subscribes to `pi-verdict:contribute` when the extension loads and emits `pi-verdict:collect` (payload `{}`) in `session_start` immediately before the rules reset, so a contributor that emits from its collect listener is applied by that reset. A contribution emitted at any other time (for example by an extension that the host loads after startup) is applied at once by a rules reload; payloads that arrive before the session's reset are queued, not lost. A host without `pi.events` leaves the feature inert.
+
+Why: an event bus needs no import dependency in either direction, and a contributor loaded before or after pi-verdict still works because the answer is requested at every session start and accepted at any time.
+Code: `COLLECT_CHANNEL`, `CONTRIBUTE_CHANNEL`, the `pi.events` subscription and the `session_start` handler in `autoMode`
+Pinned by: extension contributions (EX-1–EX-4) › collected tool is allowed without a classifier call; extension contributions (EX-1–EX-4) › late contribution and withdrawal apply immediately
+
+#### EX-2: Payload validation, replace and withdraw
+
+The payload is `{source, tools?, rules?, denyPaths?, dangerRules?}`. `source` matches `^[a-z0-9][a-z0-9-]{0,31}$`; any other top-level key is an error. Each list has at most 64 entries, every entry a non-empty string of at most 2000 characters (trimmed, deduplicated); `dangerRules` has at most 64 ids, each value an object with `pattern` and optional `flags`, `reason` and `action` (`deny` default, or `ask`; `allow` is rejected because it would be a no-op), validated by `parseDangerRuleEntry`. The effective danger rule id is `<source>-<id>` and MUST NOT equal a built-in rule id. Validation is atomic: the first error rejects the whole payload (the source's previous contribution stays), and the error is reported as a `contribution <source>: …` warning. Re-emitting a `source` replaces its previous contribution wholesale; a payload with every list empty withdraws it.
+
+Why: a contribution that is half applied is harder to reason about than one that is rejected; the built-in id check stops a contributor from replacing a built-in rule through a crafted source and id.
+Code: `parseContribution`, `SessionState.contributions`
+Pinned by: extension contributions (EX-1–EX-4) › invalid payload is rejected whole and reported; extension contributions (EX-1–EX-4) › late contribution and withdrawal apply immediately
+
+#### EX-3: Layering and opt-out
+
+Contributions are the lowest layer of the configuration. `tools`, classifier `rules` and `denyPaths` are appended to the effective lists (order-preserving union); contributed rules reach the classifier prefixed `[extension <source>]`. Contributed danger rules form the lowest `dangerRules` layer, so user, project and session `dangerRules` can re-action (`"allow"`) or remove (`false`) one by its `<source>-<id>`; they are custom rules, so they stay active under `builtinDenyFloor: false`. A contributed `deny`/`ask` rule or `denyPaths` entry is evaluated exactly like a user-written one; a contributed `tools` entry is a mechanical allow exactly like config `tools`. The config key `ignoreContributions` (global or project file only; not a session key, and not in `SETTINGS_TOOL_KEYS`, so the agent cannot switch off a source or all contributions wholesale; individual contributed danger rules can still be re-actioned or removed by id through `dangerRules`, with the user's confirmation, like any other rule) is `true` to ignore every contribution or a list of source names to ignore; a malformed value is reported and ignored.
+
+Why: an installed extension is already trusted in-process code, so its contributions apply without a prompt, but the user keeps the last word per rule and per source.
+Code: `activeContributions`, `withContributedLists`, `loadUserRules`, `sessionOnlyLoad`
+Pinned by: extension contributions (EX-1–EX-4) › collected tool is allowed without a classifier call; extension contributions (EX-1–EX-4) › contributed danger rule blocks; user config can re-action it; extension contributions (EX-1–EX-4) › contributed classifier rule reaches the prompt; extension contributions (EX-1–EX-4) › ignoreContributions drops a source
+
+#### EX-4: Visibility and protected paths
+
+`/automode status` lists each contributing source with counts only (tools, rules, danger rules, `denyPaths`) and marks an ignored source `(ignored)`. Contributed entries are not stored at any scope: contributed `tools`, `rules` and `denyPaths` cannot be edited, and contributed danger rules appear in `/verdict` and in `verdict_settings get` (effective values; `denyPaths` as a count) like custom rules, where their action can be overridden per id. Contributed `denyPaths` follow PP-1–PP-9 unchanged: the path text never reaches the agent, notifications or the classifier.
+
+Why: PP-6 holds for every source of protected paths.
+Code: `statusText` in `autoMode`
+Pinned by: extension contributions (EX-1–EX-4) › contributed denyPaths ask without disclosing the path; extension contributions (EX-1–EX-4) › ignoreContributions drops a source
 
 ## Decision tables
 
