@@ -100,8 +100,22 @@ export function activeTransport(): Transport {
 	return process.env.PI_VERDICT_JEV_TRANSPORT?.trim().toLowerCase() === "typesafe" ? "typesafe" : "openrouter";
 }
 
+const JEV_URL_REJECTED = "PI_VERDICT_JEV_URL ignored: must be an https URL (http only for localhost, 127.0.0.1, ::1)";
+
+/** F11: the override receives the gate's transcript and the API key, so it must be https (http only for loopback). Returns the warning when a set value is rejected, else null. */
+export function jevUrlOverrideError(): string | null {
+	const raw = process.env.PI_VERDICT_JEV_URL?.trim();
+	if (!raw) return null;
+	try {
+		const u = new URL(raw);
+		return u.protocol === "https:" || (u.protocol === "http:" && /^(?:localhost|127\.0\.0\.1|\[::1\])$/.test(u.hostname)) ? null : JEV_URL_REJECTED;
+	} catch {
+		return JEV_URL_REJECTED;
+	}
+}
+
 export function decisionsUrl(transport: Transport = activeTransport()): string {
-	return process.env.PI_VERDICT_JEV_URL?.trim() || TRANSPORT_DEFAULTS[transport].url;
+	return (jevUrlOverrideError() === null && process.env.PI_VERDICT_JEV_URL?.trim()) || TRANSPORT_DEFAULTS[transport].url;
 }
 
 export function wireModel(transport: Transport = activeTransport()): string {

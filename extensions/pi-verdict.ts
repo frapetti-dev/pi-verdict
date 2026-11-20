@@ -88,7 +88,7 @@ import type * as PiAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import type { BeforeAgentStartEventResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
-import { activeTransport, type JevReason, OMP_OPENROUTER_API_ID, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER, VERDICT_CHOICES_PREFIX } from "./jev-adapter";
+import { activeTransport, type JevReason, jevUrlOverrideError, OMP_OPENROUTER_API_ID, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER, VERDICT_CHOICES_PREFIX } from "./jev-adapter";
 
 // ============================================================================
 // Rules layer: bash
@@ -108,10 +108,10 @@ export const PATH_TIER_DEFAULTS: Readonly<Record<PathTierId, RuleAction>> = {
 };
 /** One-line meaning of each path tier (settings-menu info row, GR-7 gate briefing). */
 const PATH_TIER_DESC: Record<PathTierId, string> = {
-	"s0-secret": "credential and secret files, read or write",
+	"s0-secret": "credential and secret files (ssh, cloud, kube, docker, npm, .env, .pgpass, .p12/.key and the like), read or write",
 	"s1-system-read": "reads under system prefixes (/etc, /usr, /var, /System, authorized_keys)",
 	"s1-system-write": "writes under those system prefixes",
-	"s2-user-rc-write": "writes to shell rc, .gitconfig, crontab, LaunchAgents, systemd user units",
+	"s2-user-rc-write": "writes to shell rc/profile files, .gitconfig, crontab, LaunchAgents, systemd user units, ~/.local/bin, autostart entries",
 	"s3-git-meta-write": "writes to .git/hooks, .git/config, .git/modules, .gitmodules",
 };
 const isRuleAction = (v: unknown): v is RuleAction => typeof v === "string" && (RULE_ACTIONS as readonly string[]).includes(v);
@@ -125,27 +125,39 @@ export interface DangerRule {
 	builtin: boolean;
 	/** Built-in path-scoped rule: a regex hit is waived when every rm operand resolves strictly inside the workspace or temp directory (rmEscapesScope). */
 	scoped?: true;
+	/** Matched against the whole command, not the BASH_MAX_MATCH_LEN prefix (oversize-command). */
+	uncapped?: true;
 }
 
-/** Built-in danger rules (defaults; read-only): matched against the full command string (covers pipes/compound commands); the default action is deny (from research report §4.3). The effective list is `UserRules.dangerRules`. */
-const BASH_DANGER_RULES: ReadonlyArray<{ id: string; pattern: RegExp; reason: string; scoped?: true }> = [
-	{ id: "rm-recursive", pattern: /\brm\b[^;|&]*(\s-(?:[a-zA-Z]*r[a-zA-Z]*f?|[a-zA-Z]*f[a-zA-Z]*r)\b|--recursive)/i, reason: "recursive delete (rm -r) outside the workspace and temp directory", scoped: true },
-	{ id: "rm-root", pattern: /\brm\s+(-[a-zA-Z]*\s+)*(--recursive\s+)?(\/|\/etc|\/usr|\/var|~|\$HOME)(?:\s|$)/i, reason: "delete root/system/home directory" },
+/** Cap the danger-regex matching input (#25): the prefix-consuming character
+ *  classes plus nested alternations can backtrack quadratically on very long
+ *  separator-free strings. Beyond the cap, rule matching is lost: the built-in `oversize-command` rule (action ask)
+ *  turns such a command into a human decision instead of a silent classifier pass (F2). */
+export const BASH_MAX_MATCH_LEN = 8192;
+
+/** `git` followed by its global options (`-c k=v`, `-C dir`, `--no-pager`, `--git-dir=x`), so an option before the subcommand does not hide it. */
+const GIT = String.raw`\bgit\b(?:\s+(?:-[cC]\s+\S+|--[\w-]+(?:=\S+)?))*\s+`;
+
+/** Built-in danger rules (defaults; read-only): matched against the full command string (covers pipes/compound commands); the default action is deny (from research report §4.3) unless `action` says otherwise. The effective list is `UserRules.dangerRules`. */
+const BASH_DANGER_RULES: ReadonlyArray<{ id: string; pattern: RegExp; reason: string; scoped?: true; uncapped?: true; action?: RuleAction }> = [
+	{ id: "rm-recursive", pattern: /\brm\b[^;|&]*(\s-(?:[a-zA-Z]*r[a-zA-Z]*f?|[a-zA-Z]*f[a-zA-Z]*r)\b|--r[a-z]*\b)/i, reason: "recursive delete (rm -r) outside the workspace and temp directory", scoped: true },
+	{ id: "rm-root", pattern: /\brm\s+(-[a-zA-Z-]*\s+)*(\/|\/etc|\/usr|\/var|~|\$HOME)(?:\s|$)/i, reason: "delete root/system/home directory" },
 	{ id: "sudo", pattern: /\bsudo\b/i, reason: "privilege escalation (sudo)" },
-	{ id: "chmod-777", pattern: /\bchmod\b[^;|&]*(777|a\+rwx|ugo\+rwx|ugo=rwx|[ug]\+s)\b/i, reason: "permission weakening (chmod 777/setuid)" },
-	{ id: "raw-device", pattern: /(>\s*\/dev\/(sd|hd|nvme|mmcblk|vd|xvd)|of=\/dev\/(sd|hd|nvme|mmcblk|vd|xvd)|\bmkfs\.)/i, reason: "raw device write/format" },
-	{ id: "git-push-force", pattern: /\bgit\s+push\b[^;|&]*(-f\b|--force\b)/i, reason: "git push --force" },
-	{ id: "git-reset-hard", pattern: /\bgit\s+reset\s+--hard\b/i, reason: "git reset --hard" },
-	{ id: "git-clean-force", pattern: /\bgit\s+clean\b[^;|&]*(\s-[a-zA-Z]*f|--force)/i, reason: "git clean -f" },
-	{ id: "git-checkout-dot", pattern: /\bgit\s+checkout\s+(--\s+)?\.(?:\s|$)/i, reason: "git checkout . (discard working tree)" },
-	{ id: "git-restore", pattern: /\bgit\s+restore\b/i, reason: "git restore (discard changes)" },
-	{ id: "remote-exec", pattern: /\b(curl|wget)\b[^;|&]*\|\s*(sudo\s+)?(ba|z|da)?sh\b/i, reason: "remote code execution (curl|sh)" },
+	{ id: "chmod-777", pattern: /\bchmod\b[^;|&]*(777|a\+rwx|ugo\+rwx|ugo=rwx|\b0?[2-7][0-7]{3}|[ugoa]*\+[rwxXt]*s)\b/i, reason: "permission weakening (chmod 777/setuid)" },
+	{ id: "raw-device", pattern: /(>\s*\/dev\/(sd|hd|nvme|mmcblk|vd|xvd)|of=\/dev\/(sd|hd|nvme|mmcblk|vd|xvd)|\bmkfs\b|\btee\s+(-\S+\s+)*\/dev\/(sd|hd|nvme|mmcblk|vd|xvd))/i, reason: "raw device write/format" },
+	{ id: "git-push-force", pattern: new RegExp(GIT + String.raw`push\b[^;|&]*(?:\s-[a-zA-Z]*f[a-zA-Z]*\b|--force\b|\s\+\S)`, "i"), reason: "git push --force" },
+	{ id: "git-reset-hard", pattern: new RegExp(GIT + String.raw`reset\b[^;|&]*\s--hard\b`, "i"), reason: "git reset --hard" },
+	{ id: "git-clean-force", pattern: new RegExp(GIT + String.raw`clean\b[^;|&]*(\s-[a-zA-Z]*f|--force)`, "i"), reason: "git clean -f" },
+	{ id: "git-checkout-dot", pattern: new RegExp(GIT + String.raw`checkout\s+(--\s+)?\.(?:\s|$)`, "i"), reason: "git checkout . (discard working tree)" },
+	{ id: "git-restore", pattern: new RegExp(GIT + String.raw`restore\b`, "i"), reason: "git restore (discard changes)" },
+	{ id: "remote-exec", pattern: /\b(curl|wget)\b[^;|&]*\|\s*(sudo\s+)?(env\s+)?(\/\S*\/)?(ba|z|da|k)?sh\b|\b(ba|z|da|k)?sh\s+<\(\s*(curl|wget)\b/i, reason: "remote code execution (curl|sh)" },
 	{ id: "gh-repo", pattern: /\bgh\s+repo\s+(create|delete|rename|archive)\b/i, reason: "GitHub repository-level change" },
 	{ id: "gh-release", pattern: /\bgh\s+release\s+(create|delete|edit)\b/i, reason: "GitHub release change" },
 	{ id: "fork-bomb", pattern: /:\(\)\s*\{/, reason: "fork bomb" },
+	{ id: "oversize-command", pattern: new RegExp(`^[\\s\\S]{${BASH_MAX_MATCH_LEN + 1}}`), reason: `command longer than ${BASH_MAX_MATCH_LEN} characters (rules and the classifier cannot check it whole)`, action: "ask", uncapped: true },
 ];
 
-const DEFAULT_DANGER_RULES = (): DangerRule[] => BASH_DANGER_RULES.map((r) => ({ ...r, action: "deny", builtin: true }));
+const DEFAULT_DANGER_RULES = (): DangerRule[] => BASH_DANGER_RULES.map((r) => ({ ...r, action: r.action ?? "deny", builtin: true }));
 
 type RuleVerdict = "allow" | "deny" | "gray" | "ask";
 /** A built-in rule hit that produced a deny/ask: what a permission grant must cover to lift it (GR-5). */
@@ -159,24 +171,18 @@ interface RuleResult {
 	 *  context: block reasons and notifications travel back to the model, so only the
 	 *  local confirm dialog may show it (PP-6: zero path plaintext leaves the machine). */
 	detail?: string;
-	/** Which forced gate produced an ask: the `.omp` directory gate or a denyPaths hit (unattended picks its action per gate). */
-	gate?: "omp-dir" | "deny-paths";
+	/** Which forced gate produced an ask: the `.omp` directory gate, the gate-owned files gate (PP-10) or a denyPaths hit (unattended picks its action per gate; the first two share `unattendedOmpDir`). */
+	gate?: "omp-dir" | "gate-files" | "deny-paths";
 	/** Built-in rule hits behind a deny/ask (also attached to a gate ask when the built-in rules would have asked or denied too). */
 	builtin?: BuiltinHit[];
 	/** Reason of the built-in hit that `builtin` describes, kept when a gate ask replaces `reason`. */
 	builtinReason?: string;
 }
 
-/** Cap the danger-regex matching input (#25): the prefix-consuming character
- *  classes plus nested alternations can backtrack quadratically on very long
- *  separator-free strings. Beyond the cap, rule matching is lost and the call
- *  falls to the classifier (fail-closed direction). */
-export const BASH_MAX_MATCH_LEN = 8192;
-
 /** Rules whose action is `allow` are skipped (no judgment). Any deny hit wins over ask hits; the reason lists every hit of the winning action. */
 function classifyBash(command: string, rules: readonly DangerRule[], cwd: string): RuleResult {
 	const capped = command.length > BASH_MAX_MATCH_LEN ? command.slice(0, BASH_MAX_MATCH_LEN) : command;
-	const hits = rules.filter((r) => r.action !== "allow" && r.pattern.test(capped) && (!r.scoped || rmEscapesScope(command, r.pattern, cwd)));
+	const hits = rules.filter((r) => r.action !== "allow" && r.pattern.test(r.uncapped ? command : capped) && (!r.scoped || rmEscapesScope(command, r.pattern, cwd)));
 	if (hits.length) {
 		const action: "deny" | "ask" = hits.some((r) => r.action === "deny") ? "deny" : "ask";
 		const won = hits.filter((r) => r.action === action);
@@ -195,6 +201,9 @@ function classifyBash(command: string, rules: readonly DangerRule[], cwd: string
 // Canonical forms: the single implementation of both dual-form matching tiers (discipline: see the "dual-form matching" entry in CONTEXT.md)
 // ============================================================================
 
+/** Windows: `.native` resolves 8.3 short names and junctions the JS implementation leaves untouched; its `\\?\` prefix is dropped so forms compare with plain paths (F8). */
+const realpath = (p: string): string => (process.platform === "win32" ? fs.realpathSync.native(p).replace(/^\\\\\?\\(?!UNC\\)/, "") : fs.realpathSync(p));
+
 /**
  * Base tier (PP-4): lexical absolute form + whole-path realpath form (realpath resolves symlink
  * indirection; on failure - target missing, glob token - degrades to the lexical form only). denyPaths and every
@@ -203,7 +212,7 @@ function classifyBash(command: string, rules: readonly DangerRule[], cwd: string
 function baseForms(p: string): string[] {
 	const out = [p];
 	try {
-		const r = fs.realpathSync(p);
+		const r = realpath(p);
 		if (r !== p) out.push(r);
 	} catch {
 		/* does not exist: lexical form only */
@@ -222,7 +231,7 @@ function rebuiltForms(abs: string): string[] {
 	const tail: string[] = [];
 	for (;;) {
 		try {
-			const real = fs.realpathSync(dir);
+			const real = realpath(dir);
 			out.add(path.join(real, ...tail));
 			return [...out];
 		} catch {
@@ -286,6 +295,32 @@ function shellWords(segment: string): string[] | null {
 	return words;
 }
 
+/** true when a command has a shell operator outside quotes (`;` `&` `|` `<` `>` newline, backtick, `$(`), or an unbalanced quote: it can run more than the author of an allow regex saw. Backtick and `$(` also count inside double quotes. */
+function hasShellOperator(command: string): boolean {
+	let quote: string | null = null;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote === "'") {
+			if (ch === "'") quote = null;
+		} else if (ch === "\\") {
+			i++;
+		} else if (ch === "`" || (ch === "$" && command[i + 1] === "(")) {
+			return true;
+		} else if (quote === '"') {
+			if (ch === '"') quote = null;
+		} else if (ch === "'" || ch === '"') {
+			quote = ch;
+		} else if (";&|<>\n\r".includes(ch)) {
+			return true;
+		}
+	}
+	return quote !== null;
+}
+
+/** Words that may precede `rm` in a segment without changing what it deletes; anything else (`echo rm`, `docker run x rm`, `xargs`) leaves the rule in force. */
+const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const RM_PREFIX_WORD = /^(?:command|env|time|nohup|git)$/;
+
 /** true only if every operand of the segment's `rm` provably resolves strictly inside one of `bases`. */
 function rmOperandsInScope(segment: string, cwd: string, bases: string[], cwdChanged: boolean): boolean {
 	const raw = shellWords(segment);
@@ -297,8 +332,8 @@ function rmOperandsInScope(segment: string, cwd: string, bases: string[], cwdCha
 		else if (/^\d*(?:>>?|<)/.test(w)) continue;
 		else words.push(w);
 	}
-	const at = words.findIndex((w) => w.replace(/^\\/, "").split(/[\\/]/).pop() === "rm");
-	if (at < 0) return false;
+	const at = words.findIndex((w) => !ASSIGNMENT_WORD.test(w) && !RM_PREFIX_WORD.test(w));
+	if (at < 0 || words[at].replace(/^\\/, "").split(/[\\/]/).pop() !== "rm") return false;
 	const operands: string[] = [];
 	let optionsEnded = false;
 	for (const w of words.slice(at + 1)) {
@@ -310,6 +345,9 @@ function rmOperandsInScope(segment: string, cwd: string, bases: string[], cwdCha
 		if (/[`{]/.test(op) || /\$(?!HOME(?:\/|$))/.test(op)) return false;
 		if (op.startsWith("~") && op !== "~" && !op.startsWith("~/")) return false;
 		if (process.platform !== "win32" && op.includes("\\")) return false;
+		// `link/..` leaves the directory the symlink points to, which path.resolve cannot see: a `..` after a real segment is never provable
+		const parts = op.split(/[\\/]/).filter((s) => s !== "" && s !== ".");
+		if (parts.some((s, i) => s === ".." && i > 0 && parts[i - 1] !== "..")) return false;
 		const t = expandHome(op.replace(/^\$HOME(?=\/|$)/, os.homedir()));
 		if (cwdChanged && !path.isAbsolute(t)) return false;
 		const forms = rebuiltForms(path.resolve(cwd, t));
@@ -521,7 +559,7 @@ interface UserRules {
 	contributionSources: string[];
 }
 
-const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, dangerRules: DEFAULT_DANGER_RULES(), pathRules: { ...PATH_TIER_DEFAULTS }, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", modeStatus: true, grantStatus: true, confidenceThreshold: null, autoDenyThreshold: null, autoAllowThreshold: null, unattendedDenyThreshold: null, supervisedAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "off", subagentAskTimeoutMs: 60_000, mode: "auto", unattendedDenyPaths: "deny", unattendedOmpDir: "deny", classifierRules: [], rootRule: null, contributionSources: [] };
+const EMPTY_RULES: UserRules = { allow: [], deny: [], denyPaths: [], tools: [], builtinDenyFloor: true, dangerRules: DEFAULT_DANGER_RULES(), pathRules: { ...PATH_TIER_DEFAULTS }, gateOmpDir: true, classifierModel: null, explainGateModel: null, explainGatePrompt: null, toggleShortcut: DEFAULT_TOGGLE_SHORTCUT, audit: false, notifyAllows: false, footer: "full", modeStatus: true, grantStatus: true, confidenceThreshold: null, autoDenyThreshold: null, autoAllowThreshold: null, unattendedDenyThreshold: null, supervisedAllowThreshold: null, classifierFallbackModel: null, classifierFallbackMode: "shadow", subagentGate: "auto", subagentAskTimeoutMs: 60_000, mode: "auto", unattendedDenyPaths: "deny", unattendedOmpDir: "deny", classifierRules: [], rootRule: null, contributionSources: [] };
 
 /** This module's own file location (import.meta.url resolved; null = unresolvable). */
 const OWN_FILE_PATH: string | null = (() => {
@@ -631,7 +669,30 @@ function rootIn(root: string, list: string[]): boolean {
 	return list.some((t) => baseForms(t).some((tf) => rootForms.some((rf) => samePath(tf, rf))));
 }
 
-interface TrustStore { trusted: string[]; untrusted: string[]; error: string | null }
+/** A trusted project: its root plus the sha256 of the project config bytes that were trusted (F3: an edited file is no longer trusted).
+ *  A legacy string entry has `sha256: null`, which never matches, so it re-prompts once. */
+interface TrustEntry { root: string; sha256: string | null }
+/** Session-scoped trust: the same pair, but the hash is always known. */
+interface SessionTrust { root: string; sha256: string }
+interface TrustStore { trusted: TrustEntry[]; untrusted: string[]; error: string | null }
+
+const sha256Hex = (b: Buffer | string): string => createHash("sha256").update(b).digest("hex");
+
+/** sha256 of the project config file bytes; null when unreadable. */
+function projectConfigHash(pp: string): string | null {
+	try {
+		return sha256Hex(fs.readFileSync(pp));
+	} catch {
+		return null;
+	}
+}
+
+/** "trusted": a session or store entry for this root carries the current content hash; "changed": the root was trusted but no entry matches the current content; "none": never trusted. */
+function trustStateOf(root: string, hash: string | null, store: TrustStore, session: SessionTrust | null): "trusted" | "changed" | "none" {
+	const entries = [...(session ? [session] : []), ...store.trusted].filter((e) => rootIn(root, [e.root]));
+	if (entries.length === 0) return "none";
+	return hash !== null && entries.some((e) => e.sha256 === hash) ? "trusted" : "changed";
+}
 
 function readTrustStore(): TrustStore {
 	const p = trustStorePath();
@@ -647,28 +708,34 @@ function readTrustStore(): TrustStore {
 	}
 	let error: string | null = null;
 	const obj = raw as Record<string, unknown>; // narrowed above to a non-null, non-array object
-	const list = (key: "trusted" | "untrusted"): string[] => {
+	const array = (key: "trusted" | "untrusted"): unknown[] => {
 		const v = obj[key];
 		if (v === undefined) return [];
 		if (!Array.isArray(v)) {
 			error ??= `trust file ${key}: must be an array of paths (${p})`;
 			return [];
 		}
-		return v.flatMap((x) => (typeof x === "string" && x.trim() ? [path.resolve(x.trim())] : []));
+		return v;
 	};
-	const trusted = list("trusted");
-	const untrusted = list("untrusted");
+	const trusted = array("trusted").flatMap((x): TrustEntry[] => {
+		if (typeof x === "string") return x.trim() ? [{ root: path.resolve(x.trim()), sha256: null }] : [];
+		if (typeof x !== "object" || x === null || !("root" in x) || typeof x.root !== "string" || !x.root.trim()) return [];
+		const sha = "sha256" in x ? x.sha256 : null;
+		return [{ root: path.resolve(x.root.trim()), sha256: typeof sha === "string" && /^[0-9a-f]{64}$/.test(sha) ? sha : null }];
+	});
+	const untrusted = array("untrusted").flatMap((x) => (typeof x === "string" && x.trim() ? [path.resolve(x.trim())] : []));
 	return { trusted, untrusted, error };
 }
 
-/** Persist a trust decision for a project root. Returns an error message, or null on success.
+/** Persist a trust decision for a project root (a "trusted" one records the config hash it covers). Returns an error message, or null on success.
  *  A damaged file is never overwritten (the user may have hand-edited it). */
-function recordTrust(root: string, decision: "trusted" | "untrusted"): string | null {
+function recordTrust(root: string, decision: "trusted" | "untrusted", sha256: string | null = null): string | null {
 	const store = readTrustStore();
 	if (store.error !== null) return store.error;
-	const trusted = store.trusted.filter((e) => !rootIn(root, [e]));
+	const trusted = store.trusted.filter((e) => !rootIn(root, [e.root]));
 	const untrusted = store.untrusted.filter((e) => !rootIn(root, [e]));
-	(decision === "trusted" ? trusted : untrusted).push(path.resolve(root));
+	if (decision === "trusted") trusted.push({ root: path.resolve(root), sha256 });
+	else untrusted.push(path.resolve(root));
 	const p = trustStorePath();
 	try {
 		fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -743,7 +810,7 @@ function pruneSessionOverrides(): void {
  *  - todo:       session task list (UI/session metadata only)
  *  - wait:       blocks on already-started background jobs
  *  - task:       spawns subagents; their tool calls pass this gate too (the extension is
- *                re-bound in every subagent session)
+ *                re-bound in every subagent session; subagentGate defaults to "auto")
  *  - yield:      subagent result submission (hidden tool)
  *  - think:      private scratchpad (hidden tool)
  *  - checkpoint, rewind: prune session conversation context only (no file/git restore)
@@ -756,7 +823,7 @@ function pruneSessionOverrides(): void {
 const DEFAULT_ALLOWED_TOOLS = ["ask", "todo", "wait", "task", "yield", "think", "checkpoint", "rewind", "recall", "reflect"];
 
 const USER_CONFIG_TEMPLATE = `${JSON.stringify({
-	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. dangerRules: per-id action for built-in danger rules (\"deny\" | \"ask\" | \"allow\" = classifier decides), false removes a rule, {\"pattern\",\"action\",\"reason\",\"flags\"} adds a custom rule; pathRules: action per path tier (s0-secret, s1-system-read, s1-system-write, s2-user-rc-write, s3-git-meta-write); entries merge per id across global, project and session. builtinDenyFloor=false sets every built-in rule to allow (classifier decides) at your own risk; custom rules stay active. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: auto (deny/ask/allow) | unattended (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | supervised (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. autoDenyThreshold/autoAllowThreshold, unattendedDenyThreshold, supervisedAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). unattendedDenyPaths/unattendedOmpDir (deny|allow): what unattended does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: off default / normal / auto) routes asks raised inside subagents to the root UI (normal) or straight to the second model (auto); unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status). modeStatus (default true): approval-mode chip (🛡 AUTO / 🌙 UNATT / 👁 SUPV / ⚠ OFF) in the prompt status bar — on omp it appears in the status line's \"status\" segment; hidden on pi while the footer is on (the footer already shows the mode). grantStatus (default true): active permission-grant count (🔑 N) in the prompt status bar; hidden when there are none, and on pi while the footer is on. rootRule: the root rule — one baseline policy for the classifier, drafted with /automode-setup ({text, strictness: relaxed|balanced|strict, history, codebase, clarifications}); the highest scope that sets it wins as a whole; classification rules apply on top of it. ignoreContributions (not in the template; global or project config only): true to ignore every extension contribution (tools, rules, danger rules, denyPaths offered by other extensions), or a list of contributor source names to ignore.",
+	_hint: "pi-verdict user rules — full reference: https://github.com/jesset/pi-verdict/blob/main/docs/configuration.md. deny beats allow. denyPaths: protected paths, any touch asks for your confirmation (non-interactive degrades to deny); the pre-filled starter list is your declaration, edit or empty freely. dangerRules: per-id action for built-in danger rules (\"deny\" | \"ask\" | \"allow\" = classifier decides), false removes a rule, {\"pattern\",\"action\",\"reason\",\"flags\"} adds a custom rule; pathRules: action per path tier (s0-secret, s1-system-read, s1-system-write, s2-user-rc-write, s3-git-meta-write); entries merge per id across global, project and session. builtinDenyFloor=false sets every built-in rule to allow (classifier decides) at your own risk; custom rules stay active. gateOmpDir (default true): any read/write touching a .omp directory asks for your confirmation (non-interactive degrades to deny); false disables it; also togglable via /verdict. tools: exact names of non-path, non-command tools (e.g. todo, ask, task) that skip the classifier and are allowed directly; the pre-filled starter list holds only tools without side effects of their own, edit or empty freely. classifierModel pins the classifier (provider/id, e.g. zai/glm-5.3-flash; empty = session model). classifierFallbackModel (optional) adds a second-layer classifier consulted only when the first layer is uncertain (ask / fail-closed / jev confidence below confidenceThreshold); mode shadow (default) observes without changing verdicts, enforce escalates strictness only. toggleShortcut sets the key that cycles the session approval mode (null or empty disables). Changes apply to new sessions. mode: auto (deny/ask/allow) | unattended (deny/allow, never prompts: uncertain calls are blocked with an explain-or-rewrite request) | supervised (ask/allow: every auto-review deny becomes a confirmation prompt; non-interactive sessions still deny); \"off\" is session-only (/automode off). confidenceThreshold (0-100 or null): jev confidence below it cascades to classifierFallbackModel, else asks. autoDenyThreshold/autoAllowThreshold, unattendedDenyThreshold, supervisedAllowThreshold (0-100 or null): jev probability needed for deny/allow in that mode (null = jev's own choice). unattendedDenyPaths/unattendedOmpDir (deny|allow): what unattended does with denyPaths / .omp gate hits. Every approval key can also be set per trusted project and per session (/automode panel). rules: free-text rules for the classifier (e.g. \"npm install is expected in this repo\"); they take precedence over its default criteria. explainGateModel (provider/id[:thinking]; empty = session model) and explainGatePrompt (empty = built-in default) configure the EXPLAIN-GATE role behind the Explain option of the confirmation dialog; it is never offered for protected-path or .omp asks. subagentGate (omp only: auto default / normal / off) routes asks raised inside subagents straight to the second model (auto) or to the root UI (normal); off leaves subagents ungated; unanswered within subagentAskTimeoutMs (default 60000) an ask is resolved by classifierFallbackModel, and only its explicit allow permits the call — set omp's extensionHandlers.toolCallTimeoutMs to at least subagentAskTimeoutMs + 60000. footer: \"full\" (Nerd Font powerline blocks, default) | \"compact\" (plain text) | \"off\" (no footer status). modeStatus (default true): approval-mode chip (🛡 AUTO / 🌙 UNATT / 👁 SUPV / ⚠ OFF) in the prompt status bar — on omp it appears in the status line's \"status\" segment; hidden on pi while the footer is on (the footer already shows the mode). grantStatus (default true): active permission-grant count (🔑 N) in the prompt status bar; hidden when there are none, and on pi while the footer is on. rootRule: the root rule — one baseline policy for the classifier, drafted with /automode-setup ({text, strictness: relaxed|balanced|strict, history, codebase, clarifications}); the highest scope that sets it wins as a whole; classification rules apply on top of it. ignoreContributions (not in the template; global or project config only): true to ignore every extension contribution (tools, rules, danger rules, denyPaths offered by other extensions), or a list of contributor source names to ignore.",
 	allow: ["^ls\\b"],
 	deny: [],
 	tools: DEFAULT_ALLOWED_TOOLS,
@@ -791,7 +858,7 @@ const USER_CONFIG_TEMPLATE = `${JSON.stringify({
 	unattendedOmpDir: "deny",
 	classifierFallbackModel: null,
 	classifierFallbackMode: "shadow",
-	subagentGate: "off",
+	subagentGate: "auto",
 	subagentAskTimeoutMs: 60000,
 	rules: [],
 	rootRule: null,
@@ -1144,7 +1211,7 @@ function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[],
  * missing/corrupt config or invalid fields always fall back to empty rules (safe default, no failure), invalid regexes are collected and reported,
  * an invalid toggleShortcut collects warning text (emitted via session_start, same as skipped).
  */
-function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | null = null, sessionRaw: Record<string, unknown> = {}, contributions: readonly Contribution[] = []): LoadedRules {
+function loadUserRules(cwd: string | null = null, sessionTrustedRoot: SessionTrust | null = null, sessionRaw: Record<string, unknown> = {}, contributions: readonly Contribution[] = []): LoadedRules {
 	try {
 		const p = userConfigPath();
 		if (!fs.existsSync(p)) {
@@ -1181,13 +1248,22 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 			const root = projectRootOf(pp);
 			const store = readTrustStore();
 			if (store.error) skipped.push(store.error);
-			const trusted = (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, store.trusted);
+			// one read: the hash that decides trust and the bytes that get parsed are the same (no check/use gap)
+			let bytes: Buffer | null = null;
+			try {
+				bytes = fs.readFileSync(pp);
+			} catch {
+				/* unreadable: never trusted */
+			}
+			const state = trustStateOf(root, bytes === null ? null : sha256Hex(bytes), store, sessionTrustedRoot);
+			const trusted = state === "trusted";
 			project = { path: pp, trusted, applied: false };
 			let projRaw: unknown;
+			if (state === "changed") skipped.push(`project config ${pp} changed since you trusted it — project overrides not applied until you trust it again`);
 			// untrusted and undecided both mean "not applied" (file never parsed); the session_start prompt owns the user-facing notice
-			if (trusted) {
+			if (trusted && bytes !== null) {
 				try {
-					projRaw = JSON.parse(fs.readFileSync(pp, "utf8"));
+					projRaw = JSON.parse(bytes.toString("utf8"));
 				} catch (err) {
 					skipped.push(`project config parse failed: ${err instanceof Error ? err.message : String(err)} — project overrides not loaded (${pp})`);
 				}
@@ -1301,7 +1377,7 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 				...approval,
 				classifierFallbackMode: fbModeRaw === "enforce" ? "enforce" : "shadow",
 				footer: footerOk ? footerRaw : "full",
-				subagentGate: sgOk ? sgRaw : "off",
+				subagentGate: sgOk ? sgRaw : "auto",
 				subagentAskTimeoutMs: satOk ? satRaw : 60_000,
 				classifierRules,
 				rootRule: parseRootRule(raw.rootRule, skipped),
@@ -1326,6 +1402,38 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
  *  On POSIX a backslash is a legal filename character and is left untouched. */
 const toRuleForm = (f: string): string => (path.sep === "\\" ? f.replace(/\\/g, "/").replace(/^[A-Za-z]:(?=\/)/, "") : f);
 
+/** Unicode space variants the host rewrites to " " before opening a path (pi `utils/paths.js` UNICODE_SPACES). */
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+/**
+ * Absolute path the host will actually open for a tool `path` argument: mirrors pi's `resolveToCwd`
+ * (`resolvePath(raw, cwd, {normalizeUnicodeSpaces, stripAtPrefix})`) so the gate grades the same file (PG-2). Order: Unicode
+ * spaces → one leading `@` → win32 only: `\\?\` / `\\.\` device prefixes, Git Bash/WSL/Cygwin drive spelling (`/c/x`, `/mnt/c/x`) →
+ * `~`, `~/…` (win32 also `~\…`) → `file://`. `~user` is NOT expanded (the host does not either).
+ */
+function resolveToolPath(raw: string, cwd: string): string {
+	let p = raw.replace(UNICODE_SPACES, " ");
+	if (p.startsWith("@")) p = p.slice(1);
+	const win = process.platform === "win32";
+	if (win) {
+		p = p.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\[?.]\\/, "");
+		if (p.startsWith("/") && !p.startsWith("//") && !p.includes("\\")) {
+			const m = p.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+			if (m) p = `${m[1].toUpperCase()}:\\${m[2]?.replaceAll("/", "\\") ?? ""}`;
+		}
+	}
+	if (p === "~") return path.resolve(cwd, os.homedir());
+	if (p.startsWith("~/") || (win && p.startsWith("~\\"))) return path.resolve(cwd, path.join(os.homedir(), p.slice(2)));
+	if (/^file:\/\//.test(p)) {
+		try {
+			p = fileURLToPath(p);
+		} catch {
+			/* the host throws on a malformed file URL too: the call fails before touching anything */
+		}
+	}
+	return path.resolve(cwd, p);
+}
+
 function expandHome(p: string): string {
 	return p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p;
 }
@@ -1341,28 +1449,45 @@ const S0_SECRET = [
 	// V8 (security audit): common plaintext credential files added
 	/(^|\/)\.netrc$/i, /(^|\/)\.npmrc$/i, /(^|\/)\.pypirc$/i, /(^|\/)\.envrc$/i, /(^|\/)\.vault-token$/i,
 	/\.kube(\/|$)/i, /\.docker\/config\.json$/i, /\.gem\/credentials$/i,
+	/\.(?:key|p12|pfx)$/i, /(^|\/)\.pgpass$/i, /(^|\/)\.my\.cnf$/i, /(^|\/)rclone\.conf$/i, /\.azure(\/|$)/i,
 ];
 // /private prefixes: macOS firmlinks — /etc, /var are really /private/etc,
 // /private/var, and realpath'd toolchain output uses the real spelling (#21)
 const S1_SYSTEM = [/^\/etc(\/|$)/i, /^\/private\/(etc|var)(\/|$)/i, /^\/usr(\/|$)/i, /^\/var(\/|$)/i, /^\/System(\/|$)/i, /(^|\/)authorized_keys$/i];
-const S2_USER_RC = [/\.(bashrc|zshrc|profile|bash_profile|gitconfig)$/i, /crontab/i, /Library\/LaunchAgents(\/|$)/i, /\.config\/systemd(\/|$)/i];
+const S2_USER_RC = [/\.(bashrc|zshrc|zshenv|zprofile|zlogin|profile|bash_profile|bash_login|gitconfig)$/i, /crontab/i, /Library\/LaunchAgents(\/|$)/i, /\.config\/systemd(\/|$)/i, /\.local\/bin(\/|$)/i, /\.config\/autostart(\/|$)/i];
 const S3_GIT_META = [/(^|\/)\.git\/(hooks|config|modules)(\/|$)/i, /(^|\/)\.gitmodules$/i];
+
+/** F5: a recursive grep rooted at the home directory, one of its ancestors or a filesystem root reads every credential file below it (the S0 patterns only see a path that names one). */
+function coversHome(forms: string[]): boolean {
+	const homes = baseForms(path.resolve(os.homedir()));
+	return forms.some((f) => path.parse(f).root === f || homes.some((h) => pathEquals(f, h) || pathStartsWith(h, f)));
+}
+
+/** One path-tier hit at its configured action (deny/ask carry the hit for grant coverage; allow = no judgment → gray). */
+function pathTierResult(id: PathTierId, text: string, forms: string[], tiers: Readonly<Record<PathTierId, RuleAction>>): RuleResult {
+	const action = tiers[id];
+	if (action === "allow") return { verdict: "gray", reason: text };
+	return { verdict: action, reason: `tier ${id}: ${text}`, builtin: [{ kind: "path", tier: id, action, forms }] };
+}
 
 /** read-class tools: S0 read is high risk, other reads are allowed. isWrite: write/edit use the full tiering. Each tier hit applies its configured action (deny/ask carry the hit for grant coverage; allow = no judgment → gray, first tier hit still wins). */
 function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: boolean, tiers: Readonly<Record<PathTierId, RuleAction>>): RuleResult {
-	const abs = path.resolve(cwd, expandHome(rawPath));
+	const abs = resolveToolPath(rawPath, cwd);
+	// F8: Windows 8.3 short names and trailing dot/space segments alias another file for the OS; the lexical form cannot be graded
+	// segments under the (already trusted) cwd are skipped: a short-named cwd such as C:\Users\USER~1 is normal
+	const absCwd = path.resolve(cwd);
+	const aliasPart = abs === absCwd || abs.startsWith(absCwd + path.sep) ? abs.slice(absCwd.length) : abs.slice(path.parse(abs).root.length);
+	if (process.platform === "win32" && aliasPart.split(/[\\/]/).some((s) => /~\d+(?:\.[^.]*)?$/.test(s) || /[. ]$/.test(s))) {
+		return pathTierResult("s0-secret", `ambiguous Windows path alias: ${rawPath}`, [abs], tiers);
+	}
 	// Dual-form matching (#20): rules test every canonical form of the target —
 	// a project-local symlink aliasing ~/.ssh or a .git/hooks dir must not pass
 	// the floor on its lexical spelling alone.
 	const forms = rebuiltForms(abs);
 	const ruleForms = forms.map(toRuleForm);
 	const hit = (rules: RegExp[]) => ruleForms.some((f) => rules.some((r) => r.test(f)));
-	const tier = (id: PathTierId, text: string): RuleResult => {
-		const action = tiers[id];
-		if (action === "allow") return { verdict: "gray", reason: text };
-		return { verdict: action, reason: `tier ${id}: ${text}`, builtin: [{ kind: "path", tier: id, action, forms }] };
-	};
-
+	const tier = (id: PathTierId, text: string): RuleResult => pathTierResult(id, text, forms, tiers);
+	if (toolName === "grep" && coversHome(forms)) return tier("s0-secret", `recursive search over the home directory or a filesystem root: ${rawPath}`);
 	if (hit(S0_SECRET)) return tier("s0-secret", `S0 secrets/credential path: ${rawPath}`);
 	if (!isWrite) {
 		if (hit(S1_SYSTEM)) return tier("s1-system-read", `read system config path: ${rawPath}`);
@@ -1374,9 +1499,10 @@ function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: b
 	// In-cwd write allowance (#20): every canonical form must sit inside the cwd
 	// (in either its lexical or real form) — a lexical prefix hit whose real
 	// form escapes the project (symlink alias) grades as an outside-cwd write.
-	const cwdBases = new Set(baseForms(path.resolve(cwd)));
+	// A filesystem-root or home-directory cwd is no project: nothing inside it is mechanically allowed (same test as rmScopeBases).
+	const cwdBases = new Set(baseForms(absCwd));
 	const inCwd = (f: string) => [...cwdBases].some((b) => f === b || f.startsWith(b + path.sep));
-	if (forms.every(inCwd)) return { verdict: "allow" };
+	if (path.parse(absCwd).root !== absCwd && !pathEquals(absCwd, os.homedir()) && forms.every(inCwd)) return { verdict: "allow" };
 	return { verdict: "gray", reason: `write outside project directory (CWD): ${rawPath}` };
 }
 
@@ -1417,7 +1543,7 @@ function userRuleTarget(toolName: string, input: Record<string, unknown>, cwd: s
 	if (kind === "file") {
 		const p = typeof input.path === "string" && input.path ? input.path : null;
 		if (!p) return isScopeTool(toolName) ? toRuleForm(path.resolve(cwd)) : null;
-		return toRuleForm(path.resolve(cwd, expandHome(p)));
+		return toRuleForm(resolveToolPath(p, cwd));
 	}
 	return null;
 }
@@ -1451,8 +1577,7 @@ const BASH_PATH_TOKENS =
 function denyPathForms(raw: string, cwd: string): string[] {
 	if (!raw) return [];
 	// denyPaths spellings accept $HOME/ as an alias for ~/ (user-rule targets stay raw strings — no $ expansion there)
-	const expanded = expandHome(raw.replace(/^\$HOME(?=\/|$)/, os.homedir()));
-	return baseForms(path.resolve(cwd, expanded));
+	return baseForms(resolveToolPath(raw.replace(/^\$HOME(?=\/|$)/, os.homedir()), cwd));
 }
 
 /** Normalize the configured denyPaths against one cwd (PP-1: anchored once per session, never re-derived) */
@@ -1467,7 +1592,6 @@ const SCRIPT_WRAPPER = /^(?:env|time|nohup|exec|command|&)$/;
 const SCRIPT_EXTENSION = /\.(?:ts|tsx|mts|cts|js|mjs|cjs|py|sh|bash|zsh|ps1|psm1|rb|pl|php)$/i;
 /** Interpreter flags that carry the program inline (or a module): the command runs no local script. */
 const INLINE_CODE_FLAG = /^(?:-c|-e|--eval|-command|-p)$/i;
-const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /** SC-1: absolute paths of the local scripts a shell command executes (interpreter argument, direct execution, `source`/`.`), deduped by `fold`, in order of appearance.
  *  A candidate is kept when it is an existing regular file or carries a script extension (a missing one becomes a `missing` entry in the file context). Never reads content;
@@ -1673,6 +1797,24 @@ function ompTouches(toolName: string, input: Record<string, unknown>, cwd: strin
 	return { forms, bareWord };
 }
 
+/** The pi-verdict files the gate itself owns (PP-10): a project override `<.pi|.omp>/pi-verdict.json` anywhere, and below the agent dir the user config, the trust store, the session overrides and the audit logs. */
+const GATE_FILE_IN_PROJECT = /(?:^|[\\/])\.(?:pi|omp)[\\/]pi-verdict\.json$/i;
+/** The same files as a bare word inside a raw command string (`cat pi-verdict.json`); lookalikes such as `pi-verdict.test.ts` do not match. */
+const GATE_FILE_IN_COMMAND = /(?<![\w.-])pi-verdict(?:-trust)?\.json\b|(?<![\w.-])pi-verdict-sessions\b/;
+
+/** Every touch of a gate-owned file by the call (PP-10), in the same shape as `ompTouches`; scope tools are checked on their own target only. */
+function gateFileTouches(toolName: string, input: Record<string, unknown>, cwd: string): { forms: string[]; bareWord: boolean } {
+	const bases = [userConfigPath(), trustStorePath(), sessionConfigDir(), path.join(agentDirPath(), "verdicts")].flatMap(baseForms);
+	const forms: string[] = [];
+	for (const candidate of denyPathCandidates(toolName, input, cwd)) {
+		for (const form of denyPathForms(candidate, cwd)) {
+			if (GATE_FILE_IN_PROJECT.test(form) || bases.some((b) => pathEquals(form, b) || pathStartsWith(form, b))) forms.push(form);
+		}
+	}
+	const bareWord = toolKind(toolName) === "command" && GATE_FILE_IN_COMMAND.test(String(input.command ?? "")) && forms.length === 0;
+	return { forms, bareWord };
+}
+
 /**
  * Tool call → rule-layer verdict. Order (#12; RL-2, with denyPaths per PP-5):
  *   1. user deny → deny (before the built-in rules; beats every allow)
@@ -1698,7 +1840,7 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 	} else if (kind === "file") { // grep/find/ls: optional path; absent → cwd is the
 		// effective target, so user rules and denyPaths compare against it (#48)
 		const p = typeof input.path === "string" ? input.path : undefined;
-		base = p ? classifyPath(toolName, p, cwd, false, user.pathRules) : { verdict: "allow" };
+		base = p || toolName === "grep" ? classifyPath(toolName, p ?? "", cwd, false, user.pathRules) : { verdict: "allow" };
 	} else if (toolName === SETTINGS_TOOL_NAME) {
 		// RL-8: the tool confirms every change with the user itself; no target, so user rules/denyPaths never apply
 		base = { verdict: "allow", reason: "pi-verdict settings tool (confirms every change with the user)" };
@@ -1731,6 +1873,11 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 			const omp = hitOmpDir(toolName, input, cwd);
 			if (omp) return { verdict: "ask", reason: "forced gate: access to a .omp directory (gateOmpDir)", detail: omp, gate: "omp-dir", ...underneath };
 		}
+		// Forced gate on the gate's own files (PP-10): not configurable, same ask semantics as the .omp gate.
+		const gateFiles = gateFileTouches(toolName, input, cwd);
+		if (gateFiles.forms.length > 0 || gateFiles.bareWord) {
+			return { verdict: "ask", reason: "forced gate: access to a pi-verdict config, trust, session or audit file", detail: gateFiles.forms[0] ?? "pi-verdict file referenced in the command", gate: "gate-files", ...underneath };
+		}
 		// denyPaths hit → terminal ask (RL-2, PP-5): after user deny, before user allow —
 		// a protected path is the user's exception to their own allow rules.
 		// The matched path goes to `detail` (confirm dialog only): reasons travel back
@@ -1738,7 +1885,10 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 		const hit = hitDenyPaths(toolName, input, cwd, denyPathBases);
 		if (hit) return { verdict: "ask", reason: "user-declared protected path (denyPaths) [path withheld; see pi-verdict.json]", detail: hit, gate: "deny-paths", ...underneath };
 		for (const re of user.allow) {
-			if (re.test(target)) return { verdict: "allow", reason: "user allow rule" };
+			if (!re.test(target)) continue;
+			// F10: an allow regex vouches for one command, not for whatever an operator chains after it; such a command is judged by the classifier
+			if (kind === "command" && hasShellOperator(target)) break;
+			return { verdict: "allow", reason: "user allow rule" };
 		}
 	}
 	return base;
@@ -1771,7 +1921,7 @@ function classifierSystem(choices: readonly VerdictChoice[]): string {
 	const verdictLines = (["allow", "deny", "ask"] as const).filter((v) => choices.includes(v)).map((v) => `- ${v}: ${crit[v]}`);
 	return `You are a permission classifier for tool calls in an AI coding agent. You see a condensed transcript of the session: genuine user messages and past tool calls. The LAST line of the transcript is the action under review.
 
-Judge the action by its full effect — what it runs, sends, publishes, or enables — not its surface form.
+Judge the action by its full effect — what it runs, sends, publishes, or enables — not its surface form. If the action line contains "…[truncated]…", part of the action is hidden from you: never answer allow.
 
 Verdicts:
 ${verdictLines.join("\n")}
@@ -1834,12 +1984,13 @@ const MAX_TOOL_CALLS = 10;
 const MAX_ENTRY_CHARS = 1000;
 
 /** Strip zero-width characters + length cap (head 60% + tail 40%), basic anti-injection sanitization (borrowed from ai-guard) */
-function sanitize(text: string): string {
+function sanitize(text: string, cap = MAX_ENTRY_CHARS): string {
+	text = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, ""); // F13: terminal control bytes (ESC, CSI, BEL …) never reach the classifier transcript; \t \n \r stay
 	// eslint-disable-next-line no-control-regex
 	const cleaned = text.replace(/[​-‍⁠﻿]/g, "");
-	if (cleaned.length <= MAX_ENTRY_CHARS) return cleaned;
-	const head = Math.floor(MAX_ENTRY_CHARS * 0.6);
-	const tail = MAX_ENTRY_CHARS - head;
+	if (cleaned.length <= cap) return cleaned;
+	const head = Math.floor(cap * 0.6);
+	const tail = cap - head;
 	return `${cleaned.slice(0, head)}…[truncated]…${cleaned.slice(-tail)}`;
 }
 
@@ -1849,14 +2000,15 @@ function sanitize(text: string): string {
  *  otherwise forge a structural line (#22). Covers \n, \r\n, lone \r and the
  *  Unicode separators U+2028/U+2029/U+0085, which models may render as breaks.
  *  Content is preserved, only the line structure is defended. */
-function transcriptSafe(text: string): string {
-	return sanitize(text).replace(/[\r\n\u2028\u2029\u0085]/g, "\\n");
+function transcriptSafe(text: string, cap = MAX_ENTRY_CHARS): string {
+	return sanitize(text, cap).replace(/[\r\n\u2028\u2029\u0085]/g, "\\n");
 }
 
-function toolCallLine(name: string, args: Record<string, unknown>): string {
-	if (typeof args.command === "string") return `${name}: ${transcriptSafe(args.command)}`;
-	if (typeof args.path === "string") return `${name}: ${transcriptSafe(args.path)}`;
-	return `${name}: ${transcriptSafe(JSON.stringify(args))}`;
+/** `cap` is the per-entry length limit: history lines keep MAX_ENTRY_CHARS, the action under review gets BASH_MAX_MATCH_LEN so the classifier sees what the rules saw (F2). */
+function toolCallLine(name: string, args: Record<string, unknown>, cap = MAX_ENTRY_CHARS): string {
+	if (typeof args.command === "string") return `${name}: ${transcriptSafe(args.command, cap)}`;
+	if (typeof args.path === "string") return `${name}: ${transcriptSafe(args.path, cap)}`;
+	return `${name}: ${transcriptSafe(JSON.stringify(args), cap)}`;
 }
 
 /** Minimal structural needs of the adjudication pipeline on the host session (transcript source + session id) - adjudicate does not take a full
@@ -1979,6 +2131,8 @@ interface ClassifierOutcome {
 	files: FileContext;
 	/** SC-5: the second layer handed the call back to the first layer (verdict is a placeholder ask). */
 	rejudge?: true;
+	/** The reason was produced by the jev adapter, so confidence and probabilities may be read from it (F9: a general LLM's text is never parsed as one). */
+	jev?: true;
 }
 
 const CLASSIFIER_TIMEOUT_MS = 25_000; // this gateway's CC classifier distribution p90=19.8s (15s would wrongly kill ~15%), research/cache-sim data
@@ -2256,7 +2410,7 @@ async function classifyWithModel(
 				const diag = `stopReason=${r.stopReason}, model=${model.id}, errorMessage=${JSON.stringify(r.errorMessage ?? null)}, raw output=${JSON.stringify(r.text.slice(0, 200))}`;
 				if (r.stopReason !== "error" && r.stopReason !== "aborted") {
 					const parsed = parseClassifierReply(r.text, allowNeedFiles, allowRejudge);
-					if (parsed?.kind === "verdict") return { verdict: parsed.verdict, reason: parsed.reason, source: "model", auditRaw: audit(), files };
+					if (parsed?.kind === "verdict") return { verdict: parsed.verdict, reason: parsed.reason, source: "model", auditRaw: audit(), files, ...(isJevModel(model) ? { jev: true as const } : {}) };
 					if (parsed?.kind === "rejudge") return { verdict: "ask", reason: "second layer handed the call back to the first layer", source: "model", rejudge: true, auditRaw: audit(), files };
 					if (parsed?.kind === "need-files") {
 						requested = parsed.paths;
@@ -2734,7 +2888,7 @@ export class SessionState {
 
 	/** Reload user (+ trusted project) rules and re-anchor denyPaths to `cwd` (PP-1: once per session
 	 *  start; /verdict re-anchors after a config edit). Leaves shadow-cache / fallback stats untouched. */
-	reloadRules(cwd: string, sessionTrustedRoot: string | null = null): RulesLoadReport {
+	reloadRules(cwd: string, sessionTrustedRoot: SessionTrust | null = null): RulesLoadReport {
 		const loaded = loadUserRules(cwd, sessionTrustedRoot, this.sessionOverrides, [...this.contributions.values()]);
 		this.userRules = loaded.rules;
 		this.settingSources = loaded.settingSources;
@@ -2745,7 +2899,7 @@ export class SessionState {
 
 	/** Session reset: reload user rules (config changes take effect in a new session) + re-anchor denyPaths to the session cwd
 	 *  (PP-1: anchored once per session) + clear the shadow cache; returns the load report for the presentation layer to notify */
-	reset(cwd: string, sessionTrustedRoot: string | null = null, sessionOverrides: Record<string, unknown> = {}): RulesLoadReport {
+	reset(cwd: string, sessionTrustedRoot: SessionTrust | null = null, sessionOverrides: Record<string, unknown> = {}): RulesLoadReport {
 		this.sessionOverrides = { ...sessionOverrides };
 		const parsedGrants = parseGrants(this.sessionOverrides.grants);
 		this.grants = parsedGrants.active;
@@ -2868,7 +3022,7 @@ export interface AdjudicateEnv {
  *  to the fallback if configured, else to the human (headless degrades to deny). Numeric
  *  confidence exists only on jev-formatted reasons; LLM first layers never demote. */
 function confidenceDemotion(outcome: ClassifierOutcome, rules: UserRules): { confidence: number } | null {
-	if (rules.confidenceThreshold === null || outcome.source === "fail-closed") return null;
+	if (rules.confidenceThreshold === null || outcome.jev !== true) return null;
 	const conf = parseJevConfidence(outcome.reason);
 	if (conf !== null && conf < rules.confidenceThreshold) return { confidence: conf };
 	return null;
@@ -2967,7 +3121,7 @@ async function runConfidenceCascade(
 			applied = { verdict: "ask", reason: "first layer failed on rejudge — your call", source: "fail-closed" };
 		} else {
 			const dem = confidenceDemotion(again, rules);
-			const jev = dem ? null : parseJevReason(again.reason);
+			const jev = dem || again.jev !== true ? null : parseJevReason(again.reason);
 			const mapped = jev ? applyModeThresholds(rules.mode, jev, rules) : null;
 			if (dem) applied = { verdict: "ask", reason: `${again.reason} (confidence ${dem.confidence}% is below your confidenceThreshold of ${rules.confidenceThreshold}%)`, source: "classifier" };
 			else if (mapped && mapped !== again.verdict) applied = { verdict: mapped, reason: `${again.reason} — ${rules.mode} thresholds: ${again.verdict} → ${mapped}`, source: "classifier" };
@@ -3089,6 +3243,9 @@ function coveringGrants(state: SessionState, call: { toolName: string; input: Re
 		if (omp.bareWord) return null;
 		touches.push(...omp.forms);
 	}
+	const gateFiles = gateFileTouches(call.toolName, call.input, cwd);
+	if (gateFiles.bareWord) return null;
+	touches.push(...gateFiles.forms);
 	touches.push(...denyPathHits(call.toolName, call.input, cwd, state.anchoredDenyPathBases(cwd)).map((h) => h.touch));
 	for (const b of builtin) if (b.kind === "path") touches.push(...b.forms);
 	const dangerIds = builtin.flatMap((b) => (b.kind === "danger" ? [b.id] : []));
@@ -3142,7 +3299,7 @@ async function adjudicateRuled(
 	// handler appends after the confirm resolves (with the ground truth); everything else
 	// appends immediately. Recording stays observe-only — it never changes a verdict; write
 	// failures stay fail-soft in the sink and surface once via drainWarning.
-	const actionLine = toolCallLine(call.toolName, call.input);
+	const actionLine = toolCallLine(call.toolName, call.input, BASH_MAX_MATCH_LEN);
 	const buildRecord = (v: Pick<AuditRecord, "verdict" | "reason" | "source" | "degraded">, raw: ClassifierOutcome["auditRaw"] | null, shadow: string, fc: FileContext = EMPTY_FILE_CONTEXT): AuditRecord => ({
 		mode: state.userRules.mode,
 		ts: new Date().toISOString(),
@@ -3199,7 +3356,7 @@ async function adjudicateRuled(
 	if (rule.verdict === "ask") {
 		// unattended never prompts: the gate's action setting decides (default deny; "allow" passes silently, except over a built-in ask/deny underneath, which unattended refuses)
 		if (state.userRules.mode === "unattended") {
-			const action = rule.gate === "omp-dir" ? state.userRules.unattendedOmpDir : state.userRules.unattendedDenyPaths;
+			const action = rule.gate === "omp-dir" || rule.gate === "gate-files" ? state.userRules.unattendedOmpDir : state.userRules.unattendedDenyPaths;
 			if (action === "allow" && builtin.length > 0) return { verdict: "deny", reason: rule.builtinReason ?? "", source: "rule", degraded: false, grantable: true };
 			const ppRecord: AuditRecord = { ...buildRecord({ verdict: action, reason: rule.reason ?? "", source: "protected-path", degraded: false }, null, "-"), detail: rule.detail };
 			state.audit?.append(ppRecord);
@@ -3271,7 +3428,7 @@ async function adjudicateRuled(
 	let firstVerdict = outcome.verdict;
 	let firstReason = outcome.reason;
 	let thresholdVerdict: VerdictChoice | undefined;
-	const jev = !demotion && outcome.source === "model" ? parseJevReason(outcome.reason) : null;
+	const jev = !demotion && outcome.jev === true ? parseJevReason(outcome.reason) : null;
 	const mapped = jev ? applyModeThresholds(mode, jev, state.userRules) : null;
 	if (mapped && mapped !== outcome.verdict) {
 		thresholdVerdict = mapped;
@@ -4409,7 +4566,7 @@ ${RULE_KINDS_DOC}
 
 ${RULE_LAYERS_DOC}
 
-Write the narrowest rule that does what was asked, never broader. Anchor command regexes with ^ and end command words with \b. Prefer rules (free text) over a regex when a regex would be fragile or over-broad.
+Write the narrowest rule that does what was asked, never broader. Anchor command regexes with ^ and end command words with \b. A command allow rule never mechanically allows a command containing an unquoted shell operator (; & | < > newline, backticks, $(...)): such commands go to the classifier. Prefer rules (free text) over a regex when a regex would be fragile or over-broad.
 
 When <feedback> is present it lists your failed attempts or the human's amendment; output one corrected rule that fixes every listed problem and NEVER repeat a failed rule.
 
@@ -4798,6 +4955,18 @@ export function collectProjectContext(cwd: string, denyPathBases: string[]): Pro
 	let skippedProtected = 0;
 	let total = 0;
 	const isProtected = (abs: string): boolean => classifyPath("read", abs, cwd, false, PATH_TIER_DEFAULTS).verdict === "deny" || hitDenyPaths("read", { path: abs }, cwd, denyPathBases) !== null;
+	// F12: a symlinked candidate (README.md -> ~/.ssh/id_rsa) would be read through the link; only files whose real path stays inside the real cwd are sent
+	let realCwd = cwd;
+	try {
+		realCwd = fs.realpathSync(cwd);
+	} catch { /* keep the lexical cwd */ }
+	const staysInCwd = (abs: string): boolean => {
+		try {
+			return pathStartsWith(fs.realpathSync(abs), realCwd);
+		} catch {
+			return false;
+		}
+	};
 
 	let entries: fs.Dirent[] = [];
 	try {
@@ -4829,6 +4998,7 @@ export function collectProjectContext(cwd: string, denyPathBases: string[]): Pro
 	for (const rel of [...new Set(candidates)]) {
 		const abs = path.join(cwd, rel);
 		try {
+			if (!staysInCwd(abs)) continue;
 			if (!fs.statSync(abs).isFile()) continue;
 			if (isProtected(abs)) {
 				skippedProtected++;
@@ -4854,7 +5024,7 @@ export function collectProjectContext(cwd: string, denyPathBases: string[]): Pro
 	try {
 		const gitDir = path.join(cwd, ".git");
 		const cfg = path.join(gitDir, "config");
-		if (fs.statSync(gitDir).isDirectory() && fs.statSync(cfg).isFile()) {
+		if (fs.statSync(gitDir).isDirectory() && fs.statSync(cfg).isFile() && staysInCwd(cfg)) {
 			if (isProtected(cfg)) skippedProtected++;
 			else {
 				const remotes: string[] = [];
@@ -6321,7 +6491,21 @@ function splitConfigPath(p: string): { dir: string; file: string } {
 	return { dir: p.slice(0, cut), file: p.slice(cut) };
 }
 
-export function trustScreen(pp: string, title: string): ChoiceScreenSpec {
+/** One display line per top-level key of a project config (`_hint` skipped): `key: <JSON cut to 120 chars>`, `denyPaths` as a count only (PP-6). */
+function projectConfigSummary(bytes: Buffer): string[] {
+	let obj: unknown;
+	try {
+		obj = JSON.parse(bytes.toString("utf8"));
+	} catch {
+		return ["(not valid JSON)"];
+	}
+	if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return ["(not valid JSON)"];
+	return Object.entries(obj)
+		.filter(([k]) => k !== "_hint")
+		.map(([k, v]) => displaySafe(k === "denyPaths" && Array.isArray(v) ? `${k}: ${v.length} entries` : `${k}: ${(JSON.stringify(v) ?? "undefined").slice(0, 120)}`));
+}
+
+export function trustScreen(pp: string, title: string, summary: string[]): ChoiceScreenSpec {
 	const { dir, file } = splitConfigPath(displaySafe(pp));
 	return {
 		role: "pi-verdict.trust",
@@ -6335,6 +6519,7 @@ export function trustScreen(pp: string, title: string): ChoiceScreenSpec {
 					...(dir !== "" ? [tnText([{ t: dir, s: "muted" }])] : []),
 				]),
 			]),
+			tn("card", { head: "Settings it applies" }, [tn("col", { gap: "xs" }, summary.map((l) => tnText([{ t: l, s: "code" }])))]),
 			tn("col", { gap: "sm" }, [
 				tnText("If you trust it, it can override your global gate config:"),
 				tn("row", { gap: "sm", wrap: true }, ["allow rules", "builtinDenyFloor", "mode", "and more"].map((t) => tn("badge", { text: t, tone: "muted" }))),
@@ -6608,7 +6793,7 @@ async function confirmAsk(ui: UiContext, spec: ApproveDialogSpec, opts: { signal
 			const pick = await pickAsk(ui, { ...spec, explain: explain !== undefined, explanation }, signal);
 			if (signal?.aborted) return "aborted";
 			if (pick === undefined) {
-				const ok = await ui.confirm(spec.title, spec.fallbackMessage, dialogOpts);
+				const ok = await ui.confirm(displaySafe(spec.title), displaySafe(spec.fallbackMessage), dialogOpts);
 				if (signal?.aborted) return "aborted";
 				return ok ? { allow: true } : { allow: false };
 			}
@@ -6652,7 +6837,7 @@ async function confirmGrant(ui: UiContext, spec: ApproveDialogSpec, signal?: Abo
 			return pick.reason !== undefined ? { kind: "clarify", text: pick.reason } : { kind: "reject" };
 		}
 		for (;;) {
-			const choice = await ui.select(`${spec.title}\n${spec.fallbackMessage}`, [GRANT_LABELS.yes!, GRANT_LABELS.reject!, GRANT_LABELS.no!], dialogOpts);
+			const choice = await ui.select(displaySafe(`${spec.title}\n${spec.fallbackMessage}`), [GRANT_LABELS.yes!, GRANT_LABELS.reject!, GRANT_LABELS.no!], dialogOpts);
 			if (signal?.aborted) return "aborted";
 			if (choice === GRANT_LABELS.yes) return { kind: "approve" };
 			if (choice !== GRANT_LABELS.no) return { kind: "reject" };
@@ -6828,7 +7013,7 @@ export function planModeActive(ctx: ExtensionContext): boolean {
 }
 
 function subagentLabel(id: { id: string; name: string }): string {
-	return id.id === id.name ? `subagent ${id.id}` : `subagent ${id.id} (${id.name})`;
+	return displaySafe(id.id === id.name ? `subagent ${id.id}` : `subagent ${id.id} (${id.name})`);
 }
 
 /** UI of the top-level interactive session in this process. Module-level: extension factories
@@ -6986,7 +7171,7 @@ function footerInfoItems(info: FooterInfo): string[] {
 	if (info.confidenceThreshold !== null) items.push(`≥${info.confidenceThreshold}%`);
 	if (info.thresholds.deny !== null) items.push(`deny≥${info.thresholds.deny}%`);
 	if (info.thresholds.allow !== null) items.push(`allow≥${info.thresholds.allow}%`);
-	if (info.subagentGate !== "off") items.push(`subagent ${info.subagentGate}`);
+	if (info.subagentGate !== "auto") items.push(`subagent ${info.subagentGate}`);
 	return items;
 }
 /** Risk chips: relaxed floors and unattended pass-throughs. */
@@ -7434,7 +7619,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 
 	/** Session-scoped trust grant (set by the session_start prompt; /verdict reloads must honor it) */
-	let sessionTrustedRoot: string | null = null;
+	let sessionTrustedRoot: SessionTrust | null = null;
+	/** Trust the project `root` as its config reads now (`hash`): remembered for this session and persisted with the hash, so a later edit asks again (F3). */
+	const rememberTrust = (ctx: ExtensionContext, root: string, hash: string | null): void => {
+		if (hash === null) return;
+		sessionTrustedRoot = { root, sha256: hash };
+		const err = recordTrust(root, "trusted", hash);
+		if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
+	};
 	/** Bumped on session_start/shutdown so a late dialog-module load never republishes into a stale session. */
 	let sessionEpoch = 0;
 
@@ -7542,14 +7734,22 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const store = readTrustStore();
 			// ctx.agent is omp-only (pi's ExtensionContext has no `agent`): narrow at runtime
 			const isSub = subagentIdentity(ctx) !== null;
-			if (!rootIn(root, store.trusted) && !rootIn(root, store.untrusted) && ctx.hasUI && !isSub) {
-				const trustTitle = `🛡️ pi-verdict: ${pp} can override your global gate config (allow rules, builtinDenyFloor, mode, …). Trust this project?`;
-				const nativePick = await pickNative(ctx.ui, trustScreen(pp, trustTitle));
-				const choice = nativePick !== null ? nativePick : await ctx.ui.select(trustTitle, [TRUST_CHOICE, NOT_NOW_CHOICE, NEVER_CHOICE]);
+			// one read: the hash the decision records and the settings the dialog lists are the same bytes
+			let bytes: Buffer | null = null;
+			try {
+				bytes = fs.readFileSync(pp);
+			} catch {
+				/* unreadable: nothing to trust */
+			}
+			const hash = bytes === null ? null : sha256Hex(bytes);
+			const trustState = trustStateOf(root, hash, store, null);
+			if (bytes !== null && trustState !== "trusted" && !rootIn(root, store.untrusted) && ctx.hasUI && !isSub) {
+				const summary = projectConfigSummary(bytes);
+				const trustTitle = `🛡️ pi-verdict: ${displaySafe(pp)} ${trustState === "changed" ? "changed since you trusted it and " : ""}can override your global gate config (allow rules, builtinDenyFloor, mode, …). Trust this project?`;
+				const nativePick = await pickNative(ctx.ui, trustScreen(pp, trustTitle, summary));
+				const choice = nativePick !== null ? nativePick : await ctx.ui.select(`${trustTitle}\n${summary.join("\n")}`, [TRUST_CHOICE, NOT_NOW_CHOICE, NEVER_CHOICE]);
 				if (choice === TRUST_CHOICE) {
-					sessionTrustedRoot = root;
-					const err = recordTrust(root, "trusted");
-					if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
+					rememberTrust(ctx, root, hash);
 				} else if (choice === NEVER_CHOICE) {
 					const err = recordTrust(root, "untrusted");
 					if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — you will be asked again`, "warning");
@@ -7582,6 +7782,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		pruneSessionOverrides();
 		state.audit?.prune(); // #54: converge to the AUDIT_KEEP_SESSIONS most recent files at session start
 		reportLoadWarnings(report, ctx);
+		const urlError = jevUrlOverrideError();
+		if (urlError) ctx.ui.notify(`pi-verdict: ${urlError}`, "warning");
 		if (report.project?.applied) ctx.ui.notify(`pi-verdict: project overrides applied from ${report.project.path}`, "info");
 		if (report.project && !report.project.trusted) ctx.ui.notify(`pi-verdict: project config ${report.project.path} ignored — project not trusted (decisions: ${trustStorePath()})`, "info");
 		refreshStatus(ctx);
@@ -7628,10 +7830,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	// ---- Settings menus (/automode, /verdict): shared scope plumbing ----
 
 	/** Is the project config at `file` trusted for this session (i.e. applied by the loader)? */
-	const projectTrusted = (file: string): boolean => {
-		const root = projectRootOf(file);
-		return (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, readTrustStore().trusted);
-	};
+	const projectTrusted = (file: string): boolean => trustStateOf(projectRootOf(file), projectConfigHash(file), readTrustStore(), sessionTrustedRoot) === "trusted";
 	/** Action-row id of the "trust this project" button (local tab of the settings menus, while untrusted). */
 	const TRUST_ROW_ID = "trust-project";
 	/** Main-page rows offering to trust the project: a section + one action, on the local tab while `untrusted`; [] otherwise. */
@@ -7653,9 +7852,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Trust the project of `localFile` permanently (as the session_start Trust choice), reload rules and the footer. */
 	const trustProject = (ctx: ExtensionContext, localFile: string): void => {
 		const root = projectRootOf(localFile);
-		sessionTrustedRoot = root;
-		const err = recordTrust(root, "trusted");
-		if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
+		rememberTrust(ctx, root, projectConfigHash(localFile));
 		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
 		refreshStatus(ctx);
 		ctx.ui.notify(`pi-verdict: project ${root} trusted — its config is applied`, "info");
@@ -7678,8 +7875,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		}
 		const target = scope === "global" ? { file: userConfigPath(), kind: "user" as const } : localFile === null ? null : { file: localFile, kind: "local" as const };
 		if (target === null) return "no project config location here";
+		const wasTrusted = target.kind === "local" && projectTrusted(target.file);
 		const err = writeConfigKey(target.file, target.kind, key, value);
 		if (err) return err;
+		// the user's own edit through the menus keeps a trusted project trusted: re-record the hash of what was just written
+		if (wasTrusted) rememberTrust(ctx, projectRootOf(target.file), projectConfigHash(target.file));
 		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
 		refreshStatus(ctx);
 		return null;
@@ -8765,7 +8965,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				}
 				if (scope === "local") {
 					const root = projectRootOf(file);
-					const trusted = (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, readTrustStore().trusted);
+					const trusted = projectTrusted(file);
 					if (!trusted) ctx.ui.notify(`pi-verdict: project ${root} is not trusted — the rule is saved but not applied until you trust it (prompted at session start)`, "info");
 				}
 				reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
@@ -9036,7 +9236,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			};
 
 			if (rules.mode === "unattended") {
-				const actionLine = toolCallLine(GRANT_TOOL_NAME, { request, paths: paths.map(({ path: p, access }) => ({ path: p, access })), ...(ruleIds.length ? { rules: ruleIds } : {}) });
+				const grantArgs = { request, paths: paths.map(({ path: p, access }) => ({ path: p, access })), ...(ruleIds.length ? { rules: ruleIds } : {}) };
+				if (JSON.stringify(grantArgs).length > BASH_MAX_MATCH_LEN) {
+					return settingsToolText(`Rejected (unattended mode, no human): the grant request is longer than ${BASH_MAX_MATCH_LEN} characters and cannot be reviewed in full. Nothing was granted. Shorten it or split it.`);
+				}
+				const actionLine = toolCallLine(GRANT_TOOL_NAME, grantArgs, BASH_MAX_MATCH_LEN);
 				const widgetUi = ctx.hasUI && typeof ctx.ui.setWidget === "function" ? ctx.ui : null;
 				widgetUi?.setWidget(STATUS_WIDGET_KEY, ["🛡️ verdict: reviewing permission grant…"]);
 				let review: GrantConsensus;
@@ -9050,7 +9254,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					ctx.ui.notify(`🛡️ Permission grant ${id} approved by the classifier (unattended): ${displaySafe(request).replace(/\s+/g, " ").slice(0, 120)}`, "info");
 					return settingsToolText(grantedText(id, "the classifier (unattended mode, no human)"));
 				}
-				ctx.ui.notify(`🛡️ Permission grant request rejected by the classifier (unattended): ${review.reason}`, "warning");
+				ctx.ui.notify(`🛡️ Permission grant request rejected by the classifier (unattended): ${displaySafe(review.reason)}`, "warning");
 				return settingsToolText(`Rejected (unattended mode, no human): ${review.reason}. Nothing was granted.`);
 			}
 
@@ -9270,7 +9474,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					{
 						id: "trust",
 						label: "Project trust prompt",
-						run: () => showChoice("trust", trustScreen("~/projects/sample/.omp/pi-verdict.json", "🛡️ pi-verdict (preview): this project has its own pi-verdict config")),
+						run: () => showChoice("trust", trustScreen("~/projects/sample/.omp/pi-verdict.json", "🛡️ pi-verdict (preview): this project has its own pi-verdict config", ["allow: [\"^ls\\\\b\"]", "mode: \"unattended\"", "denyPaths: 2 entries"])),
 					},
 					{
 						id: "ask",
