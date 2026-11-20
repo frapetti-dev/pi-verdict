@@ -120,11 +120,11 @@ Pinned by: denyPaths (PP-1–PP-9) › negative: omitted path with an unrelated 
 
 #### PG-2: Forms
 
-A path is graded against every one of its rebuilt forms (the rebuilt tier): the lexical absolute form, its realpath form when it exists, and a form rebuilt from the realpath of the nearest existing ancestor when it does not. Each form is converted to rule form and matched case-insensitively against the grade patterns; a hit on any form counts.
+A path is graded against every one of its rebuilt forms (the rebuilt tier): the lexical absolute form, its realpath form when it exists, and a form rebuilt from the realpath of the nearest existing ancestor when it does not. Each form is converted to rule form and matched case-insensitively against the grade patterns; a hit on any form counts. The lexical form is the path the host opens, not the raw string: Unicode spaces become spaces, one leading `@` is stripped, a `file://` URL is decoded, `~` and `~/…` expand to the home directory (`~user` does not, the host does not either) and on win32 the Git Bash/WSL/Cygwin drive spellings (`/c/x`, `/mnt/c/x`) map to `C:\x`. On win32 the realpath form is the native one without the `\\?\` prefix, and a segment below the cwd that is an 8.3 short name (`NAME~N`) or ends in `.` or a space grades as `s0-secret` (its real target cannot be read from the spelling).
 
-Why: a project-local symlink aliasing `~/.ssh` or a `.git/hooks` directory must not pass the floor on its lexical spelling (#20); case variants name the same file on case-insensitive filesystems (#21).
-Code: `rebuiltForms`, `classifyPath`
-Pinned by: path floor dual-form matching (#20) › write of a new key file via that symlink denies via the real form; S-rule case folding + firmlink prefixes (#21) › case-insensitive filesystem: .SSH/ID_RSA read denies (S0 /i)
+Why: a project-local symlink aliasing `~/.ssh` or a `.git/hooks` directory must not pass the floor on its lexical spelling (#20); case variants name the same file on case-insensitive filesystems (#21); the host normalizes the argument before opening it (pi `resolveToCwd`), so a gate that grades the raw string disagrees with the file actually touched (`@/etc/cron.d/x` is an in-cwd path to a naive resolver and `/etc/cron.d/x` to the host).
+Code: `rebuiltForms`, `classifyPath`, `resolveToolPath`
+Pinned by: path floor dual-form matching (#20) › write of a new key file via that symlink denies via the real form; S-rule case folding + firmlink prefixes (#21) › case-insensitive filesystem: .SSH/ID_RSA read denies (S0 /i); host path normalization (F1, F8) › write to an @-prefixed system path is graded as the host opens it (PG-2); host path normalization (F1, F8) › write to a file:// system path is graded as the host opens it (PG-2); host path normalization (F1, F8) › Windows 8.3 short names and trailing-dot segments are an S0 hit (PG-2)
 
 #### PG-3: S0 secrets
 
@@ -162,11 +162,11 @@ Pinned by: security audit regression (all payloads must NOT be rule-allowed) ›
 
 #### PP-1: Declaration normalization and anchoring
 
-Each `denyPaths` entry is a trimmed, non-empty string. Normalization: a leading `$HOME` is read as `~`, `~` expands to the home directory, the result is resolved against the session cwd, and its base forms are taken (lexical plus realpath when it exists; PP-4). Entries are anchored once at session start and re-anchored only when rules are reloaded (`/verdict`, `/rule`, `/automode` saves); they are never re-derived per call.
+Each `denyPaths` entry is a trimmed, non-empty string. Normalization: a leading `$HOME` is read as `~`, then the entry is normalized exactly like a tool `path` argument (PG-2: Unicode spaces, `@`, `file://`, `~`/`~/…` expansion), the result is resolved against the session cwd, and its base forms are taken (lexical plus realpath when it exists; PP-4). Entries are anchored once at session start and re-anchored only when rules are reloaded (`/verdict`, `/rule`, `/automode` saves); they are never re-derived per call.
 
 Why: mid-session symlink creation or cwd drift must not change what a declaration covers.
 Code: `denyPathForms`, `anchorDenyPaths`, `SessionState.reloadRules`, `SessionState.anchoredDenyPathBases`
-Pinned by: denyPaths (PP-1–PP-9) › normalization matrix: ~, $HOME, relative, .., and glob spellings hit the same base; denyPaths (PP-1–PP-9) › relative denyPath entry stays anchored to the session cwd after session_start
+Pinned by: denyPaths (PP-1–PP-9) › normalization matrix: ~, $HOME, relative, .., and glob spellings hit the same base; denyPaths (PP-1–PP-9) › relative denyPath entry stays anchored to the session cwd after session_start; host path normalization (F1, F8) › denyPaths match a path spelled with non-breaking spaces (PP-1)
 
 #### PP-2: Candidate extraction
 

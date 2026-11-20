@@ -195,6 +195,9 @@ function classifyBash(command: string, rules: readonly DangerRule[], cwd: string
 // Canonical forms: the single implementation of both dual-form matching tiers (discipline: see the "dual-form matching" entry in CONTEXT.md)
 // ============================================================================
 
+/** Windows: `.native` resolves 8.3 short names and junctions the JS implementation leaves untouched; its `\\?\` prefix is dropped so forms compare with plain paths (F8). */
+const realpath = (p: string): string => (process.platform === "win32" ? fs.realpathSync.native(p).replace(/^\\\\\?\\(?!UNC\\)/, "") : fs.realpathSync(p));
+
 /**
  * Base tier (PP-4): lexical absolute form + whole-path realpath form (realpath resolves symlink
  * indirection; on failure - target missing, glob token - degrades to the lexical form only). denyPaths and every
@@ -203,7 +206,7 @@ function classifyBash(command: string, rules: readonly DangerRule[], cwd: string
 function baseForms(p: string): string[] {
 	const out = [p];
 	try {
-		const r = fs.realpathSync(p);
+		const r = realpath(p);
 		if (r !== p) out.push(r);
 	} catch {
 		/* does not exist: lexical form only */
@@ -222,7 +225,7 @@ function rebuiltForms(abs: string): string[] {
 	const tail: string[] = [];
 	for (;;) {
 		try {
-			const real = fs.realpathSync(dir);
+			const real = realpath(dir);
 			out.add(path.join(real, ...tail));
 			return [...out];
 		} catch {
@@ -1326,6 +1329,38 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
  *  On POSIX a backslash is a legal filename character and is left untouched. */
 const toRuleForm = (f: string): string => (path.sep === "\\" ? f.replace(/\\/g, "/").replace(/^[A-Za-z]:(?=\/)/, "") : f);
 
+/** Unicode space variants the host rewrites to " " before opening a path (pi `utils/paths.js` UNICODE_SPACES). */
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+/**
+ * Absolute path the host will actually open for a tool `path` argument: mirrors pi's `resolveToCwd`
+ * (`resolvePath(raw, cwd, {normalizeUnicodeSpaces, stripAtPrefix})`) so the gate grades the same file (PG-2). Order: Unicode
+ * spaces → one leading `@` → win32 only: `\\?\` / `\\.\` device prefixes, Git Bash/WSL/Cygwin drive spelling (`/c/x`, `/mnt/c/x`) →
+ * `~`, `~/…` (win32 also `~\…`) → `file://`. `~user` is NOT expanded (the host does not either).
+ */
+function resolveToolPath(raw: string, cwd: string): string {
+	let p = raw.replace(UNICODE_SPACES, " ");
+	if (p.startsWith("@")) p = p.slice(1);
+	const win = process.platform === "win32";
+	if (win) {
+		p = p.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\[?.]\\/, "");
+		if (p.startsWith("/") && !p.startsWith("//") && !p.includes("\\")) {
+			const m = p.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+			if (m) p = `${m[1].toUpperCase()}:\\${m[2]?.replaceAll("/", "\\") ?? ""}`;
+		}
+	}
+	if (p === "~") return path.resolve(cwd, os.homedir());
+	if (p.startsWith("~/") || (win && p.startsWith("~\\"))) return path.resolve(cwd, path.join(os.homedir(), p.slice(2)));
+	if (/^file:\/\//.test(p)) {
+		try {
+			p = fileURLToPath(p);
+		} catch {
+			/* the host throws on a malformed file URL too: the call fails before touching anything */
+		}
+	}
+	return path.resolve(cwd, p);
+}
+
 function expandHome(p: string): string {
 	return p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p;
 }
@@ -1348,20 +1383,30 @@ const S1_SYSTEM = [/^\/etc(\/|$)/i, /^\/private\/(etc|var)(\/|$)/i, /^\/usr(\/|$
 const S2_USER_RC = [/\.(bashrc|zshrc|profile|bash_profile|gitconfig)$/i, /crontab/i, /Library\/LaunchAgents(\/|$)/i, /\.config\/systemd(\/|$)/i];
 const S3_GIT_META = [/(^|\/)\.git\/(hooks|config|modules)(\/|$)/i, /(^|\/)\.gitmodules$/i];
 
+/** One path-tier hit at its configured action (deny/ask carry the hit for grant coverage; allow = no judgment → gray). */
+function pathTierResult(id: PathTierId, text: string, forms: string[], tiers: Readonly<Record<PathTierId, RuleAction>>): RuleResult {
+	const action = tiers[id];
+	if (action === "allow") return { verdict: "gray", reason: text };
+	return { verdict: action, reason: `tier ${id}: ${text}`, builtin: [{ kind: "path", tier: id, action, forms }] };
+}
+
 /** read-class tools: S0 read is high risk, other reads are allowed. isWrite: write/edit use the full tiering. Each tier hit applies its configured action (deny/ask carry the hit for grant coverage; allow = no judgment → gray, first tier hit still wins). */
 function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: boolean, tiers: Readonly<Record<PathTierId, RuleAction>>): RuleResult {
-	const abs = path.resolve(cwd, expandHome(rawPath));
+	const abs = resolveToolPath(rawPath, cwd);
+	// F8: Windows 8.3 short names and trailing dot/space segments alias another file for the OS; the lexical form cannot be graded
+	// segments under the (already trusted) cwd are skipped: a short-named cwd such as C:\Users\USER~1 is normal
+	const absCwd = path.resolve(cwd);
+	const aliasPart = abs === absCwd || abs.startsWith(absCwd + path.sep) ? abs.slice(absCwd.length) : abs.slice(path.parse(abs).root.length);
+	if (process.platform === "win32" && aliasPart.split(/[\\/]/).some((s) => /~\d+(?:\.[^.]*)?$/.test(s) || /[. ]$/.test(s))) {
+		return pathTierResult("s0-secret", `ambiguous Windows path alias: ${rawPath}`, [abs], tiers);
+	}
 	// Dual-form matching (#20): rules test every canonical form of the target —
 	// a project-local symlink aliasing ~/.ssh or a .git/hooks dir must not pass
 	// the floor on its lexical spelling alone.
 	const forms = rebuiltForms(abs);
 	const ruleForms = forms.map(toRuleForm);
 	const hit = (rules: RegExp[]) => ruleForms.some((f) => rules.some((r) => r.test(f)));
-	const tier = (id: PathTierId, text: string): RuleResult => {
-		const action = tiers[id];
-		if (action === "allow") return { verdict: "gray", reason: text };
-		return { verdict: action, reason: `tier ${id}: ${text}`, builtin: [{ kind: "path", tier: id, action, forms }] };
-	};
+	const tier = (id: PathTierId, text: string): RuleResult => pathTierResult(id, text, forms, tiers);
 
 	if (hit(S0_SECRET)) return tier("s0-secret", `S0 secrets/credential path: ${rawPath}`);
 	if (!isWrite) {
@@ -1417,7 +1462,7 @@ function userRuleTarget(toolName: string, input: Record<string, unknown>, cwd: s
 	if (kind === "file") {
 		const p = typeof input.path === "string" && input.path ? input.path : null;
 		if (!p) return isScopeTool(toolName) ? toRuleForm(path.resolve(cwd)) : null;
-		return toRuleForm(path.resolve(cwd, expandHome(p)));
+		return toRuleForm(resolveToolPath(p, cwd));
 	}
 	return null;
 }
@@ -1451,8 +1496,7 @@ const BASH_PATH_TOKENS =
 function denyPathForms(raw: string, cwd: string): string[] {
 	if (!raw) return [];
 	// denyPaths spellings accept $HOME/ as an alias for ~/ (user-rule targets stay raw strings — no $ expansion there)
-	const expanded = expandHome(raw.replace(/^\$HOME(?=\/|$)/, os.homedir()));
-	return baseForms(path.resolve(cwd, expanded));
+	return baseForms(resolveToolPath(raw.replace(/^\$HOME(?=\/|$)/, os.homedir()), cwd));
 }
 
 /** Normalize the configured denyPaths against one cwd (PP-1: anchored once per session, never re-derived) */

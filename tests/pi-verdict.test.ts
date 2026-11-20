@@ -7236,3 +7236,41 @@ describe("extension contributions (EX-1–EX-4)", () => {
 		expect(row).not.toContain("off");
 	});
 });
+
+// ── Host path normalization (F1, F8): grade the path the host opens ──
+describe("host path normalization (F1, F8)", () => {
+	test("write to an @-prefixed system path is graded as the host opens it (PG-2)", async () => {
+		const h = session({});
+		h.ctx.hasUI = false;
+		const r = await toolCall(h, "write", { path: "@/etc/cron.d/x", content: "x" });
+		expect(r?.block).toBe(true);
+		expect(h.calls.length).toBe(0);
+	});
+
+	test.skipIf(process.platform === "win32")("write to a file:// system path is graded as the host opens it (PG-2)", async () => {
+		const h = session({});
+		h.ctx.hasUI = false;
+		const r = await toolCall(h, "write", { path: "file:///etc/cron.d/x", content: "x" });
+		expect(r?.block).toBe(true);
+		expect(h.calls.length).toBe(0);
+	});
+
+	test("denyPaths match a path spelled with non-breaking spaces (PP-1)", async () => {
+		const h = session({ denyPaths: ["~/pv-secret dir"] });
+		h.ctx.hasUI = false;
+		const r = await toolCall(h, "read", { path: "~/pv-secret\u00A0dir/a" });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).toContain("non-interactive");
+		expect(h.calls.length).toBe(0);
+	});
+
+	test.skipIf(process.platform !== "win32")("Windows 8.3 short names and trailing-dot segments are an S0 hit (PG-2)", async () => {
+		for (const p of ["C:\\proj\\SSH~1\\x", "C:\\proj\\.ssh.\\x"]) {
+			const h = session({});
+			h.ctx.hasUI = false;
+			const r = await toolCall(h, "read", { path: p });
+			expect(r?.block).toBe(true);
+			expect(h.calls.length).toBe(0);
+		}
+	});
+});

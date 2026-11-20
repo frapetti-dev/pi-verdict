@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 - **Extension contributions** ([EX-1–EX-4](docs/adjudication-rules.md#ex-extension-contributions)): other extensions can contribute `tools` (mechanical allow), classifier `rules`, custom `dangerRules` (id `<source>-<id>`, action `deny` or `ask`) and `denyPaths` over the host's `pi.events` bus. pi-verdict emits `pi-verdict:collect` in `session_start` right before the rules reset; a contributor answers with `pi-verdict:contribute` (payload `{source, tools?, rules?, denyPaths?, dangerRules?}`), and a contribution emitted later applies immediately. Payloads are validated atomically (invalid ones are rejected whole and reported as warnings), the same `source` replaces its previous contribution, an empty payload withdraws it. Contributions are the lowest config layer (user, project and session `dangerRules` can re-action or remove a contributed rule), apply without a prompt, and are listed by `/automode status` with counts only; contributed `denyPaths` keep the PP-6 non-disclosure rule. The new config key `ignoreContributions` (`true` or a list of source names; global or project file only, not editable through `verdict_settings`) opts out. A host without `pi.events` leaves the feature inert.
 
+### Fixed
+
+- **Host path normalization** ([PG-2](docs/adjudication-rules.md#pg-2-forms), [PP-1](docs/adjudication-rules.md#pp-1-declaration-normalization-and-anchoring)): the gate now grades the path the host opens. A tool `path` goes through a mirror of pi's `resolveToCwd` (`resolveToolPath`: Unicode-space rewrite, one leading `@` stripped, `file://` decoded, win32 Git Bash/WSL/Cygwin drive spellings, `~` and `~/…` only) before path grading, user-rule targets and `denyPaths`, so `@/etc/cron.d/x`, `file:///etc/…` and non-breaking-space spellings no longer slip past the tiers and `denyPaths`. On Windows the realpath forms use `fs.realpathSync.native` with the `\\?\` prefix stripped, and a path segment that is an 8.3 short name (`SSH~1`) or ends in `.`/space is an `s0-secret` tier hit at its configured action (cwd segments are exempt).
+
 ## [0.27.0] - 2026-11-13
 
 ### Added
