@@ -108,10 +108,10 @@ export const PATH_TIER_DEFAULTS: Readonly<Record<PathTierId, RuleAction>> = {
 };
 /** One-line meaning of each path tier (settings-menu info row, GR-7 gate briefing). */
 const PATH_TIER_DESC: Record<PathTierId, string> = {
-	"s0-secret": "credential and secret files, read or write",
+	"s0-secret": "credential and secret files (ssh, cloud, kube, docker, npm, .env, .pgpass, .p12/.key and the like), read or write",
 	"s1-system-read": "reads under system prefixes (/etc, /usr, /var, /System, authorized_keys)",
 	"s1-system-write": "writes under those system prefixes",
-	"s2-user-rc-write": "writes to shell rc, .gitconfig, crontab, LaunchAgents, systemd user units",
+	"s2-user-rc-write": "writes to shell rc/profile files, .gitconfig, crontab, LaunchAgents, systemd user units, ~/.local/bin, autostart entries",
 	"s3-git-meta-write": "writes to .git/hooks, .git/config, .git/modules, .gitmodules",
 };
 const isRuleAction = (v: unknown): v is RuleAction => typeof v === "string" && (RULE_ACTIONS as readonly string[]).includes(v);
@@ -135,19 +135,22 @@ export interface DangerRule {
  *  turns such a command into a human decision instead of a silent classifier pass (F2). */
 export const BASH_MAX_MATCH_LEN = 8192;
 
+/** `git` followed by its global options (`-c k=v`, `-C dir`, `--no-pager`, `--git-dir=x`), so an option before the subcommand does not hide it. */
+const GIT = String.raw`\bgit\b(?:\s+(?:-[cC]\s+\S+|--[\w-]+(?:=\S+)?))*\s+`;
+
 /** Built-in danger rules (defaults; read-only): matched against the full command string (covers pipes/compound commands); the default action is deny (from research report §4.3) unless `action` says otherwise. The effective list is `UserRules.dangerRules`. */
 const BASH_DANGER_RULES: ReadonlyArray<{ id: string; pattern: RegExp; reason: string; scoped?: true; uncapped?: true; action?: RuleAction }> = [
-	{ id: "rm-recursive", pattern: /\brm\b[^;|&]*(\s-(?:[a-zA-Z]*r[a-zA-Z]*f?|[a-zA-Z]*f[a-zA-Z]*r)\b|--recursive)/i, reason: "recursive delete (rm -r) outside the workspace and temp directory", scoped: true },
-	{ id: "rm-root", pattern: /\brm\s+(-[a-zA-Z]*\s+)*(--recursive\s+)?(\/|\/etc|\/usr|\/var|~|\$HOME)(?:\s|$)/i, reason: "delete root/system/home directory" },
+	{ id: "rm-recursive", pattern: /\brm\b[^;|&]*(\s-(?:[a-zA-Z]*r[a-zA-Z]*f?|[a-zA-Z]*f[a-zA-Z]*r)\b|--r[a-z]*\b)/i, reason: "recursive delete (rm -r) outside the workspace and temp directory", scoped: true },
+	{ id: "rm-root", pattern: /\brm\s+(-[a-zA-Z-]*\s+)*(\/|\/etc|\/usr|\/var|~|\$HOME)(?:\s|$)/i, reason: "delete root/system/home directory" },
 	{ id: "sudo", pattern: /\bsudo\b/i, reason: "privilege escalation (sudo)" },
-	{ id: "chmod-777", pattern: /\bchmod\b[^;|&]*(777|a\+rwx|ugo\+rwx|ugo=rwx|[ug]\+s)\b/i, reason: "permission weakening (chmod 777/setuid)" },
-	{ id: "raw-device", pattern: /(>\s*\/dev\/(sd|hd|nvme|mmcblk|vd|xvd)|of=\/dev\/(sd|hd|nvme|mmcblk|vd|xvd)|\bmkfs\.)/i, reason: "raw device write/format" },
-	{ id: "git-push-force", pattern: /\bgit\s+push\b[^;|&]*(-f\b|--force\b)/i, reason: "git push --force" },
-	{ id: "git-reset-hard", pattern: /\bgit\s+reset\s+--hard\b/i, reason: "git reset --hard" },
-	{ id: "git-clean-force", pattern: /\bgit\s+clean\b[^;|&]*(\s-[a-zA-Z]*f|--force)/i, reason: "git clean -f" },
-	{ id: "git-checkout-dot", pattern: /\bgit\s+checkout\s+(--\s+)?\.(?:\s|$)/i, reason: "git checkout . (discard working tree)" },
-	{ id: "git-restore", pattern: /\bgit\s+restore\b/i, reason: "git restore (discard changes)" },
-	{ id: "remote-exec", pattern: /\b(curl|wget)\b[^;|&]*\|\s*(sudo\s+)?(ba|z|da)?sh\b/i, reason: "remote code execution (curl|sh)" },
+	{ id: "chmod-777", pattern: /\bchmod\b[^;|&]*(777|a\+rwx|ugo\+rwx|ugo=rwx|\b0?[2-7][0-7]{3}|[ugoa]*\+[rwxXt]*s)\b/i, reason: "permission weakening (chmod 777/setuid)" },
+	{ id: "raw-device", pattern: /(>\s*\/dev\/(sd|hd|nvme|mmcblk|vd|xvd)|of=\/dev\/(sd|hd|nvme|mmcblk|vd|xvd)|\bmkfs\b|\btee\s+(-\S+\s+)*\/dev\/(sd|hd|nvme|mmcblk|vd|xvd))/i, reason: "raw device write/format" },
+	{ id: "git-push-force", pattern: new RegExp(GIT + String.raw`push\b[^;|&]*(?:\s-[a-zA-Z]*f[a-zA-Z]*\b|--force\b|\s\+\S)`, "i"), reason: "git push --force" },
+	{ id: "git-reset-hard", pattern: new RegExp(GIT + String.raw`reset\b[^;|&]*\s--hard\b`, "i"), reason: "git reset --hard" },
+	{ id: "git-clean-force", pattern: new RegExp(GIT + String.raw`clean\b[^;|&]*(\s-[a-zA-Z]*f|--force)`, "i"), reason: "git clean -f" },
+	{ id: "git-checkout-dot", pattern: new RegExp(GIT + String.raw`checkout\s+(--\s+)?\.(?:\s|$)`, "i"), reason: "git checkout . (discard working tree)" },
+	{ id: "git-restore", pattern: new RegExp(GIT + String.raw`restore\b`, "i"), reason: "git restore (discard changes)" },
+	{ id: "remote-exec", pattern: /\b(curl|wget)\b[^;|&]*\|\s*(sudo\s+)?(env\s+)?(\/\S*\/)?(ba|z|da|k)?sh\b|\b(ba|z|da|k)?sh\s+<\(\s*(curl|wget)\b/i, reason: "remote code execution (curl|sh)" },
 	{ id: "gh-repo", pattern: /\bgh\s+repo\s+(create|delete|rename|archive)\b/i, reason: "GitHub repository-level change" },
 	{ id: "gh-release", pattern: /\bgh\s+release\s+(create|delete|edit)\b/i, reason: "GitHub release change" },
 	{ id: "fork-bomb", pattern: /:\(\)\s*\{/, reason: "fork bomb" },
@@ -1424,11 +1427,12 @@ const S0_SECRET = [
 	// V8 (security audit): common plaintext credential files added
 	/(^|\/)\.netrc$/i, /(^|\/)\.npmrc$/i, /(^|\/)\.pypirc$/i, /(^|\/)\.envrc$/i, /(^|\/)\.vault-token$/i,
 	/\.kube(\/|$)/i, /\.docker\/config\.json$/i, /\.gem\/credentials$/i,
+	/\.(?:key|p12|pfx)$/i, /(^|\/)\.pgpass$/i, /(^|\/)\.my\.cnf$/i, /(^|\/)rclone\.conf$/i, /\.azure(\/|$)/i,
 ];
 // /private prefixes: macOS firmlinks — /etc, /var are really /private/etc,
 // /private/var, and realpath'd toolchain output uses the real spelling (#21)
 const S1_SYSTEM = [/^\/etc(\/|$)/i, /^\/private\/(etc|var)(\/|$)/i, /^\/usr(\/|$)/i, /^\/var(\/|$)/i, /^\/System(\/|$)/i, /(^|\/)authorized_keys$/i];
-const S2_USER_RC = [/\.(bashrc|zshrc|profile|bash_profile|gitconfig)$/i, /crontab/i, /Library\/LaunchAgents(\/|$)/i, /\.config\/systemd(\/|$)/i];
+const S2_USER_RC = [/\.(bashrc|zshrc|zshenv|zprofile|zlogin|profile|bash_profile|bash_login|gitconfig)$/i, /crontab/i, /Library\/LaunchAgents(\/|$)/i, /\.config\/systemd(\/|$)/i, /\.local\/bin(\/|$)/i, /\.config\/autostart(\/|$)/i];
 const S3_GIT_META = [/(^|\/)\.git\/(hooks|config|modules)(\/|$)/i, /(^|\/)\.gitmodules$/i];
 
 /** F5: a recursive grep rooted at the home directory, one of its ancestors or a filesystem root reads every credential file below it (the S0 patterns only see a path that names one). */
@@ -1473,9 +1477,10 @@ function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: b
 	// In-cwd write allowance (#20): every canonical form must sit inside the cwd
 	// (in either its lexical or real form) — a lexical prefix hit whose real
 	// form escapes the project (symlink alias) grades as an outside-cwd write.
-	const cwdBases = new Set(baseForms(path.resolve(cwd)));
+	// A filesystem-root or home-directory cwd is no project: nothing inside it is mechanically allowed (same test as rmScopeBases).
+	const cwdBases = new Set(baseForms(absCwd));
 	const inCwd = (f: string) => [...cwdBases].some((b) => f === b || f.startsWith(b + path.sep));
-	if (forms.every(inCwd)) return { verdict: "allow" };
+	if (path.parse(absCwd).root !== absCwd && !pathEquals(absCwd, os.homedir()) && forms.every(inCwd)) return { verdict: "allow" };
 	return { verdict: "gray", reason: `write outside project directory (CWD): ${rawPath}` };
 }
 
