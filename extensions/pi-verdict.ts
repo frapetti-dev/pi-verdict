@@ -1424,6 +1424,12 @@ const S1_SYSTEM = [/^\/etc(\/|$)/i, /^\/private\/(etc|var)(\/|$)/i, /^\/usr(\/|$
 const S2_USER_RC = [/\.(bashrc|zshrc|profile|bash_profile|gitconfig)$/i, /crontab/i, /Library\/LaunchAgents(\/|$)/i, /\.config\/systemd(\/|$)/i];
 const S3_GIT_META = [/(^|\/)\.git\/(hooks|config|modules)(\/|$)/i, /(^|\/)\.gitmodules$/i];
 
+/** F5: a recursive grep rooted at the home directory, one of its ancestors or a filesystem root reads every credential file below it (the S0 patterns only see a path that names one). */
+function coversHome(forms: string[]): boolean {
+	const homes = baseForms(path.resolve(os.homedir()));
+	return forms.some((f) => path.parse(f).root === f || homes.some((h) => pathEquals(f, h) || pathStartsWith(h, f)));
+}
+
 /** One path-tier hit at its configured action (deny/ask carry the hit for grant coverage; allow = no judgment → gray). */
 function pathTierResult(id: PathTierId, text: string, forms: string[], tiers: Readonly<Record<PathTierId, RuleAction>>): RuleResult {
 	const action = tiers[id];
@@ -1448,7 +1454,7 @@ function classifyPath(toolName: string, rawPath: string, cwd: string, isWrite: b
 	const ruleForms = forms.map(toRuleForm);
 	const hit = (rules: RegExp[]) => ruleForms.some((f) => rules.some((r) => r.test(f)));
 	const tier = (id: PathTierId, text: string): RuleResult => pathTierResult(id, text, forms, tiers);
-
+	if (toolName === "grep" && coversHome(forms)) return tier("s0-secret", `recursive search over the home directory or a filesystem root: ${rawPath}`);
 	if (hit(S0_SECRET)) return tier("s0-secret", `S0 secrets/credential path: ${rawPath}`);
 	if (!isWrite) {
 		if (hit(S1_SYSTEM)) return tier("s1-system-read", `read system config path: ${rawPath}`);
@@ -1801,7 +1807,7 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 	} else if (kind === "file") { // grep/find/ls: optional path; absent → cwd is the
 		// effective target, so user rules and denyPaths compare against it (#48)
 		const p = typeof input.path === "string" ? input.path : undefined;
-		base = p ? classifyPath(toolName, p, cwd, false, user.pathRules) : { verdict: "allow" };
+		base = p || toolName === "grep" ? classifyPath(toolName, p ?? "", cwd, false, user.pathRules) : { verdict: "allow" };
 	} else if (toolName === SETTINGS_TOOL_NAME) {
 		// RL-8: the tool confirms every change with the user itself; no target, so user rules/denyPaths never apply
 		base = { verdict: "allow", reason: "pi-verdict settings tool (confirms every change with the user)" };

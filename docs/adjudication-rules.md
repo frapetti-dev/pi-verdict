@@ -116,7 +116,7 @@ Pinned by: gated execution (EG-1–EG-4) › EG-1: the wrapper is allowed mechan
 
 #### PG-1: Applicability
 
-Path grading is the built-in base for file tools. `read`, `write` and `edit` are always graded (an empty path resolves to the cwd); `write` and `edit` use write grading (PG-5), every other graded tool uses read grading (PG-4). `grep`, `find` and `ls` are graded only when given a non-empty path; without one the base result is allow.
+Path grading is the built-in base for file tools. `read`, `write` and `edit` are always graded (an empty path resolves to the cwd); `write` and `edit` use write grading (PG-5), every other graded tool uses read grading (PG-4). `find` and `ls` are graded only when given a non-empty path; without one the base result is allow. `grep` is always graded (an omitted path is the cwd), because of the home/root rule in PG-4.
 
 Why: a scope tool without a path searches the cwd, which the rule layer treats as the effective target (RL-3) rather than as a graded path.
 Code: `classifyByRules`, `classifyPath`
@@ -142,9 +142,11 @@ Pinned by: built-in rules (RL-5, RL-6, PG) › write to S0 secret path → deny;
 
 For read grading, after S0 (PG-3): a path under an S1 system prefix (`/etc`, `/private/etc`, `/private/var`, `/usr`, `/var`, `/System`, or a file named `authorized_keys`) is graded by the path tier `s1-system-read` (default `allow` = gray, reason prefix `tier s1-system-read:` when it is set to `ask` or `deny`); every other path is allowed without the classifier. Reads outside S0 and S1 are therefore mechanically allowed, including paths outside the cwd.
 
-Why: reads change nothing on disk; only credential reads (S0) and system configuration reads (S1) carry the risk the grading targets (code comment on `classifyPath`).
-Code: `classifyPath`, `S1_SYSTEM`
-Pinned by: S-rule case folding + firmlink prefixes (#21) › read /private/etc/sudoers grades gray like /etc/sudoers (firmlink prefix); path floor dual-form matching (#20) › ordinary direct-path behavior unchanged; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › path tiers: ask opens the dialog, deny blocks with the tier id in the reason
+A recursive `grep` whose target (or, with no path, whose cwd) is the home directory, one of its ancestors or a filesystem root is an S0 hit (tier `s0-secret`, reason `recursive search over the home directory or a filesystem root`): the S0 patterns only match a path that names a credential file, while a search from above one reads its contents. `find` and `ls` list names only and are not affected.
+
+Why: reads change nothing on disk; only credential reads (S0), system configuration reads (S1) and searches that sweep over credential files carry the risk the grading targets (code comment on `classifyPath`).
+Code: `classifyPath`, `S1_SYSTEM`, `coversHome`
+Pinned by: S-rule case folding + firmlink prefixes (#21) › read /private/etc/sudoers grades gray like /etc/sudoers (firmlink prefix); path floor dual-form matching (#20) › ordinary direct-path behavior unchanged; built-in rules (RL-5, RL-6, PG) › configurable actions, custom rules, merge and order › path tiers: ask opens the dialog, deny blocks with the tier id in the reason; grep over home or a filesystem root (F5) › home, its parent and a filesystem root are an S0 hit for grep (PG-4); grep over home or a filesystem root (F5) › grep without a path from the home directory is the same hit (PG-4); grep over home or a filesystem root (F5) › find, ls and a project below home are not affected (PG-4)
 
 #### PG-5: Writes
 

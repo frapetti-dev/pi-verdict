@@ -7441,3 +7441,34 @@ describe("gate-owned files (F3)", () => {
 		});
 	});
 });
+
+// ── Recursive grep over the home directory or a filesystem root (F5) ──
+describe("grep over home or a filesystem root (F5)", () => {
+	const HOME = os.homedir();
+	const deniedAsS0 = async (cwd: string, input: Record<string, unknown>) => {
+		const h = session({}, { cwd });
+		const r = await toolCall(h, "grep", { pattern: "BEGIN", ...input });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).toContain("tier s0-secret");
+		expect(h.calls).toHaveLength(0);
+	};
+
+	test("home, its parent and a filesystem root are an S0 hit for grep (PG-4)", async () => {
+		await deniedAsS0("/proj", { path: HOME });
+		await deniedAsS0("/proj", { path: path.dirname(HOME) });
+		await deniedAsS0("/proj", { path: path.parse(HOME).root });
+	});
+
+	test("grep without a path from the home directory is the same hit (PG-4)", async () => {
+		await deniedAsS0(HOME, {});
+	});
+
+	test("find, ls and a project below home are not affected (PG-4)", async () => {
+		const project = path.join(HOME, ".pv-f5-project");
+		for (const [tool, input, cwd] of [["find", { path: HOME }, "/proj"], ["ls", { path: HOME }, "/proj"], ["grep", {}, project], ["grep", { path: project }, "/proj"]] as const) {
+			const h = session({}, { cwd });
+			h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+			expect(await toolCall(h, tool, { pattern: "x", ...input })).toBeUndefined();
+		}
+	});
+});
