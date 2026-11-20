@@ -2618,7 +2618,7 @@ describe("project trust prompt", () => {
 			await start(h);
 			expect((h as any).selects).toBe(0);
 			expect(await applied(h)).toBe(true);
-		}, { subagentGate: "normal" }); // the probe runs tool_call on a subagent, which is inert under the default "off"
+		}, { subagentGate: "normal" }); // the probe runs tool_call on a subagent; "normal" keeps the root UI prompt out of the way of the "auto" default
 	});
 
 	test("malformed trust file: Trust applies for the session, file untouched, warns", async () => {
@@ -3286,7 +3286,7 @@ describe("footer status", () => {
 	});
 
 	describe("status bar styling", () => {
-		const info = { mode: "auto" as const, classifier: { id: "m", thinking: "off", state: "inherited" as const }, fallback: null, counts: { allow: 0, ask: 2, deny: 0 }, floorOff: true, ompGateOff: false, confidenceThreshold: null, thresholds: { deny: null, allow: null }, unattendedDenyPathsAllow: false, unattendedOmpDirAllow: false, subagentGate: "off" as const };
+		const info = { mode: "auto" as const, classifier: { id: "m", thinking: "off", state: "inherited" as const }, fallback: null, counts: { allow: 0, ask: 2, deny: 0 }, floorOff: true, ompGateOff: false, confidenceThreshold: null, thresholds: { deny: null, allow: null }, unattendedDenyPathsAllow: false, unattendedOmpDirAllow: false, subagentGate: "auto" as const };
 		const rgb: Record<string, string> = { success: "0;255;136", warning: "255;179;71", error: "255;71;87", accent: "0;180;255", muted: "1;1;1", dim: "2;2;2" };
 		/** omp-like theme: statusLine* names resolve; `hostNames:false` mimics pi, whose theme throws on them */
 		const theme = (hostNames: boolean) => ({
@@ -4085,10 +4085,11 @@ describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 		});
 	});
 
-	test("default is off: a fresh config leaves subagents ungated", async () => {
+	test("default is auto: a fresh config gates subagents without prompting", async () => {
 		await withBridge({ subagentGate: undefined }, async (root, sub) => {
-			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /opt/x" })).toBeUndefined();
-			expect(sub.calls.length).toBe(0);
+			const r = await toolCall(sub, "bash", { command: "rm " + "-rf /opt/x" });
+			expect(r?.block).toBe(true);
+			expect(String(r?.reason)).toContain("rm-recursive");
 			expect(root.confirms).toBe(0);
 		});
 	});
@@ -4161,9 +4162,9 @@ describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 		expect(warning).toContain("subagentGate");
 		expect(warning).toContain("subagentAskTimeoutMs");
 		await h.handlers["session_shutdown"]({}, h.ctx);
-		// an invalid mode falls back to the default (off): the subagent is not gated, nothing prompts
+		// an invalid mode falls back to the default (auto): the subagent is gated, nothing prompts
 		await withBridge({ subagentGate: "x", subagentAskTimeoutMs: 0 }, async (root, sub) => {
-			expect(await toolCall(sub, "bash", { command: "rm " + "-rf /opt/x" })).toBeUndefined();
+			expect((await toolCall(sub, "bash", { command: "rm " + "-rf /opt/x" }))?.block).toBe(true);
 			expect(root.confirms).toBe(0);
 		});
 	});
@@ -5978,7 +5979,7 @@ describe("gate briefing (GR-7)", () => {
 
 	test("mode off and an ungated subagent get no briefing", async () => {
 		expect(await briefed(session({}, { verdictMode: "off" }))).toBeUndefined();
-		const h = session({});
+		const h = session({ subagentGate: "off" });
 		h.ctx.agent = SUB;
 		expect(await briefed(h)).toBeUndefined();
 	});

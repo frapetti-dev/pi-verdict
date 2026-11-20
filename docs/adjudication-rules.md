@@ -651,11 +651,11 @@ Pinned by: grant invitation (PR-10) › invite row on a gray ask: call allowed, 
 
 #### SG-1: Identity and off
 
-A call is a subagent call when the omp context carries `agent.kind === "sub"`; pi never has one. With `subagentGate: "off"` (default) the gate is inert in subagents: their calls pass ungated, while the root session stays gated. Approval mode `off` (MD-2) still applies first.
+A call is a subagent call when the omp context carries `agent.kind === "sub"`; pi never has one. With `subagentGate: "off"` the gate is inert in subagents: their calls pass ungated, while the root session stays gated. The default is `auto` (SG-3), so subagent calls run the full pipeline unless the user opts out. Approval mode `off` (MD-2) still applies first.
 
-Why: default `off` keeps existing subagent workflows unchanged.
+Why: a default of `off` let any call, including one the root session would have been asked about, pass unchecked once it was delegated to a subagent (`task` is on the starter `tools` allowlist); `auto` keeps the gate in force with nobody to prompt, and `off` stays an explicit opt-out.
 Code: `subagentIdentity`, the `tool_call` handler in `autoMode`
-Pinned by: subagent gate (omp ctx.agent.kind = sub) › off: the gate is inert in subagents (the root stays gated); subagent gate (omp ctx.agent.kind = sub) › default is off: a fresh config leaves subagents ungated
+Pinned by: subagent gate (omp ctx.agent.kind = sub) › off: the gate is inert in subagents (the root stays gated); subagent gate (omp ctx.agent.kind = sub) › default is auto: a fresh config gates subagents without prompting
 
 #### SG-2: normal
 
