@@ -2105,6 +2105,8 @@ interface ClassifierOutcome {
 	files: FileContext;
 	/** SC-5: the second layer handed the call back to the first layer (verdict is a placeholder ask). */
 	rejudge?: true;
+	/** The reason was produced by the jev adapter, so confidence and probabilities may be read from it (F9: a general LLM's text is never parsed as one). */
+	jev?: true;
 }
 
 const CLASSIFIER_TIMEOUT_MS = 25_000; // this gateway's CC classifier distribution p90=19.8s (15s would wrongly kill ~15%), research/cache-sim data
@@ -2382,7 +2384,7 @@ async function classifyWithModel(
 				const diag = `stopReason=${r.stopReason}, model=${model.id}, errorMessage=${JSON.stringify(r.errorMessage ?? null)}, raw output=${JSON.stringify(r.text.slice(0, 200))}`;
 				if (r.stopReason !== "error" && r.stopReason !== "aborted") {
 					const parsed = parseClassifierReply(r.text, allowNeedFiles, allowRejudge);
-					if (parsed?.kind === "verdict") return { verdict: parsed.verdict, reason: parsed.reason, source: "model", auditRaw: audit(), files };
+					if (parsed?.kind === "verdict") return { verdict: parsed.verdict, reason: parsed.reason, source: "model", auditRaw: audit(), files, ...(isJevModel(model) ? { jev: true as const } : {}) };
 					if (parsed?.kind === "rejudge") return { verdict: "ask", reason: "second layer handed the call back to the first layer", source: "model", rejudge: true, auditRaw: audit(), files };
 					if (parsed?.kind === "need-files") {
 						requested = parsed.paths;
@@ -2994,7 +2996,7 @@ export interface AdjudicateEnv {
  *  to the fallback if configured, else to the human (headless degrades to deny). Numeric
  *  confidence exists only on jev-formatted reasons; LLM first layers never demote. */
 function confidenceDemotion(outcome: ClassifierOutcome, rules: UserRules): { confidence: number } | null {
-	if (rules.confidenceThreshold === null || outcome.source === "fail-closed") return null;
+	if (rules.confidenceThreshold === null || outcome.jev !== true) return null;
 	const conf = parseJevConfidence(outcome.reason);
 	if (conf !== null && conf < rules.confidenceThreshold) return { confidence: conf };
 	return null;
@@ -3093,7 +3095,7 @@ async function runConfidenceCascade(
 			applied = { verdict: "ask", reason: "first layer failed on rejudge — your call", source: "fail-closed" };
 		} else {
 			const dem = confidenceDemotion(again, rules);
-			const jev = dem ? null : parseJevReason(again.reason);
+			const jev = dem || again.jev !== true ? null : parseJevReason(again.reason);
 			const mapped = jev ? applyModeThresholds(rules.mode, jev, rules) : null;
 			if (dem) applied = { verdict: "ask", reason: `${again.reason} (confidence ${dem.confidence}% is below your confidenceThreshold of ${rules.confidenceThreshold}%)`, source: "classifier" };
 			else if (mapped && mapped !== again.verdict) applied = { verdict: mapped, reason: `${again.reason} — ${rules.mode} thresholds: ${again.verdict} → ${mapped}`, source: "classifier" };
@@ -3400,7 +3402,7 @@ async function adjudicateRuled(
 	let firstVerdict = outcome.verdict;
 	let firstReason = outcome.reason;
 	let thresholdVerdict: VerdictChoice | undefined;
-	const jev = !demotion && outcome.source === "model" ? parseJevReason(outcome.reason) : null;
+	const jev = !demotion && outcome.jev === true ? parseJevReason(outcome.reason) : null;
 	const mapped = jev ? applyModeThresholds(mode, jev, state.userRules) : null;
 	if (mapped && mapped !== outcome.verdict) {
 		thresholdVerdict = mapped;

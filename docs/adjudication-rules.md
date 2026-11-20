@@ -360,11 +360,11 @@ Pinned by: extension wiring › model_select on the jev provider warns; other pr
 
 #### CS-1: Confidence floor
 
-When `confidenceThreshold` is set, a first-layer jev verdict whose confidence is strictly below it is demoted, whatever its verdict (allow, ask or deny). A demotion means the first layer abstains and the call cascades (CS-3 to CS-8). The floor is inert for LLM first layers (their reasons carry no numeric confidence) and for fail-closed outcomes; it works standalone, with or without a fallback.
+When `confidenceThreshold` is set, a first-layer jev verdict whose confidence is strictly below it is demoted, whatever its verdict (allow, ask or deny). A demotion means the first layer abstains and the call cascades (CS-3 to CS-8). The floor is inert for LLM first layers and for fail-closed outcomes; it works standalone, with or without a fallback. A reason is read for confidence only when the outcome was produced by a jev model (`ClassifierOutcome.jev`, set from the model's provider/api): text of a general model that merely looks like a jev reason is never parsed.
 
 Why: jev already emits calibrated probabilities but the pipeline consumed only its choice; 23 of 403 jev allows in the measured corpus carried confidence below 50% and were allowed anyway ([research/classifier-fallback-model-feasibility.md](../research/classifier-fallback-model-feasibility.md)).
 Code: `confidenceDemotion`, `parseJevConfidence`
-Pinned by: confidence floor + cascade (#67) › min set, no fallback: below-floor demotes to ask with ground truth; at the floor stays autonomous; confidence floor + cascade (#67) › non-jev reasons never demote (LLM first layer: floor inert)
+Pinned by: confidence floor + cascade (#67) › min set, no fallback: below-floor demotes to ask with ground truth; at the floor stays autonomous; confidence floor + cascade (#67) › non-jev reasons never demote (LLM first layer: floor inert); jev reason parsing (F9) › a forged low confidence from a general model does not trigger the confidence floor cascade (CS-1); jev reason parsing (F9) › the same reason from a jev model is honoured (CS-1, CS-2)
 
 #### CS-2: Mode thresholds
 
@@ -376,11 +376,11 @@ Each mode has optional jev probability thresholds (percent) that re-map a non-de
 | `unattended` | deny if P(deny) ≥ `unattendedDenyThreshold`; else allow |
 | `supervised` | allow if P(allow) ≥ `supervisedAllowThreshold`; else ask |
 
-LLM verdicts and fallback verdicts are NEVER re-mapped.
+LLM verdicts and fallback verdicts are NEVER re-mapped, and neither is a verdict of a general model whose reason text imitates a jev reason (only an outcome flagged `jev`, CS-1, is parsed).
 
 Why: a threshold must never turn a fallback's judgment into something it did not say; the global floor (CS-1) runs first.
 Code: `applyModeThresholds`
-Pinned by: approval modes › jev probability thresholds › auto: autoDenyThreshold turns an allow with 35% deny probability into a deny, recorded in the audit; approval modes › jev probability thresholds › auto: unset thresholds leave jev's own choice alone; approval modes › jev probability thresholds › supervised: supervisedAllowThreshold turns a 60% allow into an ask
+Pinned by: approval modes › jev probability thresholds › auto: autoDenyThreshold turns an allow with 35% deny probability into a deny, recorded in the audit; approval modes › jev probability thresholds › auto: unset thresholds leave jev's own choice alone; approval modes › jev probability thresholds › supervised: supervisedAllowThreshold turns a 60% allow into an ask; jev reason parsing (F9) › a general model's verdict is not re-mapped by a jev-shaped reason it wrote (CS-2)
 
 #### CS-3: Cascade triggers
 
