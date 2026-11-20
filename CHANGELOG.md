@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ### Changed
 
 - Scope precedence (session › local › global › default), the untrusted-local skip, scoped writes and the `verdict_settings get` entry now live in one module, `extensions/pi-verdict-lib/scoped-settings.ts`, instead of four copies inside `autoMode`. `package.json` `files` ships the new `extensions/pi-verdict-lib/` directory: when installing by hand, copy the directory next to `pi-verdict.ts` (`cp -r extensions/pi-verdict.ts extensions/jev-adapter.ts extensions/pi-verdict-lib <agentDir>/extensions/`). No behavior change otherwise.
+- The per-call gate (`gateCall`, `presentVerdict`, `rememberApproval`) moved out of the `autoMode` closure into `extensions/pi-verdict-lib/gate-driver.ts` (`createGateDriver`), with the host UI as an explicit port. No behavior change.
 
 ### Fixed
 

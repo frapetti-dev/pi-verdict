@@ -624,7 +624,7 @@ On the Tern-native surface the label row shows the probability meter and then a 
 
 Why: a pass should be attributable at a glance; the omp transport has no TUI-only channel.
 Code: `verdictLabelFor`, `VerdictLabel`, the `tool_result` handler in `autoMode`
-Pinned by: approve dialog code expansion and verdict label › pi: classifier allow and user approval are told apart; denied calls leave no label; approve dialog code expansion and verdict label › omp: rule allow sends a hidden aside custom message, never a pi entry; Tern-native UI (TSP) › verdict label: compact probability and confidence meters share one row (PR-7)
+Pinned by: approve dialog code expansion and verdict label › pi: classifier allow and user approval are told apart; denied calls leave no label; approve dialog code expansion and verdict label › omp: rule allow sends a hidden aside custom message, never a pi entry; Tern-native UI (TSP) › verdict label: compact probability and confidence meters share one row (PR-7); gate driver (PR-2, PR-7, SG-4) › root ask answered Yes: allowed, labelled user
 
 #### PR-8: Verdict counters
 
@@ -682,7 +682,7 @@ Every ask carries `autoResolve`. `allow` means the cascade's fallback already al
 
 Why: a second model may only widen access by explicitly approving; every doubt fails closed.
 Code: `resolveAskWithoutHuman`
-Pinned by: subagent gate (omp ctx.agent.kind = sub) › normal: unanswered past subagentAskTimeoutMs → second model decides; only an explicit allow permits; subagent gate (omp ctx.agent.kind = sub) › no root UI: normal degrades to the second-model path with no prompt
+Pinned by: subagent gate (omp ctx.agent.kind = sub) › normal: unanswered past subagentAskTimeoutMs → second model decides; only an explicit allow permits; subagent gate (omp ctx.agent.kind = sub) › no root UI: normal degrades to the second-model path with no prompt; gate driver (PR-2, PR-7, SG-4) › subagent ask with no root UI and no fallback model: blocked with the subagent-auto tag
 
 #### SG-5: Never auto-allowed
 
