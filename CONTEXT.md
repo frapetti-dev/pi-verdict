@@ -331,6 +331,10 @@ Rules: [CF-1](docs/adjudication-rules.md#cf-1-agentdir-resolution)
 A layer a setting can be stored in: `session`, `local`, `global`, or the built-in default.
 Rules: [CF-5](docs/adjudication-rules.md#cf-5-session-scope)
 
+**Scoped settings**:
+The resolution and writing of one setting across the session, local, global and default scopes: which scope's value applies, what a scope inherits, and where an edit is stored.
+Rules: [CF-4](docs/adjudication-rules.md#cf-4-merge-semantics), [CF-5](docs/adjudication-rules.md#cf-5-session-scope)
+
 **Global scope**:
 The user config file under agentDir.
 _Avoid_: user scope

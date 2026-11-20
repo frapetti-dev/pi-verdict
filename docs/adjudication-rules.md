@@ -724,7 +724,7 @@ The project file is `<project>/.omp/pi-verdict.json` on omp and `<project>/.pi/p
 
 Why: a cloned repository's project config must never silently alter the gate, and a config that was reviewed once must not be swapped for a different one under the same trust.
 Code: `findProjectConfig`, `readTrustStore`, `recordTrust`, `trustProject`, the `session_start` handler in `autoMode`
-Pinned by: project trust prompt › Trust: applies, persists the root, and is not asked again; project trust prompt › headless: no prompt, config ignored; project trust prompt › subagent: no prompt and ignored when undecided; applied when the main session trusted it; project trust prompt › malformed trust file: Trust applies for the session, file untouched, warns; gate-owned files (F3) › an edited project config is no longer trusted: not applied, asked again with the settings it applies (CF-3); gate-owned files (F3) › a legacy string trust entry re-prompts once instead of applying the file (CF-3)
+Pinned by: project trust prompt › Trust: applies, persists the root, and is not asked again; project trust prompt › headless: no prompt, config ignored; project trust prompt › subagent: no prompt and ignored when undecided; applied when the main session trusted it; project trust prompt › malformed trust file: Trust applies for the session, file untouched, warns; gate-owned files (F3) › an edited project config is no longer trusted: not applied, asked again with the settings it applies (CF-3); gate-owned files (F3) › a legacy string trust entry re-prompts once instead of applying the file (CF-3); /rule command › project: saving into a trusted project keeps it trusted and the rule applies at once; scoped settings (CF-4, CF-5) › winner: an untrusted local value is skipped; trusting the project makes local win over global
 
 #### CF-4: Merge semantics
 
@@ -898,18 +898,18 @@ Pinned by: settings tool (ST-1–ST-5) › no UI refuses changes without a dialo
 
 #### ST-4: Plaintext
 
-`get` returns, per key, the effective value, its source and the stored value at each scope; `denyPaths` is reduced to `{redacted: true, count}`. For `denyPaths` `add`/`remove` there is no membership check before the dialog, and a no-op is reported only after approval, so the agent learns nothing about the list. Results never echo a stored value; the dialog shows `denyPaths` plaintext to the user only (PP-6).
+`get` returns, per key, the effective value, its source and the stored value at each scope; `denyPaths` is reduced to `{redacted: true, count}`. For `dangerRules` and `pathRules` the entry also carries `sources`, one origin per effective id: `session`, `local`, `global`, `contribution` (a custom rule no scope stores) or `default`. For `denyPaths` `add`/`remove` there is no membership check before the dialog, and a no-op is reported only after approval, so the agent learns nothing about the list. Results never echo a stored value; the dialog shows `denyPaths` plaintext to the user only (PP-6).
 
 Why: the tool's output reaches the agent, and protected-path plaintext must not (PP-6).
-Code: the `execute` handler registered as `SETTINGS_TOOL_NAME` in `autoMode`
-Pinned by: settings tool (ST-1–ST-5) › get never returns denyPaths plaintext
+Code: `ScopedSettings.describe` (`extensions/pi-verdict-lib/scoped-settings.ts`), the `execute` handler registered as `SETTINGS_TOOL_NAME` in `autoMode`
+Pinned by: settings tool (ST-1–ST-5) › get never returns denyPaths plaintext; scoped settings (CF-4, CF-5) › describe: dangerRules sources are reported per id
 
 #### ST-5: Writes
 
-An approved change goes through the same writers as the menus (`writeScoped`, `setSessionRuleAdditions`) and takes effect immediately (CF-8). The first `local` list change on a key the project does not override starts from a copy of the global list, and the dialog says so. A change at `local` in a project that is not trusted is saved but not applied until the project is trusted (CF-3).
+An approved change goes through the same writers as the menus (`ScopedSettings.write`, `setSessionRuleAdditions`) and takes effect immediately (CF-8). The first `local` list change on a key the project does not override starts from a copy of the global list, and the dialog says so. A change at `local` in a project that is not trusted is saved but not applied until the project is trusted (CF-3).
 
 Why: one writer per scope keeps menu and tool edits identical; the copy-first rule matches the project-replaces-global list semantics (CF-4).
-Code: `writeScoped`, `setSessionRuleAdditions`
+Code: `ScopedSettings.write`, `setSessionRuleAdditions`
 Pinned by: settings tool (ST-1–ST-5) › local add starts from a copy of the global list; settings tool (ST-1–ST-5) › session add to deny takes effect immediately
 
 ## GR: Permission grants

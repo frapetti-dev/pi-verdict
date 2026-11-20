@@ -8,6 +8,7 @@
 	"files": [
 		"extensions/pi-verdict.ts",
 		"extensions/jev-adapter.ts",
+		"extensions/pi-verdict-lib/",
 		"README.md",
 		"LICENSE"
 	],
