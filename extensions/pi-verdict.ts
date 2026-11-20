@@ -295,6 +295,28 @@ function shellWords(segment: string): string[] | null {
 	return words;
 }
 
+/** true when a command has a shell operator outside quotes (`;` `&` `|` `<` `>` newline, backtick, `$(`), or an unbalanced quote: it can run more than the author of an allow regex saw. Backtick and `$(` also count inside double quotes. */
+function hasShellOperator(command: string): boolean {
+	let quote: string | null = null;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote === "'") {
+			if (ch === "'") quote = null;
+		} else if (ch === "\\") {
+			i++;
+		} else if (ch === "`" || (ch === "$" && command[i + 1] === "(")) {
+			return true;
+		} else if (quote === '"') {
+			if (ch === '"') quote = null;
+		} else if (ch === "'" || ch === '"') {
+			quote = ch;
+		} else if (";&|<>\n\r".includes(ch)) {
+			return true;
+		}
+	}
+	return quote !== null;
+}
+
 /** Words that may precede `rm` in a segment without changing what it deletes; anything else (`echo rm`, `docker run x rm`, `xargs`) leaves the rule in force. */
 const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const RM_PREFIX_WORD = /^(?:command|env|time|nohup|git)$/;
@@ -1863,7 +1885,10 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 		const hit = hitDenyPaths(toolName, input, cwd, denyPathBases);
 		if (hit) return { verdict: "ask", reason: "user-declared protected path (denyPaths) [path withheld; see pi-verdict.json]", detail: hit, gate: "deny-paths", ...underneath };
 		for (const re of user.allow) {
-			if (re.test(target)) return { verdict: "allow", reason: "user allow rule" };
+			if (!re.test(target)) continue;
+			// F10: an allow regex vouches for one command, not for whatever an operator chains after it; such a command is judged by the classifier
+			if (kind === "command" && hasShellOperator(target)) break;
+			return { verdict: "allow", reason: "user allow rule" };
 		}
 	}
 	return base;
@@ -4540,7 +4565,7 @@ ${RULE_KINDS_DOC}
 
 ${RULE_LAYERS_DOC}
 
-Write the narrowest rule that does what was asked, never broader. Anchor command regexes with ^ and end command words with \b. Prefer rules (free text) over a regex when a regex would be fragile or over-broad.
+Write the narrowest rule that does what was asked, never broader. Anchor command regexes with ^ and end command words with \b. A command allow rule never mechanically allows a command containing an unquoted shell operator (; & | < > newline, backticks, $(...)): such commands go to the classifier. Prefer rules (free text) over a regex when a regex would be fragile or over-broad.
 
 When <feedback> is present it lists your failed attempts or the human's amendment; output one corrected rule that fixes every listed problem and NEVER repeat a failed rule.
 
