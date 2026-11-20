@@ -569,12 +569,13 @@ describe("user rules (deny > allow > gray)", () => {
 		const r1 = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x && " + head });
 		expect(r1?.block).toBe(true);
 		expect(h.calls.length).toBe(0);
-		// danger beyond the cap loses rule matching (truncation) → gray → classifier
+		// danger beyond the cap loses its own rule match, but oversize-command asks (F2): headless → deny, no model call
 		const h2 = session({});
-		h2.responses = [{ text: "<verdict>deny</verdict> mock" }];
+		h2.ctx.hasUI = false;
 		const r2 = await toolCall(h2, "bash", { command: head + " ; rm " + "-rf /opt/x" });
-		expect(h2.calls.length).toBe(1);
+		expect(h2.calls.length).toBe(0);
 		expect(r2?.block).toBe(true);
+		expect(String(r2?.reason)).toContain("oversize-command");
 	});
 	test("builtinDenyFloor: false disables the whole built-in deny floor (risk accepted by user)", async () => {
 		const h = session({ builtinDenyFloor: false });
@@ -827,7 +828,7 @@ describe("transcript line injection (#22)", () => {
 	test("path branch goes through sanitize: zero-width chars stripped, overlong entries truncated", async () => {
 		const h = session({});
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
-		await toolCall(h, "read", { path: "/etc/sudoers\u200b" + "x".repeat(1200) });
+		await toolCall(h, "read", { path: "/etc/sudoers\u200b" + "x".repeat(BASH_MAX_MATCH_LEN + 200) });
 		expect(h.calls.length).toBe(1);
 		const t = readTranscript(h);
 		expect(t).not.toContain("\u200b");
@@ -2911,7 +2912,7 @@ describe("/verdict config editor", () => {
 		await run(h, "", [...times(9, DOWN), ENTER, DOWN, DOWN, RIGHT], rendered);
 		expect(readUser().dangerRules["npm-publish"]).toEqual({ pattern: "\\bnpm\\s+publish\\b" });
 		expect(readUser().dangerRules.sudo).toBe("ask");
-		driveMenu(h, [...times(9, DOWN), ENTER, ...times(14, DOWN), RIGHT]);
+		driveMenu(h, [...times(9, DOWN), ENTER, ...times(15, DOWN), RIGHT]);
 		await h.commands.verdict.handler("", h.ctx);
 		expect(readUser().dangerRules["npm-publish"]).toEqual({ pattern: "\\bnpm\\s+publish\\b", action: "ask" });
 		driveMenu(h, [...times(9, DOWN), ENTER, DOWN, DOWN, LEFT]); // sudo ask → deny; the page keeps LEFT for the value, not for going back
@@ -7272,5 +7273,47 @@ describe("host path normalization (F1, F8)", () => {
 			expect(r?.block).toBe(true);
 			expect(h.calls.length).toBe(0);
 		}
+	});
+});
+
+// ── Oversize commands (F2): rules and the classifier must see the whole command ──
+describe("oversize commands (F2)", () => {
+	const BIG = "echo " + "a".repeat(9000);
+
+	test("a command longer than BASH_MAX_MATCH_LEN asks; headless it is denied without a model call (RL-5)", async () => {
+		const h = session({});
+		h.ctx.hasUI = false;
+		const r = await toolCall(h, "bash", { command: BIG });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).toContain("oversize-command");
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("a rule hit hidden past the cap is still reported through oversize-command (RL-5)", async () => {
+		const h = session({});
+		h.ctx.hasUI = false;
+		const r = await toolCall(h, "bash", { command: "echo " + "a".repeat(9000) + "; sudo ls" });
+		expect(r?.block).toBe(true);
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("oversize-command set to allow: the classifier sees the action line up to BASH_MAX_MATCH_LEN, not 1000 characters (CL-1)", async () => {
+		const h = session({ dangerRules: { "oversize-command": "allow" } });
+		h.responses = [{ text: "<verdict>allow</verdict> fine" }];
+		await toolCall(h, "bash", { command: BIG });
+		expect(h.calls).toHaveLength(1);
+		const lastLine = String(h.calls[0].messages[0].content).split("\n").filter((l) => l.startsWith("bash: ")).at(-1) ?? "";
+		expect(lastLine.length).toBeGreaterThan(8000);
+		expect(h.calls[0].systemPrompt).toContain("[truncated]");
+	});
+
+	test("unattended grant request whose review line would be truncated is refused without a model call (GR-3)", async () => {
+		const h = session({ mode: "unattended" });
+		await h.handlers.session_start({}, h.ctx);
+		const quotes = '"'.repeat(480);
+		const paths = Array.from({ length: 10 }, (_, i) => ({ path: `/x${i}${quotes}`, access: "read" }));
+		const r = await h.tools.verdict_grant.execute("t1", { action: "request", request: '"'.repeat(1000), paths }, undefined, undefined, h.ctx);
+		expect(r.content[0].text).toContain("cannot be reviewed in full");
+		expect(h.calls).toHaveLength(0);
 	});
 });

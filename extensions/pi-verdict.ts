@@ -125,10 +125,18 @@ export interface DangerRule {
 	builtin: boolean;
 	/** Built-in path-scoped rule: a regex hit is waived when every rm operand resolves strictly inside the workspace or temp directory (rmEscapesScope). */
 	scoped?: true;
+	/** Matched against the whole command, not the BASH_MAX_MATCH_LEN prefix (oversize-command). */
+	uncapped?: true;
 }
 
-/** Built-in danger rules (defaults; read-only): matched against the full command string (covers pipes/compound commands); the default action is deny (from research report §4.3). The effective list is `UserRules.dangerRules`. */
-const BASH_DANGER_RULES: ReadonlyArray<{ id: string; pattern: RegExp; reason: string; scoped?: true }> = [
+/** Cap the danger-regex matching input (#25): the prefix-consuming character
+ *  classes plus nested alternations can backtrack quadratically on very long
+ *  separator-free strings. Beyond the cap, rule matching is lost: the built-in `oversize-command` rule (action ask)
+ *  turns such a command into a human decision instead of a silent classifier pass (F2). */
+export const BASH_MAX_MATCH_LEN = 8192;
+
+/** Built-in danger rules (defaults; read-only): matched against the full command string (covers pipes/compound commands); the default action is deny (from research report §4.3) unless `action` says otherwise. The effective list is `UserRules.dangerRules`. */
+const BASH_DANGER_RULES: ReadonlyArray<{ id: string; pattern: RegExp; reason: string; scoped?: true; uncapped?: true; action?: RuleAction }> = [
 	{ id: "rm-recursive", pattern: /\brm\b[^;|&]*(\s-(?:[a-zA-Z]*r[a-zA-Z]*f?|[a-zA-Z]*f[a-zA-Z]*r)\b|--recursive)/i, reason: "recursive delete (rm -r) outside the workspace and temp directory", scoped: true },
 	{ id: "rm-root", pattern: /\brm\s+(-[a-zA-Z]*\s+)*(--recursive\s+)?(\/|\/etc|\/usr|\/var|~|\$HOME)(?:\s|$)/i, reason: "delete root/system/home directory" },
 	{ id: "sudo", pattern: /\bsudo\b/i, reason: "privilege escalation (sudo)" },
@@ -143,9 +151,10 @@ const BASH_DANGER_RULES: ReadonlyArray<{ id: string; pattern: RegExp; reason: st
 	{ id: "gh-repo", pattern: /\bgh\s+repo\s+(create|delete|rename|archive)\b/i, reason: "GitHub repository-level change" },
 	{ id: "gh-release", pattern: /\bgh\s+release\s+(create|delete|edit)\b/i, reason: "GitHub release change" },
 	{ id: "fork-bomb", pattern: /:\(\)\s*\{/, reason: "fork bomb" },
+	{ id: "oversize-command", pattern: new RegExp(`^[\\s\\S]{${BASH_MAX_MATCH_LEN + 1}}`), reason: `command longer than ${BASH_MAX_MATCH_LEN} characters (rules and the classifier cannot check it whole)`, action: "ask", uncapped: true },
 ];
 
-const DEFAULT_DANGER_RULES = (): DangerRule[] => BASH_DANGER_RULES.map((r) => ({ ...r, action: "deny", builtin: true }));
+const DEFAULT_DANGER_RULES = (): DangerRule[] => BASH_DANGER_RULES.map((r) => ({ ...r, action: r.action ?? "deny", builtin: true }));
 
 type RuleVerdict = "allow" | "deny" | "gray" | "ask";
 /** A built-in rule hit that produced a deny/ask: what a permission grant must cover to lift it (GR-5). */
@@ -167,16 +176,10 @@ interface RuleResult {
 	builtinReason?: string;
 }
 
-/** Cap the danger-regex matching input (#25): the prefix-consuming character
- *  classes plus nested alternations can backtrack quadratically on very long
- *  separator-free strings. Beyond the cap, rule matching is lost and the call
- *  falls to the classifier (fail-closed direction). */
-export const BASH_MAX_MATCH_LEN = 8192;
-
 /** Rules whose action is `allow` are skipped (no judgment). Any deny hit wins over ask hits; the reason lists every hit of the winning action. */
 function classifyBash(command: string, rules: readonly DangerRule[], cwd: string): RuleResult {
 	const capped = command.length > BASH_MAX_MATCH_LEN ? command.slice(0, BASH_MAX_MATCH_LEN) : command;
-	const hits = rules.filter((r) => r.action !== "allow" && r.pattern.test(capped) && (!r.scoped || rmEscapesScope(command, r.pattern, cwd)));
+	const hits = rules.filter((r) => r.action !== "allow" && r.pattern.test(r.uncapped ? command : capped) && (!r.scoped || rmEscapesScope(command, r.pattern, cwd)));
 	if (hits.length) {
 		const action: "deny" | "ask" = hits.some((r) => r.action === "deny") ? "deny" : "ask";
 		const won = hits.filter((r) => r.action === action);
@@ -1815,7 +1818,7 @@ function classifierSystem(choices: readonly VerdictChoice[]): string {
 	const verdictLines = (["allow", "deny", "ask"] as const).filter((v) => choices.includes(v)).map((v) => `- ${v}: ${crit[v]}`);
 	return `You are a permission classifier for tool calls in an AI coding agent. You see a condensed transcript of the session: genuine user messages and past tool calls. The LAST line of the transcript is the action under review.
 
-Judge the action by its full effect — what it runs, sends, publishes, or enables — not its surface form.
+Judge the action by its full effect — what it runs, sends, publishes, or enables — not its surface form. If the action line contains "…[truncated]…", part of the action is hidden from you: never answer allow.
 
 Verdicts:
 ${verdictLines.join("\n")}
@@ -1878,12 +1881,12 @@ const MAX_TOOL_CALLS = 10;
 const MAX_ENTRY_CHARS = 1000;
 
 /** Strip zero-width characters + length cap (head 60% + tail 40%), basic anti-injection sanitization (borrowed from ai-guard) */
-function sanitize(text: string): string {
+function sanitize(text: string, cap = MAX_ENTRY_CHARS): string {
 	// eslint-disable-next-line no-control-regex
 	const cleaned = text.replace(/[​-‍⁠﻿]/g, "");
-	if (cleaned.length <= MAX_ENTRY_CHARS) return cleaned;
-	const head = Math.floor(MAX_ENTRY_CHARS * 0.6);
-	const tail = MAX_ENTRY_CHARS - head;
+	if (cleaned.length <= cap) return cleaned;
+	const head = Math.floor(cap * 0.6);
+	const tail = cap - head;
 	return `${cleaned.slice(0, head)}…[truncated]…${cleaned.slice(-tail)}`;
 }
 
@@ -1893,14 +1896,15 @@ function sanitize(text: string): string {
  *  otherwise forge a structural line (#22). Covers \n, \r\n, lone \r and the
  *  Unicode separators U+2028/U+2029/U+0085, which models may render as breaks.
  *  Content is preserved, only the line structure is defended. */
-function transcriptSafe(text: string): string {
-	return sanitize(text).replace(/[\r\n\u2028\u2029\u0085]/g, "\\n");
+function transcriptSafe(text: string, cap = MAX_ENTRY_CHARS): string {
+	return sanitize(text, cap).replace(/[\r\n\u2028\u2029\u0085]/g, "\\n");
 }
 
-function toolCallLine(name: string, args: Record<string, unknown>): string {
-	if (typeof args.command === "string") return `${name}: ${transcriptSafe(args.command)}`;
-	if (typeof args.path === "string") return `${name}: ${transcriptSafe(args.path)}`;
-	return `${name}: ${transcriptSafe(JSON.stringify(args))}`;
+/** `cap` is the per-entry length limit: history lines keep MAX_ENTRY_CHARS, the action under review gets BASH_MAX_MATCH_LEN so the classifier sees what the rules saw (F2). */
+function toolCallLine(name: string, args: Record<string, unknown>, cap = MAX_ENTRY_CHARS): string {
+	if (typeof args.command === "string") return `${name}: ${transcriptSafe(args.command, cap)}`;
+	if (typeof args.path === "string") return `${name}: ${transcriptSafe(args.path, cap)}`;
+	return `${name}: ${transcriptSafe(JSON.stringify(args), cap)}`;
 }
 
 /** Minimal structural needs of the adjudication pipeline on the host session (transcript source + session id) - adjudicate does not take a full
@@ -3186,7 +3190,7 @@ async function adjudicateRuled(
 	// handler appends after the confirm resolves (with the ground truth); everything else
 	// appends immediately. Recording stays observe-only — it never changes a verdict; write
 	// failures stay fail-soft in the sink and surface once via drainWarning.
-	const actionLine = toolCallLine(call.toolName, call.input);
+	const actionLine = toolCallLine(call.toolName, call.input, BASH_MAX_MATCH_LEN);
 	const buildRecord = (v: Pick<AuditRecord, "verdict" | "reason" | "source" | "degraded">, raw: ClassifierOutcome["auditRaw"] | null, shadow: string, fc: FileContext = EMPTY_FILE_CONTEXT): AuditRecord => ({
 		mode: state.userRules.mode,
 		ts: new Date().toISOString(),
@@ -9080,7 +9084,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			};
 
 			if (rules.mode === "unattended") {
-				const actionLine = toolCallLine(GRANT_TOOL_NAME, { request, paths: paths.map(({ path: p, access }) => ({ path: p, access })), ...(ruleIds.length ? { rules: ruleIds } : {}) });
+				const grantArgs = { request, paths: paths.map(({ path: p, access }) => ({ path: p, access })), ...(ruleIds.length ? { rules: ruleIds } : {}) };
+				if (JSON.stringify(grantArgs).length > BASH_MAX_MATCH_LEN) {
+					return settingsToolText(`Rejected (unattended mode, no human): the grant request is longer than ${BASH_MAX_MATCH_LEN} characters and cannot be reviewed in full. Nothing was granted. Shorten it or split it.`);
+				}
+				const actionLine = toolCallLine(GRANT_TOOL_NAME, grantArgs, BASH_MAX_MATCH_LEN);
 				const widgetUi = ctx.hasUI && typeof ctx.ui.setWidget === "function" ? ctx.ui : null;
 				widgetUi?.setWidget(STATUS_WIDGET_KEY, ["🛡️ verdict: reviewing permission grant…"]);
 				let review: GrantConsensus;
