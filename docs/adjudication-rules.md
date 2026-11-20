@@ -276,11 +276,11 @@ Pinned by: classifier model resolution › pi-native thinking suffix: zai/flash:
 
 #### CL-4: Input transcript
 
-The classifier's user message is a `<transcript>` block of line-structured text: the last 5 user-message lines (`User: …`), then the last 10 tool-call lines (`name: command`, `name: path`, or `name: <JSON args>`), then the action under review as the LAST line. Every line is sanitized: zero-width characters stripped, entries over 1000 characters cut to the first 600 plus the last 400, and every line break (`\n`, `\r`, U+2028, U+2029, U+0085) escaped to a literal `\n` so a payload cannot forge a structural line. Assistant narration, thinking and tool results NEVER enter the transcript.
+The classifier's user message is a `<transcript>` block of line-structured text: the last 5 user-message lines (`User: …`), then the last 10 tool-call lines (`name: command`, `name: path`, or `name: <JSON args>`), then the action under review as the LAST line. Every line is sanitized: zero-width characters and terminal control characters (C0 and C1 except tab, newline and carriage return) stripped, entries over 1000 characters cut to the first 600 plus the last 400, and every line break (`\n`, `\r`, U+2028, U+2029, U+0085) escaped to a literal `\n` so a payload cannot forge a structural line. Assistant narration, thinking and tool results NEVER enter the transcript.
 
 Why: tool results and assistant text are the main indirect-injection surface; the condensed transcript with the action pinned last follows the Claude Code classifier design ([research/claude-code-classifier-prompts.md](../research/claude-code-classifier-prompts.md)); line forging was closed in #22.
 Code: `buildTranscript`, `collectTranscriptParts`, `sanitize`, `transcriptSafe`
-Pinned by: transcript line injection (#22) › multi-line user message cannot forge a second User line; genuine content survives; transcript line injection (#22) › path branch goes through sanitize: zero-width chars stripped, overlong entries truncated
+Pinned by: transcript line injection (#22) › multi-line user message cannot forge a second User line; genuine content survives; transcript line injection (#22) › path branch goes through sanitize: zero-width chars stripped, overlong entries truncated; terminal control sequences (F13) › classifier transcript strips control bytes but keeps tabs and newlines
 
 #### CL-5: System prompt composition
 
@@ -592,13 +592,13 @@ Pinned by: notifyAllows (#60) › notifyAllows: one classifier-allow notificatio
 
 #### PR-4: Ask dialog
 
-An ask presents a dialog with Yes, No and (when allowed, PP-9) Explain…. While highlighted, No is an inline text field: non-empty text is sanitized to a single line and forwarded to the agent in the block reason as `, saying: "<text>"`; empty text or Escape declines plainly. A decline blocks with tag `user-declined`. Hosts without the rich dialog get a plain yes/no confirm. Dialogs are serialized process-wide. The dialog shows the code under review and, for a jev ask, its probability bar and concern.
+An ask presents a dialog with Yes, No and (when allowed, PP-9) Explain…. While highlighted, No is an inline text field: non-empty text is sanitized to a single line and forwarded to the agent in the block reason as `, saying: "<text>"`; empty text or Escape declines plainly. A decline blocks with tag `user-declined`. Hosts without the rich dialog get a plain yes/no confirm (title and message pass through `displaySafe`, so control bytes show as visible `\uXXXX` escapes; the same holds for the subagent label and the unattended grant-rejection notice). Dialogs are serialized process-wide. The dialog shows the code under review and, for a jev ask, its probability bar and concern.
 With PR-9 the dialog's second row is "Yes, and don't ask again this session" (never in the permission-grant dialog).
 With PR-10 a third row, "Yes, and grant similar operations…", follows it in root sessions.
 
 Why: not recorded.
 Code: `confirmAsk`, `buildApproveDialog`, `declineDetail`
-Pinned by: EXPLAIN-GATE role and decline explanation › No with inline text: the user's text reaches the agent in the block reason; EXPLAIN-GATE role and decline explanation › declineDetail: single line, trimmed, absent when blank; approve dialog routing › ui.custom returning undefined (RPC mode) falls back to confirm
+Pinned by: EXPLAIN-GATE role and decline explanation › No with inline text: the user's text reaches the agent in the block reason; EXPLAIN-GATE role and decline explanation › declineDetail: single line, trimmed, absent when blank; approve dialog routing › ui.custom returning undefined (RPC mode) falls back to confirm; terminal control sequences (F13) › the plain select/confirm fallbacks show control bytes in a grant request as visible escapes, never raw
 
 #### PR-5: EXPLAIN-GATE
 

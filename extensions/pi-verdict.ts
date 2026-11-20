@@ -1985,6 +1985,7 @@ const MAX_ENTRY_CHARS = 1000;
 
 /** Strip zero-width characters + length cap (head 60% + tail 40%), basic anti-injection sanitization (borrowed from ai-guard) */
 function sanitize(text: string, cap = MAX_ENTRY_CHARS): string {
+	text = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, ""); // F13: terminal control bytes (ESC, CSI, BEL …) never reach the classifier transcript; \t \n \r stay
 	// eslint-disable-next-line no-control-regex
 	const cleaned = text.replace(/[​-‍⁠﻿]/g, "");
 	if (cleaned.length <= cap) return cleaned;
@@ -6792,7 +6793,7 @@ async function confirmAsk(ui: UiContext, spec: ApproveDialogSpec, opts: { signal
 			const pick = await pickAsk(ui, { ...spec, explain: explain !== undefined, explanation }, signal);
 			if (signal?.aborted) return "aborted";
 			if (pick === undefined) {
-				const ok = await ui.confirm(spec.title, spec.fallbackMessage, dialogOpts);
+				const ok = await ui.confirm(displaySafe(spec.title), displaySafe(spec.fallbackMessage), dialogOpts);
 				if (signal?.aborted) return "aborted";
 				return ok ? { allow: true } : { allow: false };
 			}
@@ -6836,7 +6837,7 @@ async function confirmGrant(ui: UiContext, spec: ApproveDialogSpec, signal?: Abo
 			return pick.reason !== undefined ? { kind: "clarify", text: pick.reason } : { kind: "reject" };
 		}
 		for (;;) {
-			const choice = await ui.select(`${spec.title}\n${spec.fallbackMessage}`, [GRANT_LABELS.yes!, GRANT_LABELS.reject!, GRANT_LABELS.no!], dialogOpts);
+			const choice = await ui.select(displaySafe(`${spec.title}\n${spec.fallbackMessage}`), [GRANT_LABELS.yes!, GRANT_LABELS.reject!, GRANT_LABELS.no!], dialogOpts);
 			if (signal?.aborted) return "aborted";
 			if (choice === GRANT_LABELS.yes) return { kind: "approve" };
 			if (choice !== GRANT_LABELS.no) return { kind: "reject" };
@@ -7012,7 +7013,7 @@ export function planModeActive(ctx: ExtensionContext): boolean {
 }
 
 function subagentLabel(id: { id: string; name: string }): string {
-	return id.id === id.name ? `subagent ${id.id}` : `subagent ${id.id} (${id.name})`;
+	return displaySafe(id.id === id.name ? `subagent ${id.id}` : `subagent ${id.id} (${id.name})`);
 }
 
 /** UI of the top-level interactive session in this process. Module-level: extension factories
@@ -9253,7 +9254,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					ctx.ui.notify(`🛡️ Permission grant ${id} approved by the classifier (unattended): ${displaySafe(request).replace(/\s+/g, " ").slice(0, 120)}`, "info");
 					return settingsToolText(grantedText(id, "the classifier (unattended mode, no human)"));
 				}
-				ctx.ui.notify(`🛡️ Permission grant request rejected by the classifier (unattended): ${review.reason}`, "warning");
+				ctx.ui.notify(`🛡️ Permission grant request rejected by the classifier (unattended): ${displaySafe(review.reason)}`, "warning");
 				return settingsToolText(`Rejected (unattended mode, no human): ${review.reason}. Nothing was granted.`);
 			}
 

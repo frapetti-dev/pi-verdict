@@ -7655,3 +7655,26 @@ describe("jev endpoint override warning (F11)", () => {
 		}
 	});
 });
+
+// ── terminal control sequences in model/agent-controlled text (F13) ──
+describe("terminal control sequences (F13)", () => {
+	test("the plain select/confirm fallbacks show control bytes in a grant request as visible escapes, never raw", async () => {
+		const h = session({});
+		await h.handlers.session_start({}, h.ctx);
+		h.selectPicks = ["I reject"];
+		await h.tools.verdict_grant.execute("t1", { action: "request", request: "deploy \x1b[2J\x1b]0;pwned\x07" }, undefined, undefined, h.ctx);
+		expect(h.selectTitles).toHaveLength(1);
+		expect(h.selectTitles[0]).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+		expect(h.selectTitles[0]).toContain("\\u001b");
+	});
+
+	test("classifier transcript strips control bytes but keeps tabs and newlines", async () => {
+		const h = session({});
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		await toolCall(h, "bash", { command: "echo a\tb\x1b[2Jc\x07d" });
+		const sent = JSON.stringify(h.calls[0].messages);
+		expect(sent).not.toContain("\\u001b");
+		expect(sent).not.toContain("\\u0007");
+		expect(sent).toContain("a\\tb[2Jcd");
+	});
+});
