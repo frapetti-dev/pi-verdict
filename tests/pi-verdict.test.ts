@@ -14,6 +14,7 @@ import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown
 import { prettyJson, prettyShell } from "../extensions/pi-verdict.ts";
 import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
 import { COLLECT_CHANNEL, CONTRIBUTE_CHANNEL } from "../extensions/pi-verdict.ts";
+import { createGateDriver } from "../extensions/pi-verdict-lib/gate-driver.ts";
 import { createScopedSettings } from "../extensions/pi-verdict-lib/scoped-settings.ts";
 
 // ── Stub infrastructure ─────────────────────────────────
@@ -3334,6 +3335,42 @@ describe("scoped settings (CF-4, CF-5)", () => {
 			const entry = ss.describe("dangerRules");
 			expect(entry.sources).toMatchObject({ sudo: "global", "git-push-force": "session", "rm-root": "default" });
 		});
+	});
+});
+
+describe("gate driver (PR-2, PR-7, SG-4)", () => {
+	function makeDriver() {
+		setConfig({});
+		const state = new SessionState(undefined, TMP_AGENT);
+		const h = makeHarness();
+		const driver = createGateDriver({
+			state,
+			isDebug: () => false,
+			pipelineEnv: () => adjudicateEnv({ text: "<verdict>ask</verdict> maybe", hasUI: true }),
+			refreshStatus: () => {},
+			explainAsk: async () => ({ ok: false, error: "unused" }),
+			describeAction: (toolName) => toolName,
+			rootUi: () => null,
+		});
+		return { state, h, driver };
+	}
+
+	test("root ask answered Yes: allowed, labelled user", async () => {
+		const { state, h, driver } = makeDriver();
+		const r = await driver.gateCall({ toolName: "bash", input: { command: "echo hello" } }, h.ctx, "call-1");
+		expect(r).toBeUndefined();
+		expect(h.confirms).toBe(1);
+		expect(state.takeLabel("call-1")?.how).toBe("user");
+	});
+
+	test("subagent ask with no root UI and no fallback model: blocked with the subagent-auto tag", async () => {
+		const { h, driver } = makeDriver();
+		h.ctx.agent = { kind: "sub", id: "S1", name: "s" };
+		h.ctx.hasUI = false;
+		const r = await driver.gateCall({ toolName: "bash", input: { command: "echo hello" } }, h.ctx, "call-2");
+		expect(r?.block).toBe(true);
+		expect(r?.reason.startsWith("[auto-mode subagent-auto block] BLOCKED")).toBe(true);
+		expect(h.confirms).toBe(0);
 	});
 });
 

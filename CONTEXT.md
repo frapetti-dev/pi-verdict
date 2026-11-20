@@ -238,6 +238,10 @@ Rules: [CS-3](docs/adjudication-rules.md#cs-3-cascade-triggers), [MD-4](docs/adj
 
 ### Outcomes
 
+**Gate driver**:
+The per-session handling of one tool call from adjudication to its presented outcome: the verdict, the ask dialog or block, the audit record and the verdict label.
+Rules: [PR-1](docs/adjudication-rules.md#pr-1-ask-degradation), [PR-2](docs/adjudication-rules.md#pr-2-block-reason), [PR-3](docs/adjudication-rules.md#pr-3-notifications), [PR-7](docs/adjudication-rules.md#pr-7-verdict-label), [AU-3](docs/adjudication-rules.md#au-3-interactive-asks)
+
 **Ask degradation**:
 The turning of an ask into a deny when no UI is available to answer it.
 Rules: [PR-1](docs/adjudication-rules.md#pr-1-ask-degradation)
