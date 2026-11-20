@@ -292,6 +292,10 @@ function shellWords(segment: string): string[] | null {
 	return words;
 }
 
+/** Words that may precede `rm` in a segment without changing what it deletes; anything else (`echo rm`, `docker run x rm`, `xargs`) leaves the rule in force. */
+const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const RM_PREFIX_WORD = /^(?:command|env|time|nohup|git)$/;
+
 /** true only if every operand of the segment's `rm` provably resolves strictly inside one of `bases`. */
 function rmOperandsInScope(segment: string, cwd: string, bases: string[], cwdChanged: boolean): boolean {
 	const raw = shellWords(segment);
@@ -303,8 +307,8 @@ function rmOperandsInScope(segment: string, cwd: string, bases: string[], cwdCha
 		else if (/^\d*(?:>>?|<)/.test(w)) continue;
 		else words.push(w);
 	}
-	const at = words.findIndex((w) => w.replace(/^\\/, "").split(/[\\/]/).pop() === "rm");
-	if (at < 0) return false;
+	const at = words.findIndex((w) => !ASSIGNMENT_WORD.test(w) && !RM_PREFIX_WORD.test(w));
+	if (at < 0 || words[at].replace(/^\\/, "").split(/[\\/]/).pop() !== "rm") return false;
 	const operands: string[] = [];
 	let optionsEnded = false;
 	for (const w of words.slice(at + 1)) {
@@ -316,6 +320,9 @@ function rmOperandsInScope(segment: string, cwd: string, bases: string[], cwdCha
 		if (/[`{]/.test(op) || /\$(?!HOME(?:\/|$))/.test(op)) return false;
 		if (op.startsWith("~") && op !== "~" && !op.startsWith("~/")) return false;
 		if (process.platform !== "win32" && op.includes("\\")) return false;
+		// `link/..` leaves the directory the symlink points to, which path.resolve cannot see: a `..` after a real segment is never provable
+		const parts = op.split(/[\\/]/).filter((s) => s !== "" && s !== ".");
+		if (parts.some((s, i) => s === ".." && i > 0 && parts[i - 1] !== "..")) return false;
 		const t = expandHome(op.replace(/^\$HOME(?=\/|$)/, os.homedir()));
 		if (cwdChanged && !path.isAbsolute(t)) return false;
 		const forms = rebuiltForms(path.resolve(cwd, t));
@@ -1558,7 +1565,6 @@ const SCRIPT_WRAPPER = /^(?:env|time|nohup|exec|command|&)$/;
 const SCRIPT_EXTENSION = /\.(?:ts|tsx|mts|cts|js|mjs|cjs|py|sh|bash|zsh|ps1|psm1|rb|pl|php)$/i;
 /** Interpreter flags that carry the program inline (or a module): the command runs no local script. */
 const INLINE_CODE_FLAG = /^(?:-c|-e|--eval|-command|-p)$/i;
-const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /** SC-1: absolute paths of the local scripts a shell command executes (interpreter argument, direct execution, `source`/`.`), deduped by `fold`, in order of appearance.
  *  A candidate is kept when it is an existing regular file or carries a script extension (a missing one becomes a `missing` entry in the file context). Never reads content;

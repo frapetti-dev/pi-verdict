@@ -518,6 +518,29 @@ describe("built-in rules (RL-5, RL-6, PG)", () => {
 				await isGray(ws, RMF + "build", { dangerRules: { "rm-recursive": "ask" } });
 			});
 		});
+		test("only an assignment or wrapper word may precede rm; another command word keeps the rule (F6)", async () => {
+			await withWs(async (ws) => {
+				for (const c of [RMF + "build", "FOO=1 " + RMF + "build", "command " + RMF + "build", "env " + RMF + "build"]) await isGray(ws, c);
+				for (const c of ["xargs " + RMF + "build", "nice " + RMF + "build", "xargs -a list.txt " + RMF + "build"]) await isDeny(ws, c);
+			});
+		});
+		test("a .. after a real path segment is never provably inside the workspace (F6)", async () => {
+			await withWs(async (ws) => {
+				for (const c of [RMF + "a/../b", RMF + ws + "/a/../b", RMF + "$HOME/x/../y"]) await isDeny(ws, c);
+				await isGray(ws, RMF + "./a/b");
+			});
+		});
+		test.skipIf(process.platform === "win32")("a symlink followed by .. leaves the workspace even though the lexical path stays in it (F6)", async () => {
+			await withWs(async (ws) => {
+				const outside = fs.mkdtempSync(path.join(os.homedir(), ".pv-rm-out-"));
+				try {
+					fs.symlinkSync(outside, path.join(ws, "link"));
+					await isDeny(ws, RMF + "link/../victim");
+				} finally {
+					fs.rmSync(outside, { recursive: true, force: true });
+				}
+			});
+		});
 	});
 });
 
