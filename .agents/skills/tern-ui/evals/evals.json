@@ -1,0 +1,53 @@
+{
+  "skill_name": "tern-ui",
+  "evals": [
+    {
+      "id": 1,
+      "name": "todo-overlay",
+      "prompt": "In my project I want an omp slash command /todos that pops up a native Tern dialog listing every TODO/FIXME comment in the repo grouped by file (count badge per file). Selecting one and pressing a button should open that file at the line in a split pane to the right. It has to keep working when I run omp in plain Windows Terminal. Put the extension in ./todos-ext/.",
+      "expected_output": "An omp extension with an overlay that has describe plus a render fallback, a list/item with keys, a button plus key handling, and `tern open --split right path:line` gated on the Tern env.",
+      "files": [],
+      "expectations": [
+        "has-describe-and-render-fallback: every object literal or class with describe( also has render(",
+        "harness-describe-runs: describe-harness.ts <entry> --command todos exits 0",
+        "memo-stable: the harness prints memo-stable: true",
+        "timers-cleared-on-dispose: if setInterval is used, clearInterval appears in dispose",
+        "keyboard-twin-for-actions: there is a handleInput with escape handling",
+        "exec-uses-argv: no pi.exec of sh/bash/cmd and no shell string",
+        "tern-cli-gated: TERM_PROGRAM and TERN_PANE are checked before the tern exec",
+        "overlay-role: nativeOverlay has a role"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "git-dashboard-screen",
+      "prompt": "make me a full-screen tern dashboard for omp (/gitdash) that shows the current branch, ahead/behind, a table of changed files with status badges and a sparkline of commits per day for the last 14 days; refresh every 5s; esc closes. extension goes in ./gitdash/",
+      "expected_output": "A fullscreen overlay with describeScreen (main/dock), a timer cleared on dispose, a memoized describe, table/chart, and data from pi.exec(\"git\", ...) argv.",
+      "files": [],
+      "expectations": [
+        "has-describe-and-render-fallback: every object literal or class with describe( also has render(",
+        "harness-describe-runs: describe-harness.ts <entry> --command gitdash exits 0",
+        "memo-stable: the harness prints memo-stable: true",
+        "timers-cleared-on-dispose: if setInterval is used, clearInterval appears in dispose",
+        "keyboard-twin-for-actions: there is a handleInput with escape handling",
+        "exec-uses-argv: no pi.exec of sh/bash/cmd and no shell string",
+        "uses-describeScreen-with-dock: describeScreen returns main and dock"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "branch-status-plugin",
+      "prompt": "Write a Tern plugin (not an omp extension) that shows the current git branch of the focused pane in Tern's status line and adds a command palette entry 'Copy branch name'. Put it in ./branch-plugin/ and tell me how to install it.",
+      "expected_output": "plugin.toml with schema = 1 and a valid id, a window.luau using tern.chrome.status and tern.command, tern.process.run with argv for git, and install instructions using tern plugin link.",
+      "files": [],
+      "expectations": [
+        "manifest-valid: schema = 1, id matches ^[a-z][a-z0-9-]{0,31}$, and name, version and a host/window entry are present",
+        "uses-chrome-status: tern.chrome.status is called",
+        "uses-tern-command: tern.command is called",
+        "process-run-argv: tern.process.run is called with an array argv",
+        "no-require-tern: the code never calls require(\"tern\")",
+        "install-instructions-link: the summary or README mentions tern plugin link"
+      ]
+    }
+  ]
+}

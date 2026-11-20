@@ -6,6 +6,12 @@
       "sourceType": "github",
       "skillPath": "skills/langfuse/SKILL.md",
       "computedHash": "7f77556876c26d91a276735cc78652e587ca92e02091b72c1afcb32bf67cdc66"
+    },
+    "tern-ui": {
+      "source": "frapetti-dev/tern-ui",
+      "sourceType": "github",
+      "skillPath": "skills/tern-ui/SKILL.md",
+      "computedHash": "dc91e82b347be8e2d88baa560f3324e82ea0ff0da46cb7a42a150a92c39b9032"
     }
   }
 }

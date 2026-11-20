@@ -1,0 +1,16 @@
+# Tern plugin manifest. Rules (https://docs.stencil.so/tern/reference/manifest.md):
+#   schema = 1 (required); id matches ^[a-z][a-z0-9-]{0,31}$ and is unique;
+#   name 1-64 chars; version free-form; at least one of host/window;
+#   [[lenses]] and [[blocks]] REQUIRE a host entry; unknown keys are errors.
+# Rename: id, name, the lens id and its match globs. Lens id "seq" -> tern.lens.define("seq", ...).
+schema = 1
+id = "my-plugin"
+name = "My plugin"
+version = "0.1.0"
+description = "A seq lens, a hello command and a status segment."
+host = "host.luau"
+window = "window.luau"
+
+[[lenses]]
+id = "seq"
+match = ["seq *"]
