@@ -168,8 +168,8 @@ interface RuleResult {
 	 *  context: block reasons and notifications travel back to the model, so only the
 	 *  local confirm dialog may show it (PP-6: zero path plaintext leaves the machine). */
 	detail?: string;
-	/** Which forced gate produced an ask: the `.omp` directory gate or a denyPaths hit (unattended picks its action per gate). */
-	gate?: "omp-dir" | "deny-paths";
+	/** Which forced gate produced an ask: the `.omp` directory gate, the gate-owned files gate (PP-10) or a denyPaths hit (unattended picks its action per gate; the first two share `unattendedOmpDir`). */
+	gate?: "omp-dir" | "gate-files" | "deny-paths";
 	/** Built-in rule hits behind a deny/ask (also attached to a gate ask when the built-in rules would have asked or denied too). */
 	builtin?: BuiltinHit[];
 	/** Reason of the built-in hit that `builtin` describes, kept when a gate ask replaces `reason`. */
@@ -637,7 +637,30 @@ function rootIn(root: string, list: string[]): boolean {
 	return list.some((t) => baseForms(t).some((tf) => rootForms.some((rf) => samePath(tf, rf))));
 }
 
-interface TrustStore { trusted: string[]; untrusted: string[]; error: string | null }
+/** A trusted project: its root plus the sha256 of the project config bytes that were trusted (F3: an edited file is no longer trusted).
+ *  A legacy string entry has `sha256: null`, which never matches, so it re-prompts once. */
+interface TrustEntry { root: string; sha256: string | null }
+/** Session-scoped trust: the same pair, but the hash is always known. */
+interface SessionTrust { root: string; sha256: string }
+interface TrustStore { trusted: TrustEntry[]; untrusted: string[]; error: string | null }
+
+const sha256Hex = (b: Buffer | string): string => createHash("sha256").update(b).digest("hex");
+
+/** sha256 of the project config file bytes; null when unreadable. */
+function projectConfigHash(pp: string): string | null {
+	try {
+		return sha256Hex(fs.readFileSync(pp));
+	} catch {
+		return null;
+	}
+}
+
+/** "trusted": a session or store entry for this root carries the current content hash; "changed": the root was trusted but no entry matches the current content; "none": never trusted. */
+function trustStateOf(root: string, hash: string | null, store: TrustStore, session: SessionTrust | null): "trusted" | "changed" | "none" {
+	const entries = [...(session ? [session] : []), ...store.trusted].filter((e) => rootIn(root, [e.root]));
+	if (entries.length === 0) return "none";
+	return hash !== null && entries.some((e) => e.sha256 === hash) ? "trusted" : "changed";
+}
 
 function readTrustStore(): TrustStore {
 	const p = trustStorePath();
@@ -653,28 +676,34 @@ function readTrustStore(): TrustStore {
 	}
 	let error: string | null = null;
 	const obj = raw as Record<string, unknown>; // narrowed above to a non-null, non-array object
-	const list = (key: "trusted" | "untrusted"): string[] => {
+	const array = (key: "trusted" | "untrusted"): unknown[] => {
 		const v = obj[key];
 		if (v === undefined) return [];
 		if (!Array.isArray(v)) {
 			error ??= `trust file ${key}: must be an array of paths (${p})`;
 			return [];
 		}
-		return v.flatMap((x) => (typeof x === "string" && x.trim() ? [path.resolve(x.trim())] : []));
+		return v;
 	};
-	const trusted = list("trusted");
-	const untrusted = list("untrusted");
+	const trusted = array("trusted").flatMap((x): TrustEntry[] => {
+		if (typeof x === "string") return x.trim() ? [{ root: path.resolve(x.trim()), sha256: null }] : [];
+		if (typeof x !== "object" || x === null || !("root" in x) || typeof x.root !== "string" || !x.root.trim()) return [];
+		const sha = "sha256" in x ? x.sha256 : null;
+		return [{ root: path.resolve(x.root.trim()), sha256: typeof sha === "string" && /^[0-9a-f]{64}$/.test(sha) ? sha : null }];
+	});
+	const untrusted = array("untrusted").flatMap((x) => (typeof x === "string" && x.trim() ? [path.resolve(x.trim())] : []));
 	return { trusted, untrusted, error };
 }
 
-/** Persist a trust decision for a project root. Returns an error message, or null on success.
+/** Persist a trust decision for a project root (a "trusted" one records the config hash it covers). Returns an error message, or null on success.
  *  A damaged file is never overwritten (the user may have hand-edited it). */
-function recordTrust(root: string, decision: "trusted" | "untrusted"): string | null {
+function recordTrust(root: string, decision: "trusted" | "untrusted", sha256: string | null = null): string | null {
 	const store = readTrustStore();
 	if (store.error !== null) return store.error;
-	const trusted = store.trusted.filter((e) => !rootIn(root, [e]));
+	const trusted = store.trusted.filter((e) => !rootIn(root, [e.root]));
 	const untrusted = store.untrusted.filter((e) => !rootIn(root, [e]));
-	(decision === "trusted" ? trusted : untrusted).push(path.resolve(root));
+	if (decision === "trusted") trusted.push({ root: path.resolve(root), sha256 });
+	else untrusted.push(path.resolve(root));
 	const p = trustStorePath();
 	try {
 		fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -1150,7 +1179,7 @@ function sessionOnlyLoad(sessionRaw: Record<string, unknown>, skipped: string[],
  * missing/corrupt config or invalid fields always fall back to empty rules (safe default, no failure), invalid regexes are collected and reported,
  * an invalid toggleShortcut collects warning text (emitted via session_start, same as skipped).
  */
-function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | null = null, sessionRaw: Record<string, unknown> = {}, contributions: readonly Contribution[] = []): LoadedRules {
+function loadUserRules(cwd: string | null = null, sessionTrustedRoot: SessionTrust | null = null, sessionRaw: Record<string, unknown> = {}, contributions: readonly Contribution[] = []): LoadedRules {
 	try {
 		const p = userConfigPath();
 		if (!fs.existsSync(p)) {
@@ -1187,13 +1216,22 @@ function loadUserRules(cwd: string | null = null, sessionTrustedRoot: string | n
 			const root = projectRootOf(pp);
 			const store = readTrustStore();
 			if (store.error) skipped.push(store.error);
-			const trusted = (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, store.trusted);
+			// one read: the hash that decides trust and the bytes that get parsed are the same (no check/use gap)
+			let bytes: Buffer | null = null;
+			try {
+				bytes = fs.readFileSync(pp);
+			} catch {
+				/* unreadable: never trusted */
+			}
+			const state = trustStateOf(root, bytes === null ? null : sha256Hex(bytes), store, sessionTrustedRoot);
+			const trusted = state === "trusted";
 			project = { path: pp, trusted, applied: false };
 			let projRaw: unknown;
+			if (state === "changed") skipped.push(`project config ${pp} changed since you trusted it — project overrides not applied until you trust it again`);
 			// untrusted and undecided both mean "not applied" (file never parsed); the session_start prompt owns the user-facing notice
-			if (trusted) {
+			if (trusted && bytes !== null) {
 				try {
-					projRaw = JSON.parse(fs.readFileSync(pp, "utf8"));
+					projRaw = JSON.parse(bytes.toString("utf8"));
 				} catch (err) {
 					skipped.push(`project config parse failed: ${err instanceof Error ? err.message : String(err)} — project overrides not loaded (${pp})`);
 				}
@@ -1720,6 +1758,24 @@ function ompTouches(toolName: string, input: Record<string, unknown>, cwd: strin
 	return { forms, bareWord };
 }
 
+/** The pi-verdict files the gate itself owns (PP-10): a project override `<.pi|.omp>/pi-verdict.json` anywhere, and below the agent dir the user config, the trust store, the session overrides and the audit logs. */
+const GATE_FILE_IN_PROJECT = /(?:^|[\\/])\.(?:pi|omp)[\\/]pi-verdict\.json$/i;
+/** The same files as a bare word inside a raw command string (`cat pi-verdict.json`); lookalikes such as `pi-verdict.test.ts` do not match. */
+const GATE_FILE_IN_COMMAND = /(?<![\w.-])pi-verdict(?:-trust)?\.json\b|(?<![\w.-])pi-verdict-sessions\b/;
+
+/** Every touch of a gate-owned file by the call (PP-10), in the same shape as `ompTouches`; scope tools are checked on their own target only. */
+function gateFileTouches(toolName: string, input: Record<string, unknown>, cwd: string): { forms: string[]; bareWord: boolean } {
+	const bases = [userConfigPath(), trustStorePath(), sessionConfigDir(), path.join(agentDirPath(), "verdicts")].flatMap(baseForms);
+	const forms: string[] = [];
+	for (const candidate of denyPathCandidates(toolName, input, cwd)) {
+		for (const form of denyPathForms(candidate, cwd)) {
+			if (GATE_FILE_IN_PROJECT.test(form) || bases.some((b) => pathEquals(form, b) || pathStartsWith(form, b))) forms.push(form);
+		}
+	}
+	const bareWord = toolKind(toolName) === "command" && GATE_FILE_IN_COMMAND.test(String(input.command ?? "")) && forms.length === 0;
+	return { forms, bareWord };
+}
+
 /**
  * Tool call → rule-layer verdict. Order (#12; RL-2, with denyPaths per PP-5):
  *   1. user deny → deny (before the built-in rules; beats every allow)
@@ -1777,6 +1833,11 @@ function classifyByRules(toolName: string, input: Record<string, unknown>, cwd: 
 		if (user.gateOmpDir) {
 			const omp = hitOmpDir(toolName, input, cwd);
 			if (omp) return { verdict: "ask", reason: "forced gate: access to a .omp directory (gateOmpDir)", detail: omp, gate: "omp-dir", ...underneath };
+		}
+		// Forced gate on the gate's own files (PP-10): not configurable, same ask semantics as the .omp gate.
+		const gateFiles = gateFileTouches(toolName, input, cwd);
+		if (gateFiles.forms.length > 0 || gateFiles.bareWord) {
+			return { verdict: "ask", reason: "forced gate: access to a pi-verdict config, trust, session or audit file", detail: gateFiles.forms[0] ?? "pi-verdict file referenced in the command", gate: "gate-files", ...underneath };
 		}
 		// denyPaths hit → terminal ask (RL-2, PP-5): after user deny, before user allow —
 		// a protected path is the user's exception to their own allow rules.
@@ -2782,7 +2843,7 @@ export class SessionState {
 
 	/** Reload user (+ trusted project) rules and re-anchor denyPaths to `cwd` (PP-1: once per session
 	 *  start; /verdict re-anchors after a config edit). Leaves shadow-cache / fallback stats untouched. */
-	reloadRules(cwd: string, sessionTrustedRoot: string | null = null): RulesLoadReport {
+	reloadRules(cwd: string, sessionTrustedRoot: SessionTrust | null = null): RulesLoadReport {
 		const loaded = loadUserRules(cwd, sessionTrustedRoot, this.sessionOverrides, [...this.contributions.values()]);
 		this.userRules = loaded.rules;
 		this.settingSources = loaded.settingSources;
@@ -2793,7 +2854,7 @@ export class SessionState {
 
 	/** Session reset: reload user rules (config changes take effect in a new session) + re-anchor denyPaths to the session cwd
 	 *  (PP-1: anchored once per session) + clear the shadow cache; returns the load report for the presentation layer to notify */
-	reset(cwd: string, sessionTrustedRoot: string | null = null, sessionOverrides: Record<string, unknown> = {}): RulesLoadReport {
+	reset(cwd: string, sessionTrustedRoot: SessionTrust | null = null, sessionOverrides: Record<string, unknown> = {}): RulesLoadReport {
 		this.sessionOverrides = { ...sessionOverrides };
 		const parsedGrants = parseGrants(this.sessionOverrides.grants);
 		this.grants = parsedGrants.active;
@@ -3137,6 +3198,9 @@ function coveringGrants(state: SessionState, call: { toolName: string; input: Re
 		if (omp.bareWord) return null;
 		touches.push(...omp.forms);
 	}
+	const gateFiles = gateFileTouches(call.toolName, call.input, cwd);
+	if (gateFiles.bareWord) return null;
+	touches.push(...gateFiles.forms);
 	touches.push(...denyPathHits(call.toolName, call.input, cwd, state.anchoredDenyPathBases(cwd)).map((h) => h.touch));
 	for (const b of builtin) if (b.kind === "path") touches.push(...b.forms);
 	const dangerIds = builtin.flatMap((b) => (b.kind === "danger" ? [b.id] : []));
@@ -3247,7 +3311,7 @@ async function adjudicateRuled(
 	if (rule.verdict === "ask") {
 		// unattended never prompts: the gate's action setting decides (default deny; "allow" passes silently, except over a built-in ask/deny underneath, which unattended refuses)
 		if (state.userRules.mode === "unattended") {
-			const action = rule.gate === "omp-dir" ? state.userRules.unattendedOmpDir : state.userRules.unattendedDenyPaths;
+			const action = rule.gate === "omp-dir" || rule.gate === "gate-files" ? state.userRules.unattendedOmpDir : state.userRules.unattendedDenyPaths;
 			if (action === "allow" && builtin.length > 0) return { verdict: "deny", reason: rule.builtinReason ?? "", source: "rule", degraded: false, grantable: true };
 			const ppRecord: AuditRecord = { ...buildRecord({ verdict: action, reason: rule.reason ?? "", source: "protected-path", degraded: false }, null, "-"), detail: rule.detail };
 			state.audit?.append(ppRecord);
@@ -6369,7 +6433,21 @@ function splitConfigPath(p: string): { dir: string; file: string } {
 	return { dir: p.slice(0, cut), file: p.slice(cut) };
 }
 
-export function trustScreen(pp: string, title: string): ChoiceScreenSpec {
+/** One display line per top-level key of a project config (`_hint` skipped): `key: <JSON cut to 120 chars>`, `denyPaths` as a count only (PP-6). */
+function projectConfigSummary(bytes: Buffer): string[] {
+	let obj: unknown;
+	try {
+		obj = JSON.parse(bytes.toString("utf8"));
+	} catch {
+		return ["(not valid JSON)"];
+	}
+	if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return ["(not valid JSON)"];
+	return Object.entries(obj)
+		.filter(([k]) => k !== "_hint")
+		.map(([k, v]) => displaySafe(k === "denyPaths" && Array.isArray(v) ? `${k}: ${v.length} entries` : `${k}: ${(JSON.stringify(v) ?? "undefined").slice(0, 120)}`));
+}
+
+export function trustScreen(pp: string, title: string, summary: string[]): ChoiceScreenSpec {
 	const { dir, file } = splitConfigPath(displaySafe(pp));
 	return {
 		role: "pi-verdict.trust",
@@ -6383,6 +6461,7 @@ export function trustScreen(pp: string, title: string): ChoiceScreenSpec {
 					...(dir !== "" ? [tnText([{ t: dir, s: "muted" }])] : []),
 				]),
 			]),
+			tn("card", { head: "Settings it applies" }, [tn("col", { gap: "xs" }, summary.map((l) => tnText([{ t: l, s: "code" }])))]),
 			tn("col", { gap: "sm" }, [
 				tnText("If you trust it, it can override your global gate config:"),
 				tn("row", { gap: "sm", wrap: true }, ["allow rules", "builtinDenyFloor", "mode", "and more"].map((t) => tn("badge", { text: t, tone: "muted" }))),
@@ -7482,7 +7561,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 
 	/** Session-scoped trust grant (set by the session_start prompt; /verdict reloads must honor it) */
-	let sessionTrustedRoot: string | null = null;
+	let sessionTrustedRoot: SessionTrust | null = null;
+	/** Trust the project `root` as its config reads now (`hash`): remembered for this session and persisted with the hash, so a later edit asks again (F3). */
+	const rememberTrust = (ctx: ExtensionContext, root: string, hash: string | null): void => {
+		if (hash === null) return;
+		sessionTrustedRoot = { root, sha256: hash };
+		const err = recordTrust(root, "trusted", hash);
+		if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
+	};
 	/** Bumped on session_start/shutdown so a late dialog-module load never republishes into a stale session. */
 	let sessionEpoch = 0;
 
@@ -7590,14 +7676,22 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const store = readTrustStore();
 			// ctx.agent is omp-only (pi's ExtensionContext has no `agent`): narrow at runtime
 			const isSub = subagentIdentity(ctx) !== null;
-			if (!rootIn(root, store.trusted) && !rootIn(root, store.untrusted) && ctx.hasUI && !isSub) {
-				const trustTitle = `🛡️ pi-verdict: ${pp} can override your global gate config (allow rules, builtinDenyFloor, mode, …). Trust this project?`;
-				const nativePick = await pickNative(ctx.ui, trustScreen(pp, trustTitle));
-				const choice = nativePick !== null ? nativePick : await ctx.ui.select(trustTitle, [TRUST_CHOICE, NOT_NOW_CHOICE, NEVER_CHOICE]);
+			// one read: the hash the decision records and the settings the dialog lists are the same bytes
+			let bytes: Buffer | null = null;
+			try {
+				bytes = fs.readFileSync(pp);
+			} catch {
+				/* unreadable: nothing to trust */
+			}
+			const hash = bytes === null ? null : sha256Hex(bytes);
+			const trustState = trustStateOf(root, hash, store, null);
+			if (bytes !== null && trustState !== "trusted" && !rootIn(root, store.untrusted) && ctx.hasUI && !isSub) {
+				const summary = projectConfigSummary(bytes);
+				const trustTitle = `🛡️ pi-verdict: ${displaySafe(pp)} ${trustState === "changed" ? "changed since you trusted it and " : ""}can override your global gate config (allow rules, builtinDenyFloor, mode, …). Trust this project?`;
+				const nativePick = await pickNative(ctx.ui, trustScreen(pp, trustTitle, summary));
+				const choice = nativePick !== null ? nativePick : await ctx.ui.select(`${trustTitle}\n${summary.join("\n")}`, [TRUST_CHOICE, NOT_NOW_CHOICE, NEVER_CHOICE]);
 				if (choice === TRUST_CHOICE) {
-					sessionTrustedRoot = root;
-					const err = recordTrust(root, "trusted");
-					if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
+					rememberTrust(ctx, root, hash);
 				} else if (choice === NEVER_CHOICE) {
 					const err = recordTrust(root, "untrusted");
 					if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — you will be asked again`, "warning");
@@ -7676,10 +7770,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	// ---- Settings menus (/automode, /verdict): shared scope plumbing ----
 
 	/** Is the project config at `file` trusted for this session (i.e. applied by the loader)? */
-	const projectTrusted = (file: string): boolean => {
-		const root = projectRootOf(file);
-		return (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, readTrustStore().trusted);
-	};
+	const projectTrusted = (file: string): boolean => trustStateOf(projectRootOf(file), projectConfigHash(file), readTrustStore(), sessionTrustedRoot) === "trusted";
 	/** Action-row id of the "trust this project" button (local tab of the settings menus, while untrusted). */
 	const TRUST_ROW_ID = "trust-project";
 	/** Main-page rows offering to trust the project: a section + one action, on the local tab while `untrusted`; [] otherwise. */
@@ -7701,9 +7792,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	/** Trust the project of `localFile` permanently (as the session_start Trust choice), reload rules and the footer. */
 	const trustProject = (ctx: ExtensionContext, localFile: string): void => {
 		const root = projectRootOf(localFile);
-		sessionTrustedRoot = root;
-		const err = recordTrust(root, "trusted");
-		if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
+		rememberTrust(ctx, root, projectConfigHash(localFile));
 		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
 		refreshStatus(ctx);
 		ctx.ui.notify(`pi-verdict: project ${root} trusted — its config is applied`, "info");
@@ -7726,8 +7815,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		}
 		const target = scope === "global" ? { file: userConfigPath(), kind: "user" as const } : localFile === null ? null : { file: localFile, kind: "local" as const };
 		if (target === null) return "no project config location here";
+		const wasTrusted = target.kind === "local" && projectTrusted(target.file);
 		const err = writeConfigKey(target.file, target.kind, key, value);
 		if (err) return err;
+		// the user's own edit through the menus keeps a trusted project trusted: re-record the hash of what was just written
+		if (wasTrusted) rememberTrust(ctx, projectRootOf(target.file), projectConfigHash(target.file));
 		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
 		refreshStatus(ctx);
 		return null;
@@ -8813,7 +8905,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				}
 				if (scope === "local") {
 					const root = projectRootOf(file);
-					const trusted = (sessionTrustedRoot !== null && rootIn(root, [sessionTrustedRoot])) || rootIn(root, readTrustStore().trusted);
+					const trusted = projectTrusted(file);
 					if (!trusted) ctx.ui.notify(`pi-verdict: project ${root} is not trusted — the rule is saved but not applied until you trust it (prompted at session start)`, "info");
 				}
 				reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
@@ -9322,7 +9414,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					{
 						id: "trust",
 						label: "Project trust prompt",
-						run: () => showChoice("trust", trustScreen("~/projects/sample/.omp/pi-verdict.json", "🛡️ pi-verdict (preview): this project has its own pi-verdict config")),
+						run: () => showChoice("trust", trustScreen("~/projects/sample/.omp/pi-verdict.json", "🛡️ pi-verdict (preview): this project has its own pi-verdict config", ["allow: [\"^ls\\\\b\"]", "mode: \"unattended\"", "denyPaths: 2 entries"])),
 					},
 					{
 						id: "ask",

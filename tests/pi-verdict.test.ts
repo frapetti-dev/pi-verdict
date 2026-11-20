@@ -9,6 +9,7 @@ import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown, BASH_MAX_MATCH_LEN, bindCompletion, buildChoiceScreen, collectProjectContext, declineDetail, detectLocalScripts, displaySafe, EXPLAIN_GATE_DEFAULT_PROMPT, grantLine, grantRevokeScreen, grantsScreen, renderFooter, renderJevBar, resolveAgentDir, RULE_SAVE_CHOICE, ruleReviewScreen, ruleSaveScreen, SessionState, settingsChangeScreen, settingValueLines, statusNode, trustScreen, verdictLabelNode, type ChoiceScreenSpec } from "../extensions/pi-verdict.ts";
 import { prettyJson, prettyShell } from "../extensions/pi-verdict.ts";
 import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
@@ -285,6 +286,11 @@ async function withTempDir(prefix: string, fn: (dir: string) => void | Promise<v
 	}
 }
 
+/** A trust-store entry for the project at `dir` as its config reads now (F3: trust is bound to the sha256 of the project config bytes). */
+function trustEntry(dir: string, dot = ".pi"): { root: string; sha256: string } {
+	return { root: dir, sha256: createHash("sha256").update(fs.readFileSync(path.join(dir, dot, "pi-verdict.json"))).digest("hex") };
+}
+
 // ── 1. Built-in deny floor (not overridable) + no built-in allowlist ─────────
 
 describe("built-in rules (RL-5, RL-6, PG)", () => {
@@ -394,7 +400,7 @@ describe("built-in rules (RL-5, RL-6, PG)", () => {
 			await withTempDir("pv-rules-merge-", async (dir) => {
 				fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
 				fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ dangerRules: { "git-restore": "allow" } }));
-				fs.writeFileSync(path.join(TMP_AGENT, "config", "pi-verdict-trust.json"), JSON.stringify({ trusted: [dir], untrusted: [] }));
+				fs.writeFileSync(path.join(TMP_AGENT, "config", "pi-verdict-trust.json"), JSON.stringify({ trusted: [trustEntry(dir)], untrusted: [] }));
 				try {
 					const h = session({ dangerRules: { sudo: "ask" } }, { cwd: dir });
 					await h.handlers.session_start({}, h.ctx);
@@ -2520,7 +2526,7 @@ describe("adjudicate pipeline (interface level)", () => {
 
 describe("project trust prompt", () => {
 	const TRUST_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
-	const readTrust = () => JSON.parse(fs.readFileSync(TRUST_FILE(), "utf8")) as { trusted: string[]; untrusted: string[] };
+	const readTrust = () => JSON.parse(fs.readFileSync(TRUST_FILE(), "utf8")) as { trusted: { root: string; sha256: string | null }[]; untrusted: string[] };
 
 	/** Project config denies the probe command; blocked-by-rule ⇔ the project config is applied. */
 	async function withProject(fn: (h: Harness, dir: string) => Promise<void>, cfg: Parameters<typeof setConfig>[0] = {}): Promise<void> {
@@ -2550,7 +2556,8 @@ describe("project trust prompt", () => {
 			await start(h);
 			expect((h as any).selects).toBe(1);
 			expect(await applied(h)).toBe(true);
-			expect(readTrust().trusted).toContain(path.resolve(dir));
+			expect(readTrust().trusted.map((e) => e.root)).toContain(path.resolve(dir));
+			expect(readTrust().trusted[0].sha256).toMatch(/^[0-9a-f]{64}$/);
 			await start(h);
 			expect((h as any).selects).toBe(1);
 			expect(await applied(h)).toBe(true);
@@ -2607,7 +2614,7 @@ describe("project trust prompt", () => {
 			expect((h as any).selects).toBe(0);
 			expect(await applied(h)).toBe(false);
 			fs.mkdirSync(path.dirname(TRUST_FILE()), { recursive: true });
-			fs.writeFileSync(TRUST_FILE(), JSON.stringify({ trusted: [dir] }));
+			fs.writeFileSync(TRUST_FILE(), JSON.stringify({ trusted: [trustEntry(dir)] }));
 			await start(h);
 			expect((h as any).selects).toBe(0);
 			expect(await applied(h)).toBe(true);
@@ -2742,27 +2749,31 @@ describe("/verdict config editor", () => {
 
 	test("menu height stays constant across rows, values and scopes on one page", async () => {
 		// the trust row (CF-3) adds rows to the local tab of an untrusted project, so measure a trusted one
-		const trust = path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
-		fs.mkdirSync(path.dirname(trust), { recursive: true });
-		fs.writeFileSync(trust, JSON.stringify({ trusted: ["/proj"], untrusted: [] }));
-		try {
-			const h = session({});
-			const rendered: string[] = [];
-			const after: string[] = [];
-			await run(h, "", [...times(8, DOWN), TAB, ...times(8, DOWN), TAB, ...times(8, DOWN), RIGHT, LEFT], rendered, after);
-			const heights = [rendered[0]!, ...after].map((s) => s.split("\n").length);
-			expect(new Set(heights).size).toBe(1);
+		await withTempDir("pv-menu-height-", async (dir) => {
+			fs.mkdirSync(path.dirname(localFileOf(dir)), { recursive: true });
+			fs.writeFileSync(localFileOf(dir), "{}");
+			const trust = path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
+			fs.mkdirSync(path.dirname(trust), { recursive: true });
+			fs.writeFileSync(trust, JSON.stringify({ trusted: [trustEntry(dir)], untrusted: [] }));
+			try {
+				const h = session({}, { cwd: dir });
+				const rendered: string[] = [];
+				const after: string[] = [];
+				await run(h, "", [...times(8, DOWN), TAB, ...times(8, DOWN), TAB, ...times(8, DOWN), RIGHT, LEFT], rendered, after);
+				const heights = [rendered[0]!, ...after].map((s) => s.split("\n").length);
+				expect(new Set(heights).size).toBe(1);
 
-			const r2: string[] = [];
-			const a2: string[] = [];
-			driveMenu(h, [...times(12, DOWN), RIGHT, LEFT, TAB, ...times(12, DOWN), TAB, ...times(12, DOWN)], r2, a2);
-			await h.commands.automode.handler("", h.ctx);
-			expect(r2.length).toBe(1);
-			const heights2 = [r2[0]!, ...a2].map((s) => s.split("\n").length);
-			expect(new Set(heights2).size).toBe(1);
-		} finally {
-			fs.rmSync(trust, { force: true });
-		}
+				const r2: string[] = [];
+				const a2: string[] = [];
+				driveMenu(h, [...times(12, DOWN), RIGHT, LEFT, TAB, ...times(12, DOWN), TAB, ...times(12, DOWN)], r2, a2);
+				await h.commands.automode.handler("", h.ctx);
+				expect(r2.length).toBe(1);
+				const heights2 = [r2[0]!, ...a2].map((s) => s.split("\n").length);
+				expect(new Set(heights2).size).toBe(1);
+			} finally {
+				fs.rmSync(trust, { force: true });
+			}
+		});
 	});
 
 	test("add persists to the global file and takes effect immediately (no classifier call)", async () => {
@@ -4663,7 +4674,7 @@ describe("approval modes", () => {
 				fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
 				fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ mode: "supervised", confidenceThreshold: 40 }));
 				fs.mkdirSync(path.join(TMP_AGENT, "config"), { recursive: true });
-				fs.writeFileSync(path.join(TMP_AGENT, "config", "pi-verdict-trust.json"), JSON.stringify({ trusted: [dir], untrusted: [] }));
+				fs.writeFileSync(path.join(TMP_AGENT, "config", "pi-verdict-trust.json"), JSON.stringify({ trusted: [trustEntry(dir)], untrusted: [] }));
 				try {
 					const h = session({}, { cwd: dir });
 					await h.handlers.session_start({}, h.ctx);
@@ -4807,7 +4818,7 @@ describe("approval modes", () => {
 				fs.writeFileSync(path.join(dir, ".pi", "pi-verdict.json"), JSON.stringify({ mode: "supervised" }));
 				const trust = path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
 				fs.mkdirSync(path.dirname(trust), { recursive: true });
-				fs.writeFileSync(trust, JSON.stringify({ trusted: [dir], untrusted: [] }));
+				fs.writeFileSync(trust, JSON.stringify({ trusted: [trustEntry(dir)], untrusted: [] }));
 				try {
 					const h = session({}, { cwd: dir });
 					await h.handlers.session_start({}, h.ctx);
@@ -6588,7 +6599,7 @@ describe("Tern-native UI (TSP)", () => {
 			};
 			type Shape = NativeComponent & { nativeOverlay?: { size?: string }; nativeSheet?(cx: unknown): boolean };
 
-			const trustBuilt = build(trustScreen("~/p/.omp/pi-verdict.json", "t"));
+			const trustBuilt = build(trustScreen("~/p/.omp/pi-verdict.json", "t", ["mode: \"unattended\""]));
 			const trust = trustBuilt.component as Shape;
 			expect(trust.nativeSheet?.(cx)).toBe(true);
 			const trustTree = snap(trust.describe!(cx));
@@ -7013,14 +7024,14 @@ describe("gated execution (EG-1–EG-4)", () => {
 
 describe("project trust from the settings menus (CF-3)", () => {
 	const trustFile = () => path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
-	const readTrust = () => JSON.parse(fs.readFileSync(trustFile(), "utf8")) as { trusted: string[]; untrusted: string[] };
+	const readTrust = () => JSON.parse(fs.readFileSync(trustFile(), "utf8")) as { trusted: { root: string; sha256: string | null }[]; untrusted: string[] };
 	/** An untrusted project (previous "Never") whose local config denies `echo SECRET`. */
-	const untrustedProject = async (dir: string, trusted: string[] = []) => {
+	const untrustedProject = async (dir: string, trusted = false) => {
 		const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
 		fs.mkdirSync(path.join(dir, dot), { recursive: true });
 		fs.writeFileSync(path.join(dir, dot, "pi-verdict.json"), JSON.stringify({ deny: ["^echo SECRET"] }));
 		fs.mkdirSync(path.dirname(trustFile()), { recursive: true });
-		fs.writeFileSync(trustFile(), JSON.stringify({ trusted, untrusted: trusted.length ? [] : [dir] }));
+		fs.writeFileSync(trustFile(), JSON.stringify({ trusted: trusted ? [trustEntry(dir, dot)] : [], untrusted: trusted ? [] : [dir] }));
 		const h = session({}, { cwd: dir });
 		await h.handlers.session_start({}, h.ctx);
 		return h;
@@ -7037,7 +7048,7 @@ describe("project trust from the settings menus (CF-3)", () => {
 				driveMenu(h, [MENU.UP, MENU.ENTER], rendered, after); // wraps from the first row to the last: the trust row
 				await h.commands.verdict.handler("local", h.ctx);
 				expect(rendered[0]).toContain("trust this project");
-				expect(readTrust().trusted).toContain(dir);
+				expect(readTrust().trusted.map((e) => e.root)).toContain(dir);
 				expect(readTrust().untrusted).toEqual([]);
 				expect(after.at(-1)).not.toContain("local · untrusted");
 				expect(h.notifies.some(([m, l]) => l === "info" && m.includes("trusted — its config is applied"))).toBe(true);
@@ -7057,7 +7068,7 @@ describe("project trust from the settings menus (CF-3)", () => {
 				await h.commands.automode.handler("", h.ctx);
 				expect(after[0]).not.toContain("trust this project");
 				expect(after[1]).toContain("trust this project");
-				const h2 = await untrustedProject(dir, [dir]);
+				const h2 = await untrustedProject(dir, true);
 				const after2: string[] = [];
 				driveMenu(h2, [MENU.TAB, MENU.TAB], [], after2);
 				await h2.commands.automode.handler("", h2.ctx);
@@ -7074,7 +7085,7 @@ describe("project trust from the settings menus (CF-3)", () => {
 				const h = await untrustedProject(dir);
 				driveMenu(h, [MENU.UP, MENU.ENTER]);
 				await h.commands["automode-setup"].handler("local", h.ctx);
-				expect(readTrust().trusted).toContain(dir);
+				expect(readTrust().trusted.map((e) => e.root)).toContain(dir);
 			} finally {
 				fs.rmSync(trustFile(), { force: true });
 			}
@@ -7315,5 +7326,117 @@ describe("oversize commands (F2)", () => {
 		const r = await h.tools.verdict_grant.execute("t1", { action: "request", request: '"'.repeat(1000), paths }, undefined, undefined, h.ctx);
 		expect(r.content[0].text).toContain("cannot be reviewed in full");
 		expect(h.calls).toHaveLength(0);
+	});
+});
+
+// ── Gate-owned files and content-hashed project trust (F3) ──
+describe("gate-owned files (F3)", () => {
+	const TRUST_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
+
+	test("read of the user config asks, headless it is denied without the path or a model call (PP-10)", async () => {
+		const h = session({});
+		h.ctx.hasUI = false;
+		const r = await toolCall(h, "read", { path: path.join(TMP_AGENT, "config", "pi-verdict.json") });
+		expect(r?.block).toBe(true);
+		expect(String(r?.reason)).toContain("pi-verdict config, trust, session or audit file");
+		expect(String(r?.reason)).not.toContain(TMP_AGENT);
+		expect(h.calls).toHaveLength(0);
+	});
+
+	test("a command naming the trust store or session overrides asks (PP-10)", async () => {
+		for (const command of ["cat pi-verdict-trust.json", "rm -f x/pi-verdict-sessions/s1.json"]) {
+			const h = session({});
+			h.ctx.hasUI = false;
+			const r = await toolCall(h, "bash", { command });
+			expect(r?.block).toBe(true);
+			expect(String(r?.reason)).toContain("pi-verdict config, trust, session or audit file");
+		}
+		const h = session({});
+		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
+		expect(await toolCall(h, "bash", { command: "bun test tests/pi-verdict.test.ts" })).toBeUndefined();
+	});
+
+	test("write to a project override file asks, even though it sits inside the workspace (PP-10)", async () => {
+		await withTempDir(".pv-gf-", async (dir) => {
+			const h = session({}, { cwd: dir });
+			h.ctx.hasUI = false;
+			const r = await toolCall(h, "write", { path: path.join(dir, ".pi", "pi-verdict.json"), content: "{}" });
+			expect(r?.block).toBe(true);
+			expect(String(r?.reason)).toContain("pi-verdict config, trust, session or audit file");
+			expect(h.calls).toHaveLength(0);
+		}, os.homedir());
+	});
+
+	test("unattended follows unattendedOmpDir for gate-owned files, like the .omp gate (PP-10)", async () => {
+		const target = { path: path.join(TMP_AGENT, "config", "pi-verdict.json") };
+		const deny = session({ mode: "unattended" });
+		expect((await toolCall(deny, "read", target))?.block).toBe(true);
+		const allow = session({ mode: "unattended", unattendedOmpDir: "allow" });
+		expect(await toolCall(allow, "read", target)).toBeUndefined();
+		expect(allow.calls).toHaveLength(0);
+	});
+
+	test("an edited project config is no longer trusted: not applied, asked again with the settings it applies (CF-3)", async () => {
+		await withTempDir("pv-proj-hash-", async (dir) => {
+			const file = path.join(dir, ".pi", "pi-verdict.json");
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, JSON.stringify({ deny: ["^echo trusted-marker"] }));
+			fs.mkdirSync(path.dirname(TRUST_FILE()), { recursive: true });
+			fs.writeFileSync(TRUST_FILE(), JSON.stringify({ trusted: [trustEntry(dir)], untrusted: [] }));
+			try {
+				const probe = async (h: Harness) => (await toolCall(h, "bash", { command: "echo trusted-marker" }))?.block === true;
+				const h = session({}, { cwd: dir });
+				h.responses = [{ text: "<verdict>allow</verdict> ok" }]; // unapplied config → gray → classifier allows
+				await h.handlers.session_start({}, h.ctx);
+				expect(await probe(h)).toBe(true);
+				expect(h.selects).toBe(0);
+
+				fs.writeFileSync(file, JSON.stringify({ deny: ["^echo trusted-marker"], denyPaths: ["~/a", "~/b"], mode: "unattended" }));
+				const headless = session({}, { cwd: dir });
+				headless.ctx.hasUI = false;
+				headless.responses = [{ text: "<verdict>allow</verdict> ok" }];
+				await headless.handlers.session_start({}, headless.ctx);
+				expect(await probe(headless)).toBe(false);
+				expect(headless.notifies.some(([m]) => m.includes("changed since you trusted it"))).toBe(true);
+
+				const ui = session({}, { cwd: dir });
+				ui.selectIndex = 1; // Not now
+				ui.responses = [{ text: "<verdict>allow</verdict> ok" }];
+				await ui.handlers.session_start({}, ui.ctx);
+				expect(ui.selects).toBe(1);
+				expect(ui.selectTitles[0]).toContain("changed since you trusted it");
+				expect(ui.selectTitles[0]).toContain("denyPaths: 2 entries");
+				expect(ui.selectTitles[0]).not.toContain("~/a");
+				expect(ui.selectTitles[0]).toContain('mode: "unattended"');
+				expect(await probe(ui)).toBe(false);
+
+				ui.selectIndex = 0; // Trust again: the new hash is recorded
+				await ui.handlers.session_start({}, ui.ctx);
+				expect(await probe(ui)).toBe(true);
+				const again = session({}, { cwd: dir });
+				await again.handlers.session_start({}, again.ctx);
+				expect(again.selects).toBe(0);
+			} finally {
+				fs.rmSync(TRUST_FILE(), { force: true });
+			}
+		});
+	});
+
+	test("a legacy string trust entry re-prompts once instead of applying the file (CF-3)", async () => {
+		await withTempDir("pv-proj-legacy-", async (dir) => {
+			const file = path.join(dir, ".pi", "pi-verdict.json");
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, JSON.stringify({ deny: ["^echo trusted-marker"] }));
+			fs.mkdirSync(path.dirname(TRUST_FILE()), { recursive: true });
+			fs.writeFileSync(TRUST_FILE(), JSON.stringify({ trusted: [dir], untrusted: [] }));
+			try {
+				const h = session({}, { cwd: dir });
+				h.selectIndex = 1;
+				await h.handlers.session_start({}, h.ctx);
+				expect(h.selects).toBe(1);
+			} finally {
+				fs.rmSync(TRUST_FILE(), { force: true });
+			}
+		});
 	});
 });
