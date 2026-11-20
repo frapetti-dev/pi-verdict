@@ -89,6 +89,7 @@ import type * as PiTui from "@earendil-works/pi-tui";
 import type { BeforeAgentStartEventResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
 import { activeTransport, type JevReason, jevUrlOverrideError, OMP_OPENROUTER_API_ID, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER, VERDICT_CHOICES_PREFIX } from "./jev-adapter";
+import { createScopedSettings, rememberTrust as persistTrust, SOURCE_RANK, type ScopedSettings, type ScopedSettingsHost, type WriteResult } from "./pi-verdict-lib/scoped-settings";
 
 // ============================================================================
 // Rules layer: bash
@@ -474,7 +475,7 @@ export type RootRuleStrictness = (typeof ROOT_RULE_STRICTNESS)[number];
 export interface RootRuleConfig { text: string | null; strictness: RootRuleStrictness; history: boolean; codebase: boolean; clarifications: string[] }
 export const ROOT_RULE_DEFAULTS: RootRuleConfig = { text: null, strictness: "balanced", history: true, codebase: true, clarifications: [] };
 const EDITABLE_LIST_KEYS = ["allow", "deny", "denyPaths", "tools", "rules"] as const;
-type EditableListKey = (typeof EDITABLE_LIST_KEYS)[number];
+export type EditableListKey = (typeof EDITABLE_LIST_KEYS)[number];
 const LIST_KEY_DESC: Record<EditableListKey, string> = {
 	allow: "regexes that auto-allow",
 	deny: "regexes that auto-deny",
@@ -491,7 +492,7 @@ const LIST_KEY_PLACEHOLDER: Record<EditableListKey, string> = {
 };
 
 /** Session-scoped additions to the editable lists (`/rule`); appended to the effective user + project lists. */
-type RuleAdditions = Partial<Record<EditableListKey, string[]>>;
+export type RuleAdditions = Partial<Record<EditableListKey, string[]>>;
 
 interface UserRules {
 	allow: RegExp[];
@@ -609,11 +610,11 @@ export function resolveAgentDir(ownFile: string | null, home: string, envAgentDi
 	return path.join(home, ".pi", "agent");
 }
 
-function agentDirPath(): string {
+export function agentDirPath(): string {
 	return resolveAgentDir(OWN_FILE_PATH, os.homedir(), process.env.PI_CODING_AGENT_DIR);
 }
 
-function userConfigPath(): string {
+export function userConfigPath(): string {
 	return path.join(agentDirPath(), "config", "pi-verdict.json");
 }
 
@@ -659,7 +660,7 @@ function trustStorePath(): string {
 }
 
 /** The directory that contains the project's dot dir */
-function projectRootOf(configPath: string): string {
+export function projectRootOf(configPath: string): string {
 	return path.dirname(path.dirname(configPath));
 }
 
@@ -673,13 +674,13 @@ function rootIn(root: string, list: string[]): boolean {
  *  A legacy string entry has `sha256: null`, which never matches, so it re-prompts once. */
 interface TrustEntry { root: string; sha256: string | null }
 /** Session-scoped trust: the same pair, but the hash is always known. */
-interface SessionTrust { root: string; sha256: string }
+export interface SessionTrust { root: string; sha256: string }
 interface TrustStore { trusted: TrustEntry[]; untrusted: string[]; error: string | null }
 
 const sha256Hex = (b: Buffer | string): string => createHash("sha256").update(b).digest("hex");
 
 /** sha256 of the project config file bytes; null when unreadable. */
-function projectConfigHash(pp: string): string | null {
+export function projectConfigHash(pp: string): string | null {
 	try {
 		return sha256Hex(fs.readFileSync(pp));
 	} catch {
@@ -688,13 +689,13 @@ function projectConfigHash(pp: string): string | null {
 }
 
 /** "trusted": a session or store entry for this root carries the current content hash; "changed": the root was trusted but no entry matches the current content; "none": never trusted. */
-function trustStateOf(root: string, hash: string | null, store: TrustStore, session: SessionTrust | null): "trusted" | "changed" | "none" {
+export function trustStateOf(root: string, hash: string | null, store: TrustStore, session: SessionTrust | null): "trusted" | "changed" | "none" {
 	const entries = [...(session ? [session] : []), ...store.trusted].filter((e) => rootIn(root, [e.root]));
 	if (entries.length === 0) return "none";
 	return hash !== null && entries.some((e) => e.sha256 === hash) ? "trusted" : "changed";
 }
 
-function readTrustStore(): TrustStore {
+export function readTrustStore(): TrustStore {
 	const p = trustStorePath();
 	if (!fs.existsSync(p)) return { trusted: [], untrusted: [], error: null };
 	let raw: unknown;
@@ -729,7 +730,7 @@ function readTrustStore(): TrustStore {
 
 /** Persist a trust decision for a project root (a "trusted" one records the config hash it covers). Returns an error message, or null on success.
  *  A damaged file is never overwritten (the user may have hand-edited it). */
-function recordTrust(root: string, decision: "trusted" | "untrusted", sha256: string | null = null): string | null {
+export function recordTrust(root: string, decision: "trusted" | "untrusted", sha256: string | null = null): string | null {
 	const store = readTrustStore();
 	if (store.error !== null) return store.error;
 	const trusted = store.trusted.filter((e) => !rootIn(root, [e.root]));
@@ -772,7 +773,7 @@ function readSessionOverrides(id: string): { raw: Record<string, unknown>; error
 }
 
 /** Persist the session's overrides; an empty object removes the file. Returns an error message or null. */
-function writeSessionOverrides(id: string, raw: Record<string, unknown>): string | null {
+export function writeSessionOverrides(id: string, raw: Record<string, unknown>): string | null {
 	const p = sessionConfigPath(id);
 	if (p === null) return null;
 	try {
@@ -3570,7 +3571,7 @@ export async function adjudicate(
 
 /** Where a project config would be written for `cwd`: the existing one if discovered, else `<cwd>/<dotdir>/pi-verdict.json`.
  *  null when `findProjectConfig`'s stop rule (home dir / agent tree root) would never discover a file there. */
-function projectConfigTarget(cwd: string, agentDir: string): string | null {
+export function projectConfigTarget(cwd: string, agentDir: string): string | null {
 	const found = findProjectConfig(cwd, agentDir);
 	if (found) return found;
 	if (samePath(cwd, os.homedir()) || samePath(cwd, path.dirname(path.dirname(agentDir)))) return null;
@@ -3578,7 +3579,7 @@ function projectConfigTarget(cwd: string, agentDir: string): string | null {
 }
 
 /** Parse a config file into its top-level object. A missing file yields the first-run template (user) or `{}` (local). */
-function readConfigObject(file: string, kind: "user" | "local"): { raw: Record<string, unknown> } | { error: string } {
+export function readConfigObject(file: string, kind: "user" | "local"): { raw: Record<string, unknown> } | { error: string } {
 	if (!fs.existsSync(file)) return { raw: kind === "user" ? (JSON.parse(USER_CONFIG_TEMPLATE) as Record<string, unknown>) : {} };
 	let parsed: unknown;
 	try {
@@ -3626,7 +3627,7 @@ function entryLabel(x: unknown): string {
 }
 
 /** Set (or with `undefined` drop) one key of a config file; null on success, the error message otherwise. */
-function writeConfigKey(file: string, kind: "user" | "local", key: string, value: unknown): string | null {
+export function writeConfigKey(file: string, kind: "user" | "local", key: string, value: unknown): string | null {
 	const loaded = readConfigObject(file, kind);
 	if ("error" in loaded) return loaded.error;
 	const next: Record<string, unknown> = { ...loaded.raw };
@@ -4633,7 +4634,7 @@ export const SETTINGS_TOOL_KEYS = [
 ] as const;
 export type SettingsToolKey = (typeof SETTINGS_TOOL_KEYS)[number];
 export const SETTINGS_TOOL_ACTIONS = ["get", "set", "unset", "add", "remove"] as const;
-const isListKey = (k: string): k is EditableListKey => (EDITABLE_LIST_KEYS as readonly string[]).includes(k);
+export const isListKey = (k: string): k is EditableListKey => (EDITABLE_LIST_KEYS as readonly string[]).includes(k);
 
 const SETTINGS_BOOLEAN_KEYS: readonly string[] = ["builtinDenyFloor", "gateOmpDir", "audit", "notifyAllows", "modeStatus", "grantStatus"];
 const SETTINGS_ENUMS: Record<string, readonly string[]> = {
@@ -7620,11 +7621,17 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	/** Session-scoped trust grant (set by the session_start prompt; /verdict reloads must honor it) */
 	let sessionTrustedRoot: SessionTrust | null = null;
+	/** Host view of this factory instance for the scoped-settings module (reads/writes the session trust grant). */
+	const hostFor = (ctx: ExtensionContext): ScopedSettingsHost => ({
+		state,
+		cwd: ctx.cwd,
+		sessionId: ctx.sessionManager.getSessionId(),
+		trust: { get: () => sessionTrustedRoot, set: (t) => { sessionTrustedRoot = t; } },
+	});
+	const settingsFor = (ctx: ExtensionContext): ScopedSettings => createScopedSettings(hostFor(ctx));
 	/** Trust the project `root` as its config reads now (`hash`): remembered for this session and persisted with the hash, so a later edit asks again (F3). */
 	const rememberTrust = (ctx: ExtensionContext, root: string, hash: string | null): void => {
-		if (hash === null) return;
-		sessionTrustedRoot = { root, sha256: hash };
-		const err = recordTrust(root, "trusted", hash);
+		const err = persistTrust(hostFor(ctx), root, hash);
 		if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
 	};
 	/** Bumped on session_start/shutdown so a late dialog-module load never republishes into a stale session. */
@@ -7645,36 +7652,26 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if (report.shortcutWarning) ctx.ui.notify(`pi-verdict: ${report.shortcutWarning}`, "warning");
 	}
 
-	/** Set (or with `undefined` drop) one session-scopable key at session scope: persisted per session id, rules reloaded, status refreshed. */
-	function setSessionSetting(key: SessionKey | SessionMapKey, value: unknown, ctx: ExtensionContext): void {
-		if (value === undefined) delete state.sessionOverrides[key];
-		else state.sessionOverrides[key] = value;
-		const err = writeSessionOverrides(ctx.sessionManager.getSessionId(), state.sessionOverrides);
-		if (err) ctx.ui.notify(`pi-verdict: session setting not persisted (${err}) — applies until restart`, "warning");
-		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
-		refreshStatus(ctx);
+	const sessionPersistMsg = (e: string): string => `pi-verdict: session setting not persisted (${e}) — applies until restart`;
+	/** Surface a scoped-settings write: persistence/trust warnings, load warnings, status refresh. Returns the hard error (null = saved). */
+	function surfaceWrite(ctx: ExtensionContext, r: WriteResult, persistMsg: (e: string) => string): string | null {
+		if (r.persistError) ctx.ui.notify(persistMsg(r.persistError), "warning");
+		if (r.trustError) ctx.ui.notify(`pi-verdict: trust decision not saved (${r.trustError}) — applies to this session only`, "warning");
+		if (r.report) {
+			reportLoadWarnings(r.report, ctx);
+			refreshStatus(ctx);
+		}
+		return r.error;
 	}
 
-	/** This session's additions to one editable list (`ruleAdditions`, appended to the effective list). */
-	function sessionAdditions(key: EditableListKey): string[] {
-		const existing = state.sessionOverrides.ruleAdditions;
-		if (typeof existing !== "object" || existing === null || Array.isArray(existing)) return [];
-		const list = (existing as RuleAdditions)[key];
-		return Array.isArray(list) ? list : [];
+	/** Set (or with `undefined` drop) one session-scopable key at session scope: persisted per session id, rules reloaded, status refreshed. */
+	function setSessionSetting(key: SessionKey | SessionMapKey, value: unknown, ctx: ExtensionContext): void {
+		surfaceWrite(ctx, settingsFor(ctx).write("session", key, value), sessionPersistMsg);
 	}
 
 	/** Replace this session's additions to one list (`undefined` or empty drops the key, and `ruleAdditions` itself once empty): persisted, rules reloaded, status refreshed. */
 	function setSessionRuleAdditions(key: EditableListKey, list: string[] | undefined, ctx: ExtensionContext): void {
-		const existing = state.sessionOverrides.ruleAdditions;
-		const cur: RuleAdditions = typeof existing === "object" && existing !== null && !Array.isArray(existing) ? { ...(existing as RuleAdditions) } : {};
-		if (list === undefined || list.length === 0) delete cur[key];
-		else cur[key] = list;
-		if (Object.keys(cur).length === 0) delete state.sessionOverrides.ruleAdditions;
-		else state.sessionOverrides.ruleAdditions = cur;
-		const err = writeSessionOverrides(ctx.sessionManager.getSessionId(), state.sessionOverrides);
-		if (err) ctx.ui.notify(`pi-verdict: session rule not persisted (${err}) — applies until restart`, "warning");
-		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
-		refreshStatus(ctx);
+		surfaceWrite(ctx, settingsFor(ctx).writeSessionAdditions(key, list), (e) => `pi-verdict: session rule not persisted (${e}) — applies until restart`);
 	}
 
 	/** Replace the active permission grants (GR-6): persisted under `sessionOverrides.grants` with the id counter, status refreshed; rules are not reloaded. */
@@ -7829,8 +7826,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	// ---- Settings menus (/automode, /verdict): shared scope plumbing ----
 
-	/** Is the project config at `file` trusted for this session (i.e. applied by the loader)? */
-	const projectTrusted = (file: string): boolean => trustStateOf(projectRootOf(file), projectConfigHash(file), readTrustStore(), sessionTrustedRoot) === "trusted";
 	/** Action-row id of the "trust this project" button (local tab of the settings menus, while untrusted). */
 	const TRUST_ROW_ID = "trust-project";
 	/** Main-page rows offering to trust the project: a section + one action, on the local tab while `untrusted`; [] otherwise. */
@@ -7857,64 +7852,30 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		refreshStatus(ctx);
 		ctx.ui.notify(`pi-verdict: project ${root} trusted — its config is applied`, "info");
 	};
-	/** Precedence of a setting's source: session > local > global > default. */
-	const SOURCE_RANK: Record<SettingSource, number> = { default: 0, global: 1, local: 2, session: 3 };
-
-	/** The object stored at a scope: the session overrides, or the parsed global / local config file ({} when unreadable). */
-	const storedAt = (scope: MenuScope, localFile: string | null): Record<string, unknown> => {
-		if (scope === "session") return state.sessionOverrides;
-		const loaded = scope === "global" ? readConfigObject(userConfigPath(), "user") : localFile === null ? null : readConfigObject(localFile, "local");
-		return loaded === null || "error" in loaded ? {} : loaded.raw;
-	};
-
-	/** Persist `value` (`undefined` drops the key) for a session-scopable setting or a list key at a file scope; session scope takes settings only. null = ok, else an error message. */
-	const writeScoped = (scope: MenuScope, key: string, value: unknown, localFile: string | null, ctx: ExtensionContext): string | null => {
-		if (scope === "session") {
-			setSessionSetting(key as SessionKey | SessionMapKey, value, ctx);
-			return null;
-		}
-		const target = scope === "global" ? { file: userConfigPath(), kind: "user" as const } : localFile === null ? null : { file: localFile, kind: "local" as const };
-		if (target === null) return "no project config location here";
-		const wasTrusted = target.kind === "local" && projectTrusted(target.file);
-		const err = writeConfigKey(target.file, target.kind, key, value);
-		if (err) return err;
-		// the user's own edit through the menus keeps a trusted project trusted: re-record the hash of what was just written
-		if (wasTrusted) rememberTrust(ctx, projectRootOf(target.file), projectConfigHash(target.file));
-		reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
-		refreshStatus(ctx);
-		return null;
-	};
 
 	/** Parse a menu value and store it at `scope`; invalid values and write errors surface as notifications. */
-	const applySetting = (ctx: ExtensionContext, scope: MenuScope, key: SessionKey, text: string, localFile: string | null): void => {
+	const applySetting = (ctx: ExtensionContext, scope: MenuScope, key: SessionKey, text: string): void => {
 		const value = parseMenuValue(key, text);
 		if (value === "invalid" || (key === "mode" && value === "off" && scope !== "session")) {
 			ctx.ui.notify(`pi-verdict: "${text}" is not a valid value for ${key}${scope === "session" ? "" : " at this scope"}`, "warning");
 			return;
 		}
-		const err = writeScoped(scope, key, value, localFile, ctx);
+		const err = surfaceWrite(ctx, settingsFor(ctx).write(scope, key, value), sessionPersistMsg);
 		if (err) ctx.ui.notify(`pi-verdict: could not save ${key} (${scope}): ${err}`, "error");
 	};
 
-	/** Scopes `inherit` at `scope` falls through to, nearest first; an untrusted local file is skipped. */
-	const lowerScopes = (scope: MenuScope, localFile: string | null): MenuScope[] =>
-		(scope === "session" ? (["local", "global"] as MenuScope[]) : scope === "local" ? (["global"] as MenuScope[]) : []).filter((s) => s !== "local" || (localFile !== null && projectTrusted(localFile)));
-
-	/** The next lower scope that sets `key` (what `inherit` resolves to at `scope`); an untrusted local file is skipped. */
-	const inheritedFrom = (scope: MenuScope, key: SessionKey, localFile: string | null): { source: MenuScope | "default"; text: string } => {
-		for (const s of lowerScopes(scope, localFile)) {
-			const raw = storedAt(s, localFile);
-			if (raw[key] !== undefined) return { source: s, text: storedValueText(raw, key, s) };
-		}
-		return { source: "default", text: MENU_DEFAULTS[key] ?? "off" };
+	/** What `inherit` resolves to at `scope` for a plain setting: the next lower scope that sets `key` (untrusted local skipped), else the built-in default. */
+	const inheritedSetting = (ss: ScopedSettings, scope: MenuScope, key: SessionKey): { source: MenuScope | "default"; text: string } => {
+		const inh = ss.inherited(scope, key);
+		return inh ? { source: inh.source, text: storedValueText(ss.stored(inh.source), key, inh.source) } : { source: "default", text: MENU_DEFAULTS[key] ?? "off" };
 	};
 
 	/** Description lines of a setting row: value meaning, effective value + source, a precedence warning, an untrusted-project warning.
 	 *  `worstCase` ignores live state and includes every warning the scope could ever show, so the menu can reserve a stable height. */
-	const settingInfo = (scope: MenuScope, key: SessionKey, value: string, localFile: string | null, worstCase = false): MenuInfo => {
+	const settingInfo = (ss: ScopedSettings, scope: MenuScope, key: SessionKey, value: string, worstCase = false): MenuInfo => {
 		let meaning: string;
 		if (value === "inherit") {
-			const from = inheritedFrom(scope, key, localFile);
+			const from = inheritedSetting(ss, scope, key);
 			meaning = `inherit — use the ${from.source} value (${from.text})`;
 		} else if (value === "invalid") meaning = "invalid value in the config file — fix it by hand";
 		else if ((PERCENT_KEYS as readonly string[]).includes(key)) meaning = value === "off" ? "off — disabled" : `${value} — ${PERCENT_MEANING[key as PercentKey]}`;
@@ -7927,7 +7888,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			{ tone: "muted", text: `Effective: ${effText} (${src})` },
 		];
 		if (worstCase ? scope !== "session" : SOURCE_RANK[src] > SOURCE_RANK[scope]) info.push({ tone: "warning", text: `${worstCase ? "session" : src} sets this too and wins over ${scope}` });
-		if (scope === "local" && (worstCase || (localFile !== null && !projectTrusted(localFile)))) info.push({ tone: "warning", text: "not applied until this project is trusted" });
+		if (scope === "local" && (worstCase || (ss.localFile !== null && !ss.localTrusted()))) info.push({ tone: "warning", text: "not applied until this project is trusted" });
 		return info;
 	};
 
@@ -7938,8 +7899,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			ctx.ui.notify("pi-verdict: the settings panel needs an interactive TUI — use /automode status|auto|unattended|supervised|off|forget", "warning");
 			return;
 		}
-		const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
-		let untrusted = localFile !== null && !projectTrusted(localFile);
+		const ss = settingsFor(ctx);
+		const localFile = ss.localFile;
+		let untrusted = localFile !== null && !ss.localTrusted();
 		let showAll = false;
 		let closeMenu: (() => void) | undefined;
 		let openRoot = false;
@@ -7957,7 +7919,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			badge: (scope) => (scope === "local" && untrusted ? { label: "local · untrusted", warn: true } : { label: scope, warn: false }),
 			pageTitle: () => "",
 			rows: (scope) => {
-				const raw = storedAt(scope, localFile);
+				const raw = ss.stored(scope);
 				const effMode = state.userRules.mode;
 				const modeValues: readonly string[] = scope === "session" ? APPROVAL_MODES : APPROVAL_MODES.filter((m) => m !== "off");
 				const rows: MenuRow[] = [
@@ -7968,9 +7930,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						values: scope === "global" ? modeValues : ["inherit", ...modeValues],
 						value: storedValueText(raw, "mode", scope),
 						shortcut: registeredToggleKey ?? undefined,
-						...(scope === "global" ? {} : { inherited: inheritedFrom(scope, "mode", localFile) }),
-						info: (v) => settingInfo(scope, "mode", v, localFile),
-						maxInfo: (v) => settingInfo(scope, "mode", v, localFile, true),
+						...(scope === "global" ? {} : { inherited: inheritedSetting(ss, scope, "mode") }),
+						info: (v) => settingInfo(ss, scope, "mode", v),
+						maxInfo: (v) => settingInfo(ss, scope, "mode", v, true),
 					},
 				];
 				for (const sec of sections) {
@@ -7978,9 +7940,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					rows.push({ kind: "section", label: sec.label });
 					for (const item of sec.items) {
 						const value = storedValueText(raw, item.key, scope);
-						const info = (v: string): MenuInfo => settingInfo(scope, item.key, v, localFile);
-						const maxInfo = (v: string): MenuInfo => settingInfo(scope, item.key, v, localFile, true);
-						const inh = scope === "global" ? {} : { inherited: inheritedFrom(scope, item.key, localFile) };
+						const info = (v: string): MenuInfo => settingInfo(ss, scope, item.key, v);
+						const maxInfo = (v: string): MenuInfo => settingInfo(ss, scope, item.key, v, true);
+						const inh = scope === "global" ? {} : { inherited: inheritedSetting(ss, scope, item.key) };
 						const values = ENUM_VALUES[item.key];
 						rows.push(
 							values
@@ -8016,7 +7978,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				rows.push(...trustRows(scope, localFile, untrusted));
 				return rows;
 			},
-			change: (scope, id, value) => applySetting(ctx, scope, id as SessionKey, value, localFile),
+			change: (scope, id, value) => applySetting(ctx, scope, id as SessionKey, value),
 			action: (_scope, id) => {
 				if (id === TRUST_ROW_ID && localFile !== null) {
 					trustProject(ctx, localFile);
@@ -8053,34 +8015,20 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			ctx.ui.notify("pi-verdict: /automode-setup needs an interactive TUI", "warning");
 			return;
 		}
-		const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
-		let untrusted = localFile !== null && !projectTrusted(localFile);
+		const ss = settingsFor(ctx);
+		const localFile = ss.localFile;
+		let untrusted = localFile !== null && !ss.localTrusted();
 		const scopes: MenuScope[] = localFile === null ? ["global", "session"] : ["global", "local", "session"];
 
-		const ownRootRule = (scope: MenuScope): RootRuleConfig | null => parseRootRule(storedAt(scope, localFile).rootRule, []);
-		/** The root rule a scope inherits (what an edit there starts from); an untrusted local file is skipped. */
-		const inheritedRootRule = (scope: MenuScope): { source: MenuScope; cfg: RootRuleConfig } | null => {
-			const lower: MenuScope[] = scope === "session" ? ["local", "global"] : scope === "local" ? ["global"] : [];
-			for (const source of lower) {
-				if (source === "local" && (localFile === null || !projectTrusted(localFile))) continue;
-				const cfg = ownRootRule(source);
-				if (cfg) return { source, cfg };
-			}
-			return null;
-		};
-		const viewRootRule = (scope: MenuScope): RootRuleConfig => ownRootRule(scope) ?? inheritedRootRule(scope)?.cfg ?? ROOT_RULE_DEFAULTS;
-		/** The scope whose root rule the classifier uses: session > trusted local > global (RR-1). */
-		const winningScope = (): MenuScope | null => {
-			if (ownRootRule("session")) return "session";
-			if (localFile !== null && !untrusted && ownRootRule("local")) return "local";
-			return ownRootRule("global") ? "global" : null;
-		};
+		const rootRuleOf = (raw: unknown): RootRuleConfig | null => parseRootRule(raw, []);
+		const ownRootRule = (scope: MenuScope): RootRuleConfig | null => rootRuleOf(ss.stored(scope).rootRule);
+		const viewRootRule = (scope: MenuScope): RootRuleConfig => ownRootRule(scope) ?? ss.inherited(scope, "rootRule", rootRuleOf)?.value ?? ROOT_RULE_DEFAULTS;
 		/** Store a patched copy of the scope's root rule (its own, else a copy of the inherited one, else the defaults). */
 		const updateRootRule = (scope: MenuScope, patch: Partial<RootRuleConfig>): boolean => {
 			const own = ownRootRule(scope);
-			const inherited = own ? null : inheritedRootRule(scope);
-			const base = own ?? inherited?.cfg ?? ROOT_RULE_DEFAULTS;
-			const err = writeScoped(scope, "rootRule", { ...base, clarifications: [...base.clarifications], ...patch }, localFile, ctx);
+			const inherited = own ? null : ss.inherited(scope, "rootRule", rootRuleOf);
+			const base = own ?? inherited?.value ?? ROOT_RULE_DEFAULTS;
+			const err = surfaceWrite(ctx, ss.write(scope, "rootRule", { ...base, clarifications: [...base.clarifications], ...patch }), sessionPersistMsg);
 			if (err) {
 				ctx.ui.notify(`pi-verdict: could not save rootRule (${scope}): ${err}`, "error");
 				return false;
@@ -8240,7 +8188,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						cfg.clarifications.forEach((c, i) => rows.push({ kind: "entry", id: String(i), text: displaySafe(c), tag: s, editable: true, info: () => [] }));
 						return rows;
 					}
-					const winner = winningScope();
+					const winner = ss.winner("rootRule", rootRuleOf);
 					const textInfo: MenuInfo = cfg.text
 						? cfg.text.split(/\r?\n/).slice(0, 6).map((t) => ({ tone: "text" as const, text: displaySafe(t) }))
 						: [{ tone: "muted", text: "No root rule yet — generate one with g." }];
@@ -8276,7 +8224,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					if (id === "text") out.pending = { kind: "edit", scope: s };
 					else if (id === "generate") out.pending = { kind: "generate", scope: s };
 					else if (id === "remove") {
-						const err = writeScoped(s, "rootRule", undefined, localFile, ctx);
+						const err = surfaceWrite(ctx, ss.write(s, "rootRule", undefined), sessionPersistMsg);
 						if (err) ctx.ui.notify(`pi-verdict: could not remove rootRule (${s}): ${err}`, "error");
 						else ctx.ui.notify(`pi-verdict: root rule removed (${s})`, "info");
 						return;
@@ -8383,7 +8331,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			ctx.ui.notify("pi-verdict: /verdict needs an interactive TUI", "warning");
 			return;
 		}
-		const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
+		const ss = settingsFor(ctx);
+		const localFile = ss.localFile;
 		if (initial === "local" && localFile === null) {
 			ctx.ui.notify("pi-verdict: no project config location here (cwd is your home dir or the agent tree root)", "warning");
 			return;
@@ -8395,7 +8344,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				return;
 			}
 		}
-		let untrusted = localFile !== null && !projectTrusted(localFile);
+		let untrusted = localFile !== null && !ss.localTrusted();
 		const rolesTarget = ompRolesTarget();
 		if (rolesTarget) {
 			const rc = readOmpConfig(rolesTarget.file, rolesTarget.yaml);
@@ -8406,10 +8355,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		type ListState = { list: unknown[]; set: boolean; invalid: boolean };
 		const ownList = (scope: MenuScope, key: EditableListKey): ListState => {
 			if (scope === "session") {
-				const list = sessionAdditions(key);
+				const list = ss.sessionAdditions(key);
 				return { list, set: list.length > 0, invalid: false };
 			}
-			const v = storedAt(scope, localFile)[key];
+			const v = ss.stored(scope)[key];
 			if (v === undefined) return { list: [], set: false, invalid: false };
 			return Array.isArray(v) ? { list: v, set: true, invalid: false } : { list: [], set: true, invalid: true };
 		};
@@ -8435,7 +8384,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				return true;
 			}
 			const file = scope === "global" ? userConfigPath() : localFile;
-			const err = writeScoped(scope, key, next, localFile, ctx);
+			const err = surfaceWrite(ctx, ss.write(scope, key, next), sessionPersistMsg);
 			if (err) {
 				ctx.ui.notify(`pi-verdict: could not save ${file}: ${err}`, "error");
 				return false;
@@ -8445,7 +8394,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		};
 
 		const switchRow = (scope: MenuScope, key: "builtinDenyFloor" | "gateOmpDir" | "footer" | "modeStatus" | "grantStatus", label: string): MenuRow => {
-			const raw = storedAt(scope, localFile);
+			const raw = ss.stored(scope);
 			const stored = raw[key];
 			const isBool = key !== "footer";
 			const base = isBool ? ["on", "off"] : (ENUM_VALUES.footer as readonly string[]);
@@ -8457,9 +8406,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				values: !valid ? ["invalid"] : scope === "global" ? base : ["inherit", ...base],
 				value: valid ? storedValueText(raw, key, scope) : "invalid",
 				...(valid ? {} : { locked: "fix by hand" }),
-				...(valid && scope !== "global" ? { inherited: inheritedFrom(scope, key, localFile) } : {}),
-				info: (v) => settingInfo(scope, key, v, localFile),
-				maxInfo: (v) => settingInfo(scope, key, v, localFile, true),
+				...(valid && scope !== "global" ? { inherited: inheritedSetting(ss, scope, key) } : {}),
+				info: (v) => settingInfo(ss, scope, key, v),
+				maxInfo: (v) => settingInfo(ss, scope, key, v, true),
 			};
 		};
 
@@ -8467,8 +8416,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const plainObject = (v: unknown): Record<string, unknown> | null => (typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
 		/** What `inherit` resolves to for one danger rule / path tier at `scope`: the nearest lower scope with a valid entry, else the built-in default. */
 		const inheritedBuiltin = (scope: MenuScope, mapKey: "dangerRules" | "pathRules", id: string, fallback: string): { source: MenuScope | "default"; text: string } => {
-			for (const s of lowerScopes(scope, localFile)) {
-				const e = plainObject(storedAt(s, localFile)[mapKey])?.[id];
+			for (const s of ss.lowerScopes(scope)) {
+				const e = plainObject(ss.stored(s)[mapKey])?.[id];
 				let text: string | null = null;
 				if (isRuleAction(e)) text = e;
 				else if (mapKey === "dangerRules" && e === false) text = "off";
@@ -8482,7 +8431,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		};
 		/** One choice row per built-in/custom danger rule and per path tier at `scope`: the stored entry (or inherit) as the value. */
 		const builtinRows = (scope: MenuScope): MenuRow[] => {
-			const stored = storedAt(scope, localFile);
+			const stored = ss.stored(scope);
 			const dr = plainObject(stored.dangerRules) ?? {};
 			const pr = plainObject(stored.pathRules) ?? {};
 			const eff = state.userRules.dangerRules;
@@ -8541,14 +8490,14 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			const isDanger = id.startsWith("danger:");
 			const ruleId = id.slice(isDanger ? "danger:".length : "path:".length);
 			const key = isDanger ? "dangerRules" : "pathRules";
-			const map: Record<string, unknown> = { ...(plainObject(storedAt(scope, localFile)[key]) ?? {}) };
+			const map: Record<string, unknown> = { ...(plainObject(ss.stored(scope)[key]) ?? {}) };
 			if (value === "inherit") delete map[ruleId];
 			else if (isDanger && value === "off") map[ruleId] = false;
 			else if (isRuleAction(value)) {
 				const prev = plainObject(map[ruleId]);
 				map[ruleId] = isDanger && prev !== null ? { ...prev, action: value } : value;
 			} else return;
-			const err = writeScoped(scope, key, Object.keys(map).length > 0 ? map : undefined, localFile, ctx);
+			const err = surfaceWrite(ctx, ss.write(scope, key, Object.keys(map).length > 0 ? map : undefined), sessionPersistMsg);
 			if (err) ctx.ui.notify(`pi-verdict: could not save ${key} (${scope}): ${err}`, "error");
 			else ctx.ui.notify(`pi-verdict: ${key}.${ruleId} → ${value} (${scope}) — rules reloaded`, "info");
 		};
@@ -8659,7 +8608,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					changeBuiltin(scope, id, value);
 					return;
 				}
-				if (id === "builtinDenyFloor" || id === "gateOmpDir" || id === "footer" || id === "modeStatus" || id === "grantStatus") applySetting(ctx, scope, id, value, localFile);
+				if (id === "builtinDenyFloor" || id === "gateOmpDir" || id === "footer" || id === "modeStatus" || id === "grantStatus") applySetting(ctx, scope, id, value);
 			},
 			action: (scope, id) => {
 				if (id === TRUST_ROW_ID && localFile !== null) {
@@ -8929,7 +8878,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 						ctx.ui.notify(`pi-verdict: already active in ${kind}`, "info");
 						return;
 					}
-					setSessionRuleAdditions(kind, [...sessionAdditions(kind), rule], ctx);
+					setSessionRuleAdditions(kind, [...settingsFor(ctx).sessionAdditions(kind), rule], ctx);
 					ctx.ui.notify(`pi-verdict: ${kind} rule added for this session — rules reloaded`, "info");
 					return;
 				}
@@ -8958,18 +8907,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 					ctx.ui.notify(`pi-verdict: already in ${kind} (${file})`, "info");
 					return;
 				}
-				const err = writeConfigKey(file, scope, kind, [...base, rule]);
+				const ss = settingsFor(ctx);
+				const err = surfaceWrite(ctx, ss.write(scope === "local" ? "local" : "global", kind, [...base, rule]), sessionPersistMsg);
 				if (err) {
 					ctx.ui.notify(`pi-verdict: could not save ${file}: ${err}`, "error");
 					return;
 				}
-				if (scope === "local") {
-					const root = projectRootOf(file);
-					const trusted = projectTrusted(file);
-					if (!trusted) ctx.ui.notify(`pi-verdict: project ${root} is not trusted — the rule is saved but not applied until you trust it (prompted at session start)`, "info");
-				}
-				reportLoadWarnings(state.reloadRules(ctx.cwd, sessionTrustedRoot), ctx);
-				refreshStatus(ctx);
+				if (scope === "local" && !ss.localTrusted()) ctx.ui.notify(`pi-verdict: project ${projectRootOf(file)} is not trusted — the rule is saved but not applied until you trust it (prompted at session start)`, "info");
 				ctx.ui.notify(`pi-verdict: ${kind} rule saved to ${file} — rules reloaded`, "info");
 				return;
 			}
@@ -9011,35 +8955,13 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		execute: async (_toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) => {
 			if (subagentIdentity(ctx) !== null) throw new Error("verdict_settings is not available in subagents — ask the user to make the change in the main session");
 			const action = params.action as (typeof SETTINGS_TOOL_ACTIONS)[number];
-			const localFile = projectConfigTarget(ctx.cwd, agentDirPath());
+			const ss = settingsFor(ctx);
+			const localFile = ss.localFile;
 
 			if (action === "get") {
 				const keys: readonly SettingsToolKey[] = params.key === undefined ? SETTINGS_TOOL_KEYS : [params.key as SettingsToolKey];
-				const globalStored = storedAt("global", localFile);
-				const localStored = localFile === null ? {} : storedAt("local", localFile);
-				const settings = keys.map((key) => {
-					const rules = state.userRules as unknown as Record<string, unknown>;
-					const redact = (v: unknown) => (key === "denyPaths" && v !== undefined ? (Array.isArray(v) ? { redacted: true, count: v.length } : { redacted: true }) : v);
-					let effective: unknown;
-					if (key === "allow" || key === "deny") effective = state.userRules[key].map((r) => r.source);
-					else if (key === "rules") effective = state.userRules.classifierRules;
-					else if (key === "dangerRules") effective = Object.fromEntries(state.userRules.dangerRules.map((r) => [r.id, { action: r.action, reason: r.reason, pattern: r.pattern.source, flags: r.pattern.flags, builtin: r.builtin }]));
-					else effective = rules[key];
-					const g = redact(globalStored[key]);
-					const l = redact(localStored[key]);
-					let s: unknown;
-					if (isListKey(key)) {
-						const add = sessionAdditions(key);
-						s = add.length > 0 ? redact(add) : undefined;
-					} else s = state.sessionOverrides[key];
-					const source = s !== undefined ? "session" : l !== undefined && localFile !== null && projectTrusted(localFile) ? "local" : g !== undefined ? "global" : "default";
-					const entry: Record<string, unknown> = { key, effective: redact(effective), source };
-					if (g !== undefined) entry.global = g;
-					if (l !== undefined) entry.local = l;
-					if (s !== undefined) entry.session = s;
-					return entry;
-				});
-				const project = localFile === null ? null : { file: localFile, trusted: projectTrusted(localFile) };
+				const settings = keys.map((key) => ss.describe(key));
+				const project = localFile === null ? null : { file: localFile, trusted: ss.localTrusted() };
 				return settingsToolText(JSON.stringify({ settings, project }, null, 2));
 			}
 
@@ -9058,8 +8980,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 			const notes: string[] = [];
 			const sessionList = scope === "session" && isListKey(key);
-			const stored = storedAt(scope, localFile);
-			const cur = sessionList ? sessionAdditions(key as EditableListKey) : [];
+			const stored = ss.stored(scope);
+			const cur = sessionList ? ss.sessionAdditions(key as EditableListKey) : [];
 			let before: unknown = sessionList ? (cur.length > 0 ? cur : undefined) : stored[key];
 			let after: unknown;
 			let noChange = false;
@@ -9087,7 +9009,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				if (sessionList) base = cur;
 				else if (scope === "global" || stored[key] !== undefined) base = strings(stored[key]);
 				else {
-					base = strings(storedAt("global", localFile)[key]);
+					base = strings(ss.stored("global")[key]);
 					notes.push(`The project list replaces the global one; it starts as a copy of the global list (${base.length} entries).`);
 				}
 				before = sessionList ? before : stored[key] !== undefined ? base : undefined;
@@ -9103,7 +9025,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				noChange = key === "denyPaths" && (after as string[]).length === base.length;
 			}
 
-			if (scope === "local" && localFile !== null && !projectTrusted(localFile)) notes.push("Project not trusted: saved, but not applied until you trust this project.");
+			if (scope === "local" && localFile !== null && !ss.localTrusted()) notes.push("Project not trusted: saved, but not applied until you trust this project.");
 			if (key === "toggleShortcut") notes.push("Takes effect after /reload or a new session.");
 			if (sessionList) notes.push("Session entries are appended to the effective list; they cannot remove global/local entries.");
 
@@ -9123,7 +9045,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 			if (sessionList) setSessionRuleAdditions(key as EditableListKey, after as string[] | undefined, ctx);
 			else {
-				const err = writeScoped(scope, key, after, localFile, ctx);
+				const err = surfaceWrite(ctx, ss.write(scope, key, after), sessionPersistMsg);
 				if (err) throw new Error(`could not save ${key} (${scope}): ${err}`);
 			}
 			return settingsToolText([`Saved: ${action} ${key} at ${scope} scope.`, ...notes].join("\n"));

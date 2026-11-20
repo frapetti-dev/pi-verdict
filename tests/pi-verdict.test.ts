@@ -14,6 +14,7 @@ import autoMode, { adjudicate, anchorDenyPaths, approvalKey, approveCodeMarkdown
 import { prettyJson, prettyShell } from "../extensions/pi-verdict.ts";
 import { USER_RULES_HEADER } from "../extensions/jev-adapter.ts";
 import { COLLECT_CHANNEL, CONTRIBUTE_CHANNEL } from "../extensions/pi-verdict.ts";
+import { createScopedSettings } from "../extensions/pi-verdict-lib/scoped-settings.ts";
 
 // ── Stub infrastructure ─────────────────────────────────
 
@@ -3169,6 +3170,27 @@ describe("/rule command", () => {
 		});
 	});
 
+	test("project: saving into a trusted project keeps it trusted and the rule applies at once", async () => {
+		await withTempDir("pv-rule-trusted-", async (dir) => {
+			const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
+			fs.mkdirSync(path.join(dir, dot), { recursive: true });
+			fs.writeFileSync(path.join(dir, dot, "pi-verdict.json"), JSON.stringify({ allow: ["^g"] }));
+			const trust = path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
+			fs.mkdirSync(path.dirname(trust), { recursive: true });
+			fs.writeFileSync(trust, JSON.stringify({ trusted: [trustEntry(dir, dot)], untrusted: [] }));
+			try {
+				const h = session({ allow: ["^g"] }, { cwd: dir });
+				h.responses = [gen("allow", "^p"), ok()];
+				await run(h, "allow p", { picks: ["Save — project"] });
+				expect(JSON.parse(fs.readFileSync(path.join(dir, dot, "pi-verdict.json"), "utf8")).allow).toEqual(["^g", "^p"]);
+				expect(await toolCall(h, "bash", { command: "p x" })).toBeUndefined();
+				expect(h.calls).toHaveLength(2); // generator + critic; the gated call itself needs no classifier
+			} finally {
+				fs.rmSync(trust, { force: true });
+			}
+		});
+	});
+
 	test("invalid regex hides every Save option and nothing is written", async () => {
 		const h = session({});
 		h.responses = [gen("allow", "(")];
@@ -3277,6 +3299,41 @@ describe("/rule command", () => {
 		const rows = h.widgetSets.filter(([k]) => k === "verdict");
 		expect(rows[0][1]![0]).toContain("Attempt 1/3");
 		expect(rows.at(-1)![1]).toBeUndefined();
+	});
+});
+
+describe("scoped settings (CF-4, CF-5)", () => {
+	const TRUST_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict-trust.json");
+	const make = (cwd: string) => createScopedSettings({ state: new SessionState(undefined, TMP_AGENT), cwd, sessionId: "scoped-settings-test", trust: { get: () => null, set: () => {} } });
+
+	test("winner: an untrusted local value is skipped; trusting the project makes local win over global", async () => {
+		await withTempDir("pv-ss-winner-", async (dir) => {
+			const dot = path.basename(path.dirname(TMP_AGENT)).startsWith(".") ? path.basename(path.dirname(TMP_AGENT)) : ".pi";
+			setConfig({ mode: "supervised" });
+			fs.mkdirSync(path.join(dir, dot), { recursive: true });
+			fs.writeFileSync(path.join(dir, dot, "pi-verdict.json"), JSON.stringify({ mode: "unattended" }));
+			fs.rmSync(TRUST_FILE(), { force: true });
+			const ss = make(dir);
+			try {
+				expect(ss.winner("mode")).toBe("global");
+				fs.writeFileSync(TRUST_FILE(), JSON.stringify({ trusted: [trustEntry(dir, dot)], untrusted: [] }));
+				expect(ss.winner("mode")).toBe("local");
+				ss.write("session", "mode", "auto");
+				expect(ss.winner("mode")).toBe("session");
+			} finally {
+				fs.rmSync(TRUST_FILE(), { force: true });
+			}
+		});
+	});
+
+	test("describe: dangerRules sources are reported per id", async () => {
+		await withTempDir("pv-ss-sources-", async (dir) => {
+			setConfig({ dangerRules: { sudo: "ask" } });
+			const ss = make(dir);
+			ss.write("session", "dangerRules", { "git-push-force": "allow" });
+			const entry = ss.describe("dangerRules");
+			expect(entry.sources).toMatchObject({ sudo: "global", "git-push-force": "session", "rm-root": "default" });
+		});
 	});
 });
 
