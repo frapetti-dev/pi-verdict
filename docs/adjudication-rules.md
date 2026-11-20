@@ -856,9 +856,11 @@ Pinned by: root rule (RR-1–RR-4) › root rule sits inside the user rules bloc
 
 `/automode-setup` sends the model (the session model, reasoning off): the strictness level and its definition, the clarifications, and, when enabled, the current session branch transcript (the last 20 user lines and the last 100 tool-call lines; tool results never) and a deterministic project snapshot. The snapshot is the top-level listing, a fixed file set (project docs, build and manifest files, up to 5 CI workflows; at most 6000 characters per file and 40000 in total) and the git remote names and URLs with userinfo removed. A file that is a credential path (S0, regardless of `builtinDenyFloor`) or matches `denyPaths` is skipped and only counted (PP-6); protected names are also omitted from the listing. The generator output and the file contents are untrusted data, and the clarifications are the only trusted instructions. The user's config is never sent.
 
+A candidate file (and `.git/config`) whose real path is not inside the real project directory is skipped without being counted, so a symlink such as `README.md -> ~/.ssh/id_rsa` cannot make the snapshot read a file outside the project (F12).
+
 Why: the root rule is drafted from evidence the user already exposed to the session; protected-path plaintext must never reach a model (PP-6).
 Code: `collectProjectContext`, `generateRootRule`, `STRICTNESS_DOC`
-Pinned by: root rule (RR-1–RR-4) › codebase context skips protected files and strips remote userinfo; root rule (RR-1–RR-4) › /automode-setup: generate → review → save to session; root rule (RR-1–RR-4) › nothing to analyze → warning, no model call
+Pinned by: root rule (RR-1–RR-4) › codebase context skips protected files and strips remote userinfo; root rule (RR-1–RR-4) › codebase context never follows a symlink out of the project (F12, RR-3); root rule (RR-1–RR-4) › /automode-setup: generate → review → save to session; root rule (RR-1–RR-4) › nothing to analyze → warning, no model call
 
 #### RR-4: Loop and review
 

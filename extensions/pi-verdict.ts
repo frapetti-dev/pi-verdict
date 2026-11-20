@@ -4954,6 +4954,18 @@ export function collectProjectContext(cwd: string, denyPathBases: string[]): Pro
 	let skippedProtected = 0;
 	let total = 0;
 	const isProtected = (abs: string): boolean => classifyPath("read", abs, cwd, false, PATH_TIER_DEFAULTS).verdict === "deny" || hitDenyPaths("read", { path: abs }, cwd, denyPathBases) !== null;
+	// F12: a symlinked candidate (README.md -> ~/.ssh/id_rsa) would be read through the link; only files whose real path stays inside the real cwd are sent
+	let realCwd = cwd;
+	try {
+		realCwd = fs.realpathSync(cwd);
+	} catch { /* keep the lexical cwd */ }
+	const staysInCwd = (abs: string): boolean => {
+		try {
+			return pathStartsWith(fs.realpathSync(abs), realCwd);
+		} catch {
+			return false;
+		}
+	};
 
 	let entries: fs.Dirent[] = [];
 	try {
@@ -4985,6 +4997,7 @@ export function collectProjectContext(cwd: string, denyPathBases: string[]): Pro
 	for (const rel of [...new Set(candidates)]) {
 		const abs = path.join(cwd, rel);
 		try {
+			if (!staysInCwd(abs)) continue;
 			if (!fs.statSync(abs).isFile()) continue;
 			if (isProtected(abs)) {
 				skippedProtected++;
@@ -5010,7 +5023,7 @@ export function collectProjectContext(cwd: string, denyPathBases: string[]): Pro
 	try {
 		const gitDir = path.join(cwd, ".git");
 		const cfg = path.join(gitDir, "config");
-		if (fs.statSync(gitDir).isDirectory() && fs.statSync(cfg).isFile()) {
+		if (fs.statSync(gitDir).isDirectory() && fs.statSync(cfg).isFile() && staysInCwd(cfg)) {
 			if (isProtected(cfg)) skippedProtected++;
 			else {
 				const remotes: string[] = [];

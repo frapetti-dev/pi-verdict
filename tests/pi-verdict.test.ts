@@ -5183,6 +5183,23 @@ describe("root rule (RR-1–RR-4)", () => {
 		});
 	});
 
+	test.skipIf(process.platform === "win32")("codebase context never follows a symlink out of the project (F12, RR-3)", async () => {
+		await withTempDir("pv-root-out-", async (outside) => {
+			await withTempDir("pv-root-", (dir) => {
+				fs.writeFileSync(path.join(outside, "secret.txt"), "OUTSIDE-SECRET-CONTENT");
+				fs.writeFileSync(path.join(outside, "gitconfig"), '[remote "evil"]\n\turl = https://outside.example/x.git\n');
+				fs.symlinkSync(path.join(outside, "secret.txt"), path.join(dir, "README.md"));
+				fs.writeFileSync(path.join(dir, "package.json"), "{}");
+				fs.mkdirSync(path.join(dir, ".git"));
+				fs.symlinkSync(path.join(outside, "gitconfig"), path.join(dir, ".git", "config"));
+				const ctx = collectProjectContext(dir, []);
+				expect(ctx.files).toEqual(["package.json"]);
+				expect(ctx.text).not.toContain("OUTSIDE-SECRET-CONTENT");
+				expect(ctx.text).not.toContain("outside.example");
+			});
+		});
+	});
+
 	test("/automode-setup: generate → review → save to session", async () => {
 		const h = rrSession({});
 		await h.handlers.session_start({}, h.ctx);
