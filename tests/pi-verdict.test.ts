@@ -7622,3 +7622,19 @@ describe("jev reason parsing (F9)", () => {
 		expect(await toolCall(h, "bash", { command: "cargo build" })).toBeUndefined();
 	});
 });
+
+// ── PI_VERDICT_JEV_URL warning (F11) ──
+describe("jev endpoint override warning (F11)", () => {
+	test("session_start warns once when PI_VERDICT_JEV_URL is rejected", async () => {
+		const saved = process.env.PI_VERDICT_JEV_URL;
+		process.env.PI_VERDICT_JEV_URL = "http://proxy.example/d";
+		try {
+			const h = session({});
+			await h.handlers.session_start({}, h.ctx);
+			expect(h.notifies.filter(([m, l]) => m.includes("PI_VERDICT_JEV_URL ignored") && l === "warning").length).toBeGreaterThan(0);
+		} finally {
+			if (saved === undefined) delete process.env.PI_VERDICT_JEV_URL;
+			else process.env.PI_VERDICT_JEV_URL = saved;
+		}
+	});
+});

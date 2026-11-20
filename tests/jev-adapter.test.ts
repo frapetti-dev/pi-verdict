@@ -15,6 +15,7 @@ import jevAdapter, {
 	CONCERNS,
 	createJevProvider,
 	decisionsUrl,
+	jevUrlOverrideError,
 	extractState,
 	MODEL_ID,
 	PROVIDER_ID,
@@ -350,6 +351,21 @@ describe("transport selection and endpoint override", () => {
 		process.env.PI_VERDICT_JEV_URL = "https://proxy.example/decisions";
 		expect(decisionsUrl("openrouter")).toBe("https://proxy.example/decisions");
 		expect(decisionsUrl("typesafe")).toBe("https://proxy.example/decisions");
+	});
+	test("PI_VERDICT_JEV_URL must be https; loopback may use http; anything else is ignored with a warning (F11, JV-2)", () => {
+		for (const bad of ["http://proxy.example/d", "ftp://x.example/d", "file:///etc/passwd", "not a url", "http://localhost.evil.example/d"]) {
+			process.env.PI_VERDICT_JEV_URL = bad;
+			expect(jevUrlOverrideError()).toContain("PI_VERDICT_JEV_URL ignored");
+			expect(decisionsUrl("openrouter")).toBe(TRANSPORT_DEFAULTS.openrouter.url);
+			expect(decisionsUrl("typesafe")).toBe(TRANSPORT_DEFAULTS.typesafe.url);
+		}
+		for (const ok of ["http://127.0.0.1:8080/d", "http://localhost:8080/d", "http://[::1]:8080/d", "https://proxy.example/d"]) {
+			process.env.PI_VERDICT_JEV_URL = ok;
+			expect(jevUrlOverrideError()).toBeNull();
+			expect(decisionsUrl("typesafe")).toBe(ok);
+		}
+		delete process.env.PI_VERDICT_JEV_URL;
+		expect(jevUrlOverrideError()).toBeNull();
 	});
 	test("TRANSPORT_DEFAULTS pins both wire contracts", () => {
 		expect(TRANSPORT_DEFAULTS.openrouter).toMatchObject({ url: "https://openrouter.ai/api/alpha/decisions", wireModel: "~typesafe/jev-latest", keyEnv: "OPENROUTER_API_KEY", loginProvider: "openrouter" });

@@ -88,7 +88,7 @@ import type * as PiAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import type { BeforeAgentStartEventResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
-import { activeTransport, type JevReason, OMP_OPENROUTER_API_ID, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER, VERDICT_CHOICES_PREFIX } from "./jev-adapter";
+import { activeTransport, type JevReason, jevUrlOverrideError, OMP_OPENROUTER_API_ID, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER, VERDICT_CHOICES_PREFIX } from "./jev-adapter";
 
 // ============================================================================
 // Rules layer: bash
@@ -7768,6 +7768,8 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		pruneSessionOverrides();
 		state.audit?.prune(); // #54: converge to the AUDIT_KEEP_SESSIONS most recent files at session start
 		reportLoadWarnings(report, ctx);
+		const urlError = jevUrlOverrideError();
+		if (urlError) ctx.ui.notify(`pi-verdict: ${urlError}`, "warning");
 		if (report.project?.applied) ctx.ui.notify(`pi-verdict: project overrides applied from ${report.project.path}`, "info");
 		if (report.project && !report.project.trusted) ctx.ui.notify(`pi-verdict: project config ${report.project.path} ignored — project not trusted (decisions: ${trustStorePath()})`, "info");
 		refreshStatus(ctx);
