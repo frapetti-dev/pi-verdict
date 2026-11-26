@@ -13,7 +13,8 @@ import jevAdapter, {
 	API_ID,
 	buildDecisionsBody,
 	CONCERNS,
-	createJevProvider,
+	jevModel,
+	streamDecisions,
 	decisionsUrl,
 	jevUrlOverrideError,
 	extractState,
@@ -28,6 +29,13 @@ import jevAdapter, {
 	wireModel,
 } from "../extensions/jev-adapter.ts";
 import { adjudicate, SessionState } from "../extensions/pi-verdict.ts";
+
+/** streamDecisions against the active transport, the way the classifier calls it. */
+const mkProvider = (fetcher?: typeof fetch) => {
+	const transport = activeTransport();
+	const model = jevModel(transport);
+	return { model, streamSimple: (m: typeof model, c: any, o: any) => streamDecisions(transport, m, c, o, fetcher) };
+};
 
 const TMP_AGENT = fs.mkdtempSync(path.join(os.tmpdir(), "pi-verdict-jev-test-"));
 const SAVED_OR_KEY = process.env.OPENROUTER_API_KEY;
@@ -175,7 +183,7 @@ describe("verdict prefix contract (real adjudicate pipeline)", () => {
 	});
 });
 
-describe("streamDecisions via createJevProvider", () => {
+describe("streamDecisions", () => {
 	test("happy path: request shape, synthesized text, usage mapping, signal passthrough", async () => {
 		const controller = new AbortController();
 		const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -183,8 +191,8 @@ describe("streamDecisions via createJevProvider", () => {
 			calls.push({ url, init });
 			return new Response(JSON.stringify(decisionResponse("deny", { deny: 0.96, allow: 0.04, ask: 0 }, 0.29)), { status: 200 });
 		}) as typeof fetch;
-		const provider = createJevProvider(async () => "sk-or-live", fetcher);
-		const model = provider.getModels()[0];
+		const provider = mkProvider(fetcher);
+		const model = provider.model;
 		expect(model.id).toBe(MODEL_ID);
 		const message = await provider
 			.streamSimple(model, { messages: [{ role: "user", content: "User: hi\nbash: cat ~/.ssh/id_ed25519" }] } as any, {
@@ -208,21 +216,21 @@ describe("streamDecisions via createJevProvider", () => {
 	});
 	test("HTTP error lands as stopReason error with the status and body snippet", async () => {
 		const fetcher = (async () => new Response('{"error":{"message":"is a decisions model"}}', { status: 400 })) as typeof fetch;
-		const provider = createJevProvider(undefined, fetcher);
-		const message = await provider.streamSimple(provider.getModels()[0], { messages: [{ role: "user", content: "x" }] } as any, { apiKey: "k" }).result();
+		const provider = mkProvider(fetcher);
+		const message = await provider.streamSimple(provider.model, { messages: [{ role: "user", content: "x" }] } as any, { apiKey: "k" }).result();
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("400");
 		expect(message.errorMessage).toContain("decisions model");
 	});
 	test("malformed JSON lands as stopReason error", async () => {
-		const provider = createJevProvider(undefined, (async () => new Response("not json", { status: 200 })) as typeof fetch);
-		const message = await provider.streamSimple(provider.getModels()[0], { messages: [{ role: "user", content: "x" }] } as any, { apiKey: "k" }).result();
+		const provider = mkProvider((async () => new Response("not json", { status: 200 })) as typeof fetch);
+		const message = await provider.streamSimple(provider.model, { messages: [{ role: "user", content: "x" }] } as any, { apiKey: "k" }).result();
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("malformed JSON");
 	});
 	test("missing API key lands as stopReason error", async () => {
-		const provider = createJevProvider(undefined);
-		const message = await provider.streamSimple(provider.getModels()[0], { messages: [{ role: "user", content: "x" }] } as any, {}).result();
+		const provider = mkProvider();
+		const message = await provider.streamSimple(provider.model, { messages: [{ role: "user", content: "x" }] } as any, {}).result();
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("no API key resolved");
 	});
@@ -232,10 +240,10 @@ describe("streamDecisions via createJevProvider", () => {
 			calls.push({ url });
 			return new Response(JSON.stringify(decisionResponse("allow", { allow: 1 }, 1)), { status: 200 });
 		}) as typeof fetch;
-		const provider = createJevProvider(undefined, fetcher);
+		const provider = mkProvider(fetcher);
 		process.env.PI_VERDICT_JEV_TRANSPORT = "typesafe";
 		try {
-			const message = await provider.streamSimple(provider.getModels()[0], { messages: [{ role: "user", content: "x" }] } as any, { apiKey: "k" }).result();
+			const message = await provider.streamSimple(provider.model, { messages: [{ role: "user", content: "x" }] } as any, { apiKey: "k" }).result();
 			expect(message.stopReason).toBe("stop");
 			expect(calls[0].url).toBe("https://openrouter.ai/api/alpha/decisions");
 		} finally {
@@ -244,83 +252,17 @@ describe("streamDecisions via createJevProvider", () => {
 	});
 });
 
-describe("auth resolve order", () => {
-	const input = { ctx: { env: async () => undefined, fileExists: async () => false }, credential: undefined, signal: new AbortController().signal };
-	test("openrouter resolver wins over env", async () => {
-		process.env.OPENROUTER_API_KEY = "sk-env";
-		const r = await createJevProvider(async () => "sk-or-login").auth.apiKey.resolve(input as any);
-		expect(r).toEqual({ auth: { apiKey: "sk-or-login" }, source: "openrouter" });
-	});
-	test("env applies when the resolver throws or is unset", async () => {
-		process.env.OPENROUTER_API_KEY = "sk-env";
-		expect((await createJevProvider(async () => { throw new Error("store down"); }).auth.apiKey.resolve(input as any))?.auth.apiKey).toBe("sk-env");
-		expect((await createJevProvider(undefined).auth.apiKey.resolve(input as any))?.auth.apiKey).toBe("sk-env");
-	});
-	test("unconfigured when neither source yields a key", async () => {
-		delete process.env.OPENROUTER_API_KEY;
-		expect(await createJevProvider(undefined).auth.apiKey.resolve(input as any)).toBeUndefined();
-	});
-});
-
 describe("extension wiring", () => {
-	function makePi() {
-		const registered: unknown[] = [];
-		const handlers: Record<string, (event: any, ctx: any) => unknown> = {};
-		return {
-			pi: {
-				registerProvider: (p: unknown) => registered.push(p),
-				on: (event: string, handler: (event: any, ctx: any) => unknown) => {
-					handlers[event] = handler;
-				},
-			},
-			registered,
-			handlers,
-		};
-	}
-	const ctxWith = (apiKey?: string) => ({
-		modelRegistry: { getProviderAuth: async () => (apiKey ? { auth: { apiKey } } : undefined) },
-		ui: { notify: () => {} },
-	});
-
-	test("registers the typesafe provider at load and re-registers on session_start", () => {
-		const { pi, registered, handlers } = makePi();
-		jevAdapter(pi as any);
-		expect(registered).toHaveLength(1);
-		expect((registered[0] as any).id).toBe(PROVIDER_ID);
-		expect((registered[0] as any).getModels()[0].id).toBe(MODEL_ID);
-		handlers["session_start"]({}, ctxWith("sk-or"));
-		expect(registered).toHaveLength(2); // re-register refreshes the sync hasConfiguredAuth snapshot
-	});
-	test("model_select on the jev provider warns; other providers stay silent", () => {
-		const { pi, handlers } = makePi();
-		const notifies: Array<[string, string]> = [];
-		const ctx = { ...ctxWith(), ui: { notify: (m: string, k: string) => notifies.push([m, k]) } };
-		jevAdapter(pi as any);
-		handlers["model_select"]({ model: { provider: PROVIDER_ID, id: MODEL_ID } }, ctx);
-		expect(notifies).toHaveLength(1);
-		expect(notifies[0][0]).toContain("classifierModel only");
-		expect(notifies[0][1]).toBe("warning");
-		handlers["model_select"]({ model: { provider: "anthropic", id: "claude" } }, ctx);
-		expect(notifies).toHaveLength(1);
-	});
-	test("pi 0.84 shape (registerProvider(providerOrName, config), arity 2) still registers the Provider object", () => {
-		const registered: unknown[] = [];
-		const pi = { registerProvider: (_providerOrName: unknown, _config?: unknown) => registered.push(_providerOrName), on: () => {} };
-		expect(pi.registerProvider.length).toBe(2);
-		jevAdapter(pi as any);
-		expect(registered).toHaveLength(1);
-		expect(typeof (registered[0] as any).streamSimple).toBe("function");
-	});
-	test("omp shape (logger + typebox on the API object) registers by name + config, never a Provider object", () => {
+	test("registers by name + config, never a Provider object", () => {
 		process.env.OPENROUTER_API_KEY = "sk-or";
 		const calls: unknown[][] = [];
-		const pi = { logger: {}, typebox: {}, registerProvider: (...a: unknown[]) => calls.push(a), on: () => {} };
+		const pi = { registerProvider: (...a: unknown[]) => calls.push(a), on: () => {} };
 		jevAdapter(pi as any);
 		expect(calls).toHaveLength(1);
 		expect(calls[0][0]).toBe(PROVIDER_ID);
 		expect((calls[0][1] as any).models[0].id).toBe(MODEL_ID);
 	});
-	test("hosts without registerProvider (omp) stay inert", () => {
+	test("hosts without registerProvider stay inert", () => {
 		const pi: Record<string, unknown> = { on: () => {} };
 		expect(() => jevAdapter(pi as any)).not.toThrow();
 	});
@@ -396,11 +338,10 @@ describe("typesafe transport (direct v1 API)", () => {
 				{ status: 200 },
 			);
 		}) as typeof fetch;
-		const provider = createJevProvider(undefined, fetcher);
-		expect(provider.name).toBe("TypeSafe (jev direct)");
-		expect(provider.getModels()[0].baseUrl).toBe("https://api.typesafe.ai/v1/systemone");
+		const provider = mkProvider(fetcher);
+		expect(provider.model.baseUrl).toBe("https://api.typesafe.ai/v1/systemone");
 		const message = await provider
-			.streamSimple(provider.getModels()[0], { messages: [{ role: "user", content: "Action: cat ~/.ssh/id_ed25519" }] } as any, { apiKey: "ts-req" })
+			.streamSimple(provider.model, { messages: [{ role: "user", content: "Action: cat ~/.ssh/id_ed25519" }] } as any, { apiKey: "ts-req" })
 			.result();
 		expect(message.stopReason).toBe("stop");
 		expect(message.content[0]).toEqual({ type: "text", text: "<verdict>deny</verdict> jev: deny 76% (confidence 65%; allow 16%, ask 8%)" });
@@ -409,22 +350,10 @@ describe("typesafe transport (direct v1 API)", () => {
 		const body = JSON.parse(String(calls[0].init.body));
 		expect(body.model).toBe("jev-latest");
 	});
-	test("auth resolves TYPESAFE_API_KEY only, ignoring openrouter sources", async () => {
-		const input = { ctx: { env: async () => undefined, fileExists: async () => false }, credential: undefined, signal: new AbortController().signal };
-		process.env.OPENROUTER_API_KEY = "sk-or-env";
-		try {
-			expect(await createJevProvider(async () => "sk-or-login").auth.apiKey.resolve(input as any)).toEqual({ auth: { apiKey: "ts-test" }, source: "typesafe" });
-			delete process.env.TYPESAFE_API_KEY;
-			expect(await createJevProvider(async () => "sk-or-login").auth.apiKey.resolve(input as any)).toBeUndefined();
-		} finally {
-			delete process.env.OPENROUTER_API_KEY;
-			process.env.TYPESAFE_API_KEY = "ts-test";
-		}
-	});
 	test("missing key names TYPESAFE_API_KEY in the error", async () => {
 		delete process.env.TYPESAFE_API_KEY;
-		const provider = createJevProvider(undefined);
-		const message = await provider.streamSimple(provider.getModels()[0], { messages: [{ role: "user", content: "x" }] } as any, {}).result();
+		const provider = mkProvider();
+		const message = await provider.streamSimple(provider.model, { messages: [{ role: "user", content: "x" }] } as any, {}).result();
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("TYPESAFE_API_KEY");
 	});
@@ -509,9 +438,9 @@ describe("restricted verdict sets (approval modes)", () => {
 			calls.push({ init });
 			return new Response(JSON.stringify(decisionResponse("allow", { allow: 0.7, ask: 0.3 }, 0.65)), { status: 200 });
 		}) as typeof fetch;
-		const provider = createJevProvider(async () => "sk", fetcher);
+		const provider = mkProvider(fetcher);
 		const message = await provider
-			.streamSimple(provider.getModels()[0], { systemPrompt: "intro\nAllowed verdicts: allow, ask\n\nformat", messages: [{ role: "user", content: "User: hi\nbash: ls" }] } as any, { apiKey: "sk" })
+			.streamSimple(provider.model, { systemPrompt: "intro\nAllowed verdicts: allow, ask\n\nformat", messages: [{ role: "user", content: "User: hi\nbash: ls" }] } as any, { apiKey: "sk" })
 			.result();
 		const body = JSON.parse(String(calls[0].init.body));
 		expect(Object.keys(body.questions.verdict.criteria)).toEqual(["allow", "ask"]);

@@ -141,16 +141,15 @@ export default function (pi) {
 
 Bypass testing of the rule layer ([writeup](../research/rule-layer-security-audit.md)) showed that allowlist robustness is very limited: command strings are obfuscatable and a sound allow claim needs shell-AST analysis a measured rule engine did not pay for ([rule-engine-sim](../research/rule-engine-sim/README.md)). The built-in layer therefore makes only **deny** claims for commands (the sound direction); command allow claims are yours. Path grading is the one built-in allow: reads outside the S0 and S1 grades and writes inside the working directory outside S0–S3 pass mechanically ([PG-4](adjudication-rules.md#pg-4-reads), [PG-5](adjudication-rules.md#pg-5-writes), [RL-5](adjudication-rules.md#rl-5-danger-rules)).
 
-## Tern-native UI
+## UI
 
-pi-verdict has no config key for this. On omp, `session_start` runs a probe (a throwaway `setWidget` factory that receives the host TUI); when that TUI reports `nativeRendering` (omp inside Tern with the Tern Surface Protocol live), the ask and grant dialog, the settings menus (`/automode`, `/verdict`, `/automode-setup`), the `/rule` progress panel, the classifier status row, the footer, the verdict label and the five select/confirm flows (project trust, `verdict_settings` confirmation, `/grants`, `/rule` review, root-rule review) describe themselves as native nodes instead of ANSI rows. Set `PI_TUI_NATIVE=0` (omp's own switch) to keep the ANSI UI inside Tern. On pi and on omp outside Tern nothing changes. Text inputs and the editor (`ui.input`, `ui.editor`, the Explain question) stay host dialogs, which omp already draws natively.
+pi-verdict has no config key for this. The ask and grant dialog, the settings menus (`/automode`, `/verdict`, `/automode-setup`), the `/rule` progress panel, the classifier status row, the footer, the verdict label and the select/confirm flows (project trust, `verdict_settings` confirmation, `/grants`, `/rule` review, root-rule review) are omp pi-tui nodes, drawn by the terminal and by Tern alike. Without `ctx.ui.custom` (headless or RPC) the plain `select`/`confirm` fallbacks apply.
 
-## Host notes (pi and oh-my-pi)
+## Host notes (oh-my-pi)
 
-pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp); the extension self-anchors to whichever agent tree it is installed in. On a dual-install machine the gate follows the extension copy's own location — the mere presence of `~/.omp` never redirects a pi run (and vice versa).
+pi-verdict requires [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) 19.2.1+; the extension self-anchors to the agent tree it is installed in.
 
 Implementation details worth knowing if you hack on the extension:
 
-- omp 18's `ModelRegistry` has no `complete` method, so the classifier resolves completion through the pi-ai compat module at first gray-zone verdict (`@earendil-works/pi-ai/compat`, which omp's legacy compat layer rewrites to its bundled pi-ai). Resolution or call failures follow the usual fail-closed deny.
-- Thinking control is sent in both hosts' native dialects (`thinkingEnabled`/`effort` for pi, `reasoning`/`disableReasoning` for omp); each host reads its own fields and ignores the other's.
+- omp's `ModelRegistry` has no `complete` method, so the classifier resolves completion through `@oh-my-pi/pi-ai` at first gray-zone verdict. Resolution or call failures follow the usual fail-closed deny.
 - omp installs npm plugins under `plugins/node_modules/<pkg>/` in its config root — under `<agentDir>/` up to omp 18.0, a sibling of `agent/` since omp 18.1. The user-rules config always lives under `<agentDir>/config/` on both layouts.

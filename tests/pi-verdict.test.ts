@@ -6,6 +6,7 @@
  * the temp-dir fixture goes through withTempDir (create -> fn -> cleanup).
  */
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
+import type { KeyEvent, UiNode } from "@oh-my-pi/pi-tui";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -60,15 +61,12 @@ interface Harness {
 	ompReloads: number;
 	/** `pi.sendMessage` calls (omp label path) */
 	sent: Array<{ message: any; options: any }>;
-	/** `pi.appendEntry` calls (pi label path) */
-	entries: Array<[string, any]>;
 	messageRenderers: Record<string, any>;
-	entryRenderers: Record<string, any>;
 	/** `pi.registerTool` definitions by name */
 	tools: Record<string, ToolDefinitionStub>;
 	/** Extension event bus shared by every listener of this harness (`pi.events`): synchronous dispatch, no replay. */
 	events: { emit: (channel: string, data: unknown) => void; on: (channel: string, fn: (data: unknown) => void) => () => void };
-	install: (opts?: { verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }>; ompHost?: boolean }) => void;
+	install: (opts?: { verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> }) => void;
 	/** Sets a CLI flag value after install, as pi/omp do once the extension factory has loaded. */
 	setFlag: (name: string, value: unknown) => void;
 }
@@ -84,10 +82,8 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 	let flags: Record<string, unknown> = {};
 	const branch: any[] = [];
 	const sent: Array<{ message: any; options: any }> = [];
-	const entries: Array<[string, any]> = [];
 	const messageRenderers: Record<string, any> = {};
-	const entryRenderers: Record<string, any> = {};
-	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, entries, messageRenderers, entryRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectTitles: [] as string[], selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined, roles: undefined, ompAgentDir: undefined, ompReloads: 0 };
+	const h: any = { handlers, commands, shortcuts, notifies, statusSets, fgCalls, branch, sent, messageRenderers, calls: [], responses: [], confirms: 0, confirmMsgs: [] as string[], confirmAnswer: true, confirmError: undefined, selects: 0, selectTitles: [] as string[], selectIndex: 0, selectPicks: null, inputs: [], editors: [], findMap: undefined, roles: undefined, ompAgentDir: undefined, ompReloads: 0 };
 	h.widgetSets = widgetSets;
 	const bus = new Map<string, Set<(d: unknown) => void>>();
 	h.events = {
@@ -135,13 +131,13 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 			input: async () => h.inputs.shift(),
 			editor: async () => h.editors.shift(),
 			setStatus: (id: string, text: string) => statusSets.push([id, text]), theme: { fg: (c: string, s: string) => (fgCalls.push([c, s]), s) },
-			setWidget: (key: string, content: string[] | undefined) => widgetSets.push([key, content]),
+			setWidget: (key: string, content: unknown) => widgetSets.push([key, typeof content === "function" ? shownText(content(hostUi, fakeTheme) as UiNode).split("\n") : (content as string[] | undefined)]),
 		},
 	};
 	h.ctx = ctx;
 
 	h.setFlag = (name, value) => { flags[name] = value; };
-	h.install = (opts?: { verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }>; ompHost?: boolean }) => {
+	h.install = (opts?: { verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> }) => {
 		flags = { "auto-mode-debug": opts?.debug ?? false, ...(opts?.verdictMode ? { "verdict-mode": opts.verdictMode } : {}), ...(opts?.modelFlag ? { "auto-mode-model": opts.modelFlag } : {}) };
 		const prev = process.env.PI_AUTO_MODE_DEBUG;
 		if (opts?.debug) process.env.PI_AUTO_MODE_DEBUG = "1"; else delete process.env.PI_AUTO_MODE_DEBUG;
@@ -155,8 +151,6 @@ function makeHarness(cwd: string = "/proj", opts?: { ompRegistry?: boolean; role
 			registerShortcut: (k: string, o: any) => { shortcuts[k] = o; },
 			registerMessageRenderer: (t: string, r: any) => { messageRenderers[t] = r; },
 			sendMessage: (message: any, options: any) => { sent.push({ message, options }); },
-			appendEntry: (t: string, data: any) => { entries.push([t, data]); },
-			...(opts?.ompHost ? { logger: {}, typebox: {} } : { registerEntryRenderer: (t: string, r: any) => { entryRenderers[t] = r; } }),
 			...(rolesEnabled ? { pi: { settings: { getModelRole: (r: string) => h.roles?.[r], getAgentDir: () => h.ompAgentDir ?? path.join(TMP_AGENT, "omp"), reloadFromDisk: async () => { h.ompReloads++; } } } } : {}),
 		} as any, opts?.compatLoader ? { compatLoader: opts.compatLoader } : {});
 		if (prev !== undefined) process.env.PI_AUTO_MODE_DEBUG = prev; else delete process.env.PI_AUTO_MODE_DEBUG;
@@ -210,24 +204,81 @@ function setConfig(cfg: { allow?: string[]; deny?: string[]; denyPaths?: unknown
 const userMsg = (h: Harness, t: string) => h.branch.push({ type: "message", message: { role: "user", content: t } });
 const toolCall = (h: Harness, toolName: string, input: any, toolCallId?: string) => h.handlers.tool_call({ toolName, input, ...(toolCallId === undefined ? {} : { toolCallId }) }, h.ctx);
 
-const ANSI = /\x1b\[[0-9;]*m/g;
-type DialogComponent = { render(width: number): string[]; handleInput(data: string): void };
-type DialogFactory = (tui: { requestRender(): void }, theme: { fg(c: string, t: string): string; bold(t: string): string }, kb: undefined, done: (r: unknown) => void) => DialogComponent;
+/** A decoded key press, as omp delivers it to a node's `onKey`. */
+const key = (id: string, text?: string): KeyEvent => ({ id, text, kind: "press", raw: "" });
+/** Sends key `id` to a mounted dialog root. */
+const press = (node: UiNode, id: string, text?: string): boolean => node.handlers.onKey!(key(id, text)) as boolean;
+type Tsp = { k: string; p: Record<string, unknown>; c: Tsp[]; key: string | undefined };
+/** A mounted node as the old `{k, p, c, key}` tree. */
+const toTsp = (node: UiNode): Tsp => ({ k: node.kind, p: node.props() as Record<string, unknown>, c: node.children().map(toTsp), key: node.key() });
+/** A `prefs` window as lines: title, pages, then per section a heading and one line per row (`› ` marks the focused row). */
+function prefsLines(p: Record<string, any>): string[] {
+	const out: string[] = [String(p.title), `pages: ${(p.pages as Array<{ label: string }>).map((g) => g.label).join(" | ")}${p.page === "__main" ? "" : ` > ${p.page}`}`];
+	for (const s of p.sections as Array<{ title: string; rows: Array<Record<string, any>> }>) {
+		out.push(`── ${s.title}`);
+		for (const r of s.rows) {
+			const c = r.control;
+			const val = c.k === "number" ? (c.labels?.[String(c.value)] ?? c.value) : c.k === "action" ? `[${c.label}]` : c.k === "text" ? (c.value || c.placeholder || "") : c.value;
+			const draft = p.editing?.row === r.id ? ` ▏${p.editing.draft}` : "";
+			out.push(`${p.focus === r.id ? "› " : "  "}${r.label}  ${val}${draft}${r.hint ? `  ${r.hint}` : ""}${r.warning ? `  ⚠ ${r.warning}` : ""}${r.disabled ? `  (${r.disabled})` : ""}`);
+		}
+	}
+	out.push(String(p.lead));
+	return out;
+}
+/** Every string a node tree shows (texts, labels, titles, hints …) in tree order: the plain-text stand-in for a render. */
+function shownText(node: UiNode): string {
+	const out: string[] = [];
+	const walk = (v: unknown): void => {
+		if (typeof v === "string") out.push(v);
+		else if (Array.isArray(v)) v.forEach(walk);
+		else if (typeof v === "object" && v !== null) Object.values(v).forEach(walk);
+	};
+	const visit = (n: UiNode): void => {
+		if (n.kind === "prefs") {
+			out.push(...prefsLines(n.props() as Record<string, any>));
+			return;
+		}
+		walk(Object.entries(n.props()).filter(([k]) => k !== "role" && k !== "tone" && k !== "gap" && k !== "align" && k !== "style" && k !== "size").map(([, v]) => v));
+		n.children().forEach(visit);
+	};
+	visit(node);
+	return out.join("\n");
+}
+/** Raw terminal bytes of the old key scripts as decoded key events. */
+function rawKey(data: string): KeyEvent {
+	const named: Record<string, string> = { "\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left", "\r": "enter", "\n": "enter", "\x1b": "escape", "\t": "tab", "\x1b[Z": "shift+tab", "\x7f": "backspace", "\x1b[3~": "delete", "\x0f": "ctrl+o", "\x1b[5~": "pageUp", "\x1b[6~": "pageDown", "\x1b[H": "home", "\x1b[F": "end" };
+	const id = named[data];
+	if (id !== undefined) return key(id);
+	if (data.length === 1 && data >= " ") return key(data, data);
+	throw new Error(`rawKey: unmapped ${JSON.stringify(data)}`);
+}
+/** Sends raw terminal bytes (a key, or a bracketed paste) to a mounted dialog root. */
+function sendRaw(root: UiNode, data: string): void {
+	const paste = /^\x1b\[200~([\s\S]*)\x1b\[201~$/.exec(data);
+	if (paste) {
+		root.handlers.onPaste!({ text: paste[1]! });
+		return;
+	}
+	const e = rawKey(data);
+	press(root, e.id, e.text);
+}
+/** The host's `ui` handed to a `ui.custom` factory. */
+const hostUi = { requestRender() {}, size: () => ({ columns: 120, rows: 40 }), suspend: <T,>(run: () => T): T => run() };
+const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+type DialogFactory = (ui: typeof hostUi, theme: typeof fakeTheme, kb: undefined, done: (r: unknown) => void) => UiNode;
 
-/** Each ui.custom call replays the next key script against the real dialog component and records its render; an exhausted script list presses Escape.
- *  `after` additionally records the render after each key. */
+/** Each ui.custom call replays the next key script against the real dialog and records its shown text; an exhausted script list presses Escape.
+ *  `after` additionally records the text after each key. */
 function driveDialogs(h: Harness, scripts: string[][], rendered: string[], after?: string[]): void {
 	h.ctx.ui.custom = async (factory: DialogFactory) => {
-		const { initTheme } = await import("@earendil-works/pi-coding-agent");
-		initTheme("dark", false);
-		const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 		const keys = scripts.shift() ?? ["\x1b"];
 		return new Promise((resolve) => {
-			const component = factory({ requestRender() {} }, fakeTheme, undefined, resolve);
-			rendered.push(component.render(80).join("\n").replace(ANSI, ""));
+			const root = factory(hostUi, fakeTheme, undefined, resolve);
+			rendered.push(shownText(root));
 			for (const k of keys) {
-				component.handleInput(k);
-				after?.push(component.render(80).join("\n").replace(ANSI, ""));
+				sendRaw(root, k);
+				after?.push(shownText(root));
 			}
 		});
 	};
@@ -239,39 +290,49 @@ const times = (n: number, key: string): string[] => Array<string>(n).fill(key);
 
 /** Replays one key script against the real settings menu opened by the next `ui.custom` call, then presses Escape until it closes.
  *  One-shot: the previous `ui.custom` is restored when the menu opens, so a later ask dialog in the same test is not driven by these keys.
- *  `rendered` gets the first render, `after` the render after each key (width 100, ANSI stripped). */
+ *  `rendered` gets the first shown text, `after` the text after each key. */
 function driveMenu(h: Harness, keys: string[], rendered: string[] = [], after: string[] = []): void {
 	const previous = h.ctx.ui.custom;
 	h.ctx.ui.custom = async (factory: DialogFactory) => {
 		h.ctx.ui.custom = previous;
-		// Lazy like the extension's own dialog modules: the pi package is an optional peer dependency, so the suite must not load it statically.
-		const { initTheme } = await import("@earendil-works/pi-coding-agent");
-		initTheme("dark", false);
-		const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 		const { promise, resolve } = Promise.withResolvers<unknown>();
 		let closed = false;
-		const component = factory({ requestRender() {} }, fakeTheme, undefined, (r) => {
+		const root = factory(hostUi, fakeTheme, undefined, (r) => {
 			closed = true;
 			resolve(r);
 		});
-		const draw = (): string => component.render(100).join("\n").replace(ANSI, "");
-		rendered.push(draw());
+		rendered.push(shownText(root));
 		for (const k of keys) {
-			component.handleInput(k);
-			after.push(draw());
+			sendRaw(root, k);
+			after.push(shownText(root));
 		}
-		for (let i = 0; i < 6 && !closed; i++) component.handleInput(MENU.ESC);
+		for (let i = 0; i < 6 && !closed; i++) press(root, "escape");
 		return promise;
 	};
+}
+
+/** A session whose footer widget is not recorded, so `widgetSets` only holds the status rows under test. */
+function sessionRowsOnly(...args: Parameters<typeof session>): Harness {
+	const h = session(...args);
+	const record = h.ctx.ui.setWidget;
+	h.ctx.ui.setWidget = (k: string, c: unknown, o: unknown) => (k === "auto-mode" ? undefined : record(k, c, o));
+	return h;
+}
+
+/** A session on a host without `ui.setWidget`: the footer then rides `setStatus` as the ANSI line. */
+function sessionStatusOnly(...args: Parameters<typeof session>): Harness {
+	const h = session(...args);
+	delete h.ctx.ui.setWidget;
+	return h;
 }
 
 /** Open a session: write a real config from cfg -> build the harness -> install the extension. The ordering constraint
  *  (config before install) is internalized here; opts collects all variants: cwd/ompRegistry go to makeHarness,
  *  invalid/flag/debug/modelFlag/compatLoader go to setConfig and install respectively. */
-function session(cfg: Parameters<typeof setConfig>[0], opts: { cwd?: string; ompRegistry?: boolean; roles?: boolean; ompHost?: boolean; invalid?: string[]; verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> } = {}): Harness {
+function session(cfg: Parameters<typeof setConfig>[0], opts: { cwd?: string; ompRegistry?: boolean; roles?: boolean; invalid?: string[]; verdictMode?: string; debug?: boolean; modelFlag?: string; compatLoader?: () => Promise<{ complete: any }> } = {}): Harness {
 	setConfig(cfg, opts.invalid);
 	const h = makeHarness(opts.cwd, { ompRegistry: opts.ompRegistry, roles: opts.roles });
-	h.install({ verdictMode: opts.verdictMode, debug: opts.debug, modelFlag: opts.modelFlag, compatLoader: opts.compatLoader, ompHost: opts.ompHost });
+	h.install({ verdictMode: opts.verdictMode, debug: opts.debug, modelFlag: opts.modelFlag, compatLoader: opts.compatLoader });
 	return h;
 }
 
@@ -1155,7 +1216,7 @@ describe("toggle shortcut", () => {
 		expect((await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }))?.block).toBe(true);
 	});
 	test("footer chip per mode: auto success, unattended error, supervised warning, off warning", async () => {
-		const h = session({});
+		const h = sessionStatusOnly({});
 		await h.handlers.session_start({}, h.ctx);
 		expect(h.statusSets.at(-1)).toEqual(["auto-mode", "🛡 auto · ↺ mock/glm"]);
 		expect(h.fgCalls).toContainEqual(["success", "🛡 auto"]);
@@ -2847,7 +2908,7 @@ describe("/verdict config editor", () => {
 		const before = fs.readFileSync(USER_FILE(), "utf8");
 		const after: string[] = [];
 		await run(h, "", [DOWN, ENTER, DOWN, "d"], [], after);
-		expect(after.at(-1)).toContain("press d again to remove");
+		expect(after.at(-1)).toContain("clear the value again to remove");
 		expect(fs.readFileSync(USER_FILE(), "utf8")).toBe(before);
 		driveMenu(h, [DOWN, ENTER, DOWN, "d", "d"]);
 		await h.commands.verdict.handler("", h.ctx);
@@ -2869,7 +2930,7 @@ describe("/verdict config editor", () => {
 			await run(h, "local", [ENTER, ENTER, ...typed("^p"), ENTER], rendered);
 			const file = localFileOf(dir);
 			expect(JSON.parse(fs.readFileSync(file, "utf8")).allow).toEqual(["^g", "^p"]);
-			expect(rendered[0]).toContain("⟨ local · untrusted ⟩");
+			expect(rendered[0]).toContain("local · untrusted");
 			expect(h.notifies.some(([m, l]) => l === "info" && m.includes("local allow created from the global list (1 entries)"))).toBe(true);
 		});
 	});
@@ -2882,7 +2943,7 @@ describe("/verdict config editor", () => {
 			const after: string[] = [];
 			// allow page: add, ^p, (section), unset
 			await run(h, "local", [ENTER, DOWN, DOWN, ENTER], [], after);
-			expect(after.at(-1)).toContain("press enter again to confirm");
+			expect(after.at(-1)).toContain("activate again to confirm");
 			expect(JSON.parse(fs.readFileSync(localFileOf(dir), "utf8")).allow).toEqual(["^p"]);
 			driveMenu(h, [ENTER, DOWN, DOWN, ENTER, ENTER]);
 			await h.commands.verdict.handler("local", h.ctx);
@@ -2915,8 +2976,8 @@ describe("/verdict config editor", () => {
 		expect(JSON.parse(fs.readFileSync(sessionFile, "utf8")).ruleAdditions).toEqual({ allow: ["^cargo test\\b"] });
 		expect(readUser().allow).toEqual(["^ls\\b"]);
 		const lines = after.at(-1)!.split("\n");
-		expect(lines.find((l) => l.includes("^ls"))).toMatch(/^ {2}\^ls\\b\s+global\s*$/);
-		expect(lines.find((l) => l.startsWith("› "))).toContain("+ add"); // two DOWNs: session entry, then wrapped back to add
+		expect(lines.find((l) => l.includes("^ls"))).toMatch(/\^ls\\b\s+\(global\)$/);
+		expect(lines.find((l) => l.startsWith("› "))).toContain("Add"); // two DOWNs: session entry, then wrapped back to add
 		expect(await toolCall(h, "bash", { command: "cargo test" })).toBeUndefined();
 		expect(h.calls.length).toBe(0);
 	});
@@ -2962,8 +3023,8 @@ describe("/verdict config editor", () => {
 		const after: string[] = [];
 		await run(h, "session", [...times(9, DOWN), ENTER], rendered, after);
 		const lines = after.at(-1)!.split("\n");
-		expect(lines.find((l) => l.includes("sudo"))).toMatch(/inherit.*ask · global$/);
-		expect(lines.find((l) => l.includes("s0-secret"))).toMatch(/inherit.*deny · default$/);
+		expect(lines.find((l) => l.includes("sudo"))).toMatch(/inherit\s+inherits ask · global/);
+		expect(lines.find((l) => l.includes("s0-secret"))).toMatch(/inherit\s+inherits deny · default/);
 	});
 
 	test("built-in rules page: cycling a danger rule persists its action; a custom rule keeps its pattern", async () => {
@@ -3251,18 +3312,9 @@ describe("/rule command", () => {
 	});
 
 	test("waiting panel renders the attempt counter and Escape cancels before any model call", async () => {
-		// Lazy like the extension's own dialog modules (and the driveDialog helper): the pi package is an optional peer dependency, so the suite must not load it statically.
-		const { initTheme } = await import("@earendil-works/pi-coding-agent");
-		initTheme("dark", false);
 		const h = session({});
 		const rendered: string[] = [];
-		h.ctx.ui.custom = async (factory: any) => {
-			const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
-			const c = factory({ requestRender() {} }, fakeTheme, undefined, () => {});
-			rendered.push(c.render(80).join("\n"));
-			c.handleInput("\x1b");
-			return undefined;
-		};
+		driveDialogs(h, [["\x1b"]], rendered);
 		await run(h, "allow cargo", { picks: [] });
 		expect(rendered[0]).toContain("Attempt 1/3");
 		expect(h.calls).toHaveLength(0);
@@ -3295,7 +3347,7 @@ describe("footer status", () => {
 	};
 
 	test("risky settings render before the model, in red/yellow", async () => {
-		const h = session({ builtinDenyFloor: false, gateOmpDir: false });
+		const h = sessionStatusOnly({ builtinDenyFloor: false, gateOmpDir: false });
 		await h.handlers.session_start({}, h.ctx);
 		const s = lastStatus(h)!;
 		expect(s).toContain("⚠ floor off · ⚠ .omp gate off");
@@ -3305,20 +3357,20 @@ describe("footer status", () => {
 	});
 
 	test('footer:"off" clears the status', async () => {
-		const h = session({ footer: "off" });
+		const h = sessionStatusOnly({ footer: "off" });
 		await h.handlers.session_start({}, h.ctx);
 		expect(h.statusSets.at(-1)).toEqual(["auto-mode", undefined]);
 	});
 
 	test("invalid footer value is reported and the default style renders", async () => {
-		const h = session({ footer: "bogus" });
+		const h = sessionStatusOnly({ footer: "bogus" });
 		await h.handlers.session_start({}, h.ctx);
 		expect(h.notifies.some(([m]) => m.includes('footer: "bogus"'))).toBe(true);
 		expect(lastStatus(h)).toBe("🛡 auto · ↺ mock/glm");
 	});
 
 	test("full style: powerline blocks, per-session counters reset on session start", async () => {
-		const h = session({});
+		const h = sessionStatusOnly({});
 		withBg(h);
 		await h.handlers.session_start({}, h.ctx);
 		expect(lastStatus(h)).toContain("\uF00C 0");
@@ -3374,7 +3426,7 @@ describe("footer status", () => {
 	});
 
 	test("counters count the final verdict: mechanical deny and ask-once", async () => {
-		const h = session({});
+		const h = sessionStatusOnly({});
 		withBg(h);
 		await h.handlers.session_start({}, h.ctx);
 		await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" });
@@ -3387,40 +3439,40 @@ describe("footer status", () => {
 	});
 
 	test("unavailable classifier model falls back to the session model with a warning marker", async () => {
-		const h = session({ classifierModel: "nope/x" });
+		const h = sessionStatusOnly({ classifierModel: "nope/x" });
 		h.findMap = {};
 		await h.handlers.session_start({}, h.ctx);
 		expect(lastStatus(h)).toContain("⚠ ↺ mock/glm");
 	});
 
 	test("configured classifier shows its own id (and thinking level); no session-model marker", async () => {
-		const h = session({ classifierModel: "zai/flash:low" });
+		const h = sessionStatusOnly({ classifierModel: "zai/flash:low" });
 		h.findMap = { "zai/flash": { id: "glm-4-flash" } };
 		await h.handlers.session_start({}, h.ctx);
 		expect(lastStatus(h)).toBe("🛡 auto · glm-4-flash:low");
 	});
 
 	test("fallback model + mode and the confidence floor show as badges", async () => {
-		const h = session({ classifierFallbackModel: "p/fb", classifierFallbackMode: "enforce", confidenceThreshold: 70 });
+		const h = sessionStatusOnly({ classifierFallbackModel: "p/fb", classifierFallbackMode: "enforce", confidenceThreshold: 70 });
 		h.findMap = { "p/fb": { id: "fb" } };
 		await h.handlers.session_start({}, h.ctx);
 		expect(lastStatus(h)).toContain("↳ fb·enforce");
 		expect(lastStatus(h)).toContain("≥70%");
-		const missing = session({ classifierFallbackModel: "p/gone" });
+		const missing = sessionStatusOnly({ classifierFallbackModel: "p/gone" });
 		missing.findMap = {};
 		await missing.handlers.session_start({}, missing.ctx);
 		expect(lastStatus(missing)).toContain("↳ ⚠ unavailable·shadow");
 	});
 
 	test("no session model and no classifier → fail-closed label", async () => {
-		const h = session({});
+		const h = sessionStatusOnly({});
 		h.ctx.model = null;
 		await h.handlers.session_start({}, h.ctx);
 		expect(lastStatus(h)).toContain("no model · fail-closed");
 	});
 
 	test("mode off renders a single ungated block (full) / line (compact)", async () => {
-		const h = session({});
+		const h = sessionStatusOnly({});
 		withBg(h);
 		await h.handlers.session_start({}, h.ctx);
 		await h.commands.automode.handler("off", h.ctx);
@@ -3432,13 +3484,13 @@ describe("footer status", () => {
 	test("omp host: footer goes to a below-editor widget (omp strips ANSI from setStatus); pi keeps setStatus", async () => {
 		setConfig({});
 		const omp = makeHarness("/proj");
-		omp.install({ ompHost: true });
+		omp.install();
 		omp.ctx.ui.theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s, getBgAnsi: () => "\x1b[48;2;1;2;3m", getFgAnsi: () => "\x1b[38;2;4;5;6m" };
 		let opts: unknown;
-		omp.ctx.ui.setWidget = (key: string, content: string[] | undefined, o: unknown) => { omp.widgetSets.push([key, content]); opts = o; };
+		const record = omp.ctx.ui.setWidget; omp.ctx.ui.setWidget = (key: string, content: unknown, o: unknown) => { record(key, content); opts = o; };
 		await omp.handlers.session_start({}, omp.ctx);
 		const w = omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)!;
-		expect(w[1]![0]).toContain("\uF132 AUTO");
+		expect(w[1]![0]).toContain("AUTO");
 		expect(opts).toEqual({ placement: "belowEditor" });
 		expect(omp.statusSets.filter(([k]) => k === "auto-mode").every(([, t]) => t === undefined)).toBe(true); // no duplicate plain line
 		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 AUTO"); // omp: the footer is a below-editor widget, so the powerbar chip is shown (modeStatus on)
@@ -3449,7 +3501,7 @@ describe("footer status", () => {
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("AUTO OFF");
 		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("⚠ OFF · ungated");
 
-		const pi = session({});
+		const pi = sessionStatusOnly({});
 		await pi.handlers.session_start({}, pi.ctx);
 		expect(pi.widgetSets.filter(([k]) => k === "auto-mode")).toEqual([]);
 		expect(pi.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined(); // pi with the footer on: the footer is the chip
@@ -3459,7 +3511,7 @@ describe("footer status", () => {
 	test('omp host: footer:"off" clears the widget', async () => {
 		setConfig({ footer: "off" });
 		const omp = makeHarness("/proj");
-		omp.install({ ompHost: true });
+		omp.install();
 		await omp.handlers.session_start({}, omp.ctx);
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)).toEqual(["auto-mode", undefined]);
 		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)).toEqual(["verdict-mode", "🛡 AUTO"]); // footer off: the chip is the only indicator
@@ -3468,27 +3520,26 @@ describe("footer status", () => {
 	test("modeStatus:false hides the powerbar chip on omp and with the footer off", async () => {
 		setConfig({ modeStatus: false });
 		const omp = makeHarness("/proj");
-		omp.install({ ompHost: true });
+		omp.install();
 		omp.ctx.ui.theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s, getBgAnsi: () => "\x1b[48;2;1;2;3m", getFgAnsi: () => "\x1b[38;2;4;5;6m" };
-		omp.ctx.ui.setWidget = (key: string, content: string[] | undefined) => { omp.widgetSets.push([key, content]); };
 		await omp.handlers.session_start({}, omp.ctx);
 		expect(omp.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined();
 		expect(omp.widgetSets.filter(([k]) => k === "auto-mode").at(-1)![1]![0]).toContain("AUTO");
 
-		const off = session({ footer: "off", modeStatus: false });
+		const off = sessionStatusOnly({ footer: "off", modeStatus: false });
 		await off.handlers.session_start({}, off.ctx);
 		expect(off.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBeUndefined();
 	});
 
 	test("invalid modeStatus is reported and the chip stays on", async () => {
-		const h = session({ footer: "off", modeStatus: "yes" });
+		const h = sessionStatusOnly({ footer: "off", modeStatus: "yes" });
 		await h.handlers.session_start({}, h.ctx);
 		expect(h.notifies.some(([m]) => m.includes('modeStatus: "yes"'))).toBe(true);
 		expect(h.statusSets.filter(([k]) => k === "verdict-mode").at(-1)![1]).toBe("🛡 AUTO");
 	});
 
 	test("/verdict modeStatus edit persists and redraws immediately", async () => {
-		const h = session({ footer: "off", modeStatus: false });
+		const h = sessionStatusOnly({ footer: "off", modeStatus: false });
 		await h.handlers.session_start({}, h.ctx);
 		driveMenu(h, [...times(7, MENU.DOWN), MENU.LEFT]); // mode-in-status-bar row: off → on
 		await h.commands.verdict.handler("", h.ctx);
@@ -3499,7 +3550,7 @@ describe("footer status", () => {
 	test("session scope overrides the user config for modeStatus", async () => {
 		const dir = path.join(TMP_AGENT, "config", "pi-verdict-sessions");
 		const file = path.join(dir, "s1.json");
-		const h = session({ footer: "off" });
+		const h = sessionStatusOnly({ footer: "off" });
 		fs.mkdirSync(dir, { recursive: true });
 		fs.writeFileSync(file, JSON.stringify({ modeStatus: false }));
 		try {
@@ -3511,7 +3562,7 @@ describe("footer status", () => {
 	});
 
 	test("/verdict footer edit persists and redraws immediately", async () => {
-		const h = session({ footer: "off" });
+		const h = sessionStatusOnly({ footer: "off" });
 		await h.handlers.session_start({}, h.ctx);
 		expect(h.statusSets.at(-1)).toEqual(["auto-mode", undefined]);
 		driveMenu(h, [...times(6, MENU.DOWN), MENU.LEFT]); // footer row: off → compact
@@ -3643,18 +3694,9 @@ describe("approve dialog routing", () => {
 		expect(h.confirms).toBe(1);
 	});
 
-	/** Drives the real dialog component: renders, sends the given keys, resolves like the TUI host would. */
+	/** Drives the real dialog: records its shown text, sends the given keys. */
 	function driveDialog(h: Harness, keys: string[], rendered: string[]): void {
-		h.ctx.ui.custom = async (factory: any) => {
-			const { initTheme } = await import("@earendil-works/pi-coding-agent");
-			initTheme("dark", false);
-			const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
-			return new Promise((resolve) => {
-				const component = factory({ requestRender() {} }, fakeTheme, undefined, resolve);
-				rendered.push(component.render(80).join("\n").replace(ANSI, ""));
-				for (const k of keys) component.handleInput(k);
-			});
-		};
+		driveDialogs(h, [keys], rendered);
 	}
 
 	test("rich dialog: Down + Enter declines without calling confirm; renders command and options", async () => {
@@ -3665,7 +3707,7 @@ describe("approve dialog routing", () => {
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(r.reason).toContain("user-declined");
 		expect(h.confirms).toBe(0);
-		for (const s of ["cargo build", "Yes", "No", "Classifier opinion: needs a human"]) expect(rendered[0]).toContain(s);
+		for (const s of ["cargo build", "Yes", "No", "needs a human"]) expect(rendered[0]).toContain(s);
 	});
 
 	test("rich dialog: Enter on the default allows", async () => {
@@ -3683,10 +3725,9 @@ describe("approve dialog routing", () => {
 		driveDialog(h, ["\x1b"], rendered);
 		const r = await toolCall(h, "bash", { command: "cargo build" });
 		expect(r.reason).toContain("user-declined"); // Escape cancels
-		expect(rendered[0]).toContain("concern: network operation");
+		expect(rendered[0]).toContain("network operation");
 		expect(rendered[0]).toContain("35%");
-		expect(rendered[0]).toContain("█");
-		expect(rendered[0]).toContain("━");
+		expect(rendered[0]).toContain("confidence");
 	});
 
 	test("rich dialog: the confidence floor shows as a tick and in the legend", async () => {
@@ -3695,7 +3736,7 @@ describe("approve dialog routing", () => {
 		const rendered: string[] = [];
 		driveDialog(h, ["\x1b"], rendered);
 		await toolCall(h, "bash", { command: "cargo build" });
-		expect(rendered[0]).toContain("┃");
+		expect(rendered[0]).toContain("min 40%");
 		expect(rendered[0]).toContain("45%");
 		expect(rendered[0]).toContain("min 40%");
 	});
@@ -3850,10 +3891,8 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 		driveDialogs(h, [[DOWN, DOWN, "f", "o", "\x1b"]], rendered, after);
 		await toolCall(h, "bash", { command: "cargo build" });
 		expect(rendered[0]!.split("\n").some((l) => l.trim() === "No")).toBe(true);
-		expect(after[1]).toContain("→ No, ");
 		expect(after[1]).toContain("tell the agent what to do instead");
-		expect(after[3]).toContain("→ No, fo");
-		expect(after[3]).not.toContain("tell the agent what to do instead");
+		expect(after[3]).toContain("\nfo");
 	});
 
 	test("protected-path ask: declining with inline text works, and no model call is made", async () => {
@@ -3873,95 +3912,6 @@ describe("EXPLAIN-GATE role and decline explanation", () => {
 });
 
 // ── subagent gate (omp ctx.agent.kind = "sub") ───────────
-
-describe("ask dialog mouse clicks", () => {
-	const ANSI = /\x1b\[[0-9;]*m/g;
-	const DOWN = "\x1b[B";
-	const UP = "\x1b[A";
-	const ASK = { text: "<verdict>ask</verdict> needs a human" };
-
-	type DialogComponent = { render(width: number): string[]; handleInput(data: string): void };
-	type FakeTui = { requestRender(): void; terminal?: { rows: number; columns: number }; children?: unknown[] };
-	type DialogFactory = (tui: FakeTui, theme: { fg(c: string, t: string): string; bold(t: string): string }, kb: undefined, done: (r: unknown) => void) => DialogComponent;
-
-	/** Replays `keys` against the real dialog. A key given as a function receives the current render and returns the input (used to click a labelled row).
-	 *  `layout` hosts the dialog under a 3-line filler with terminal metrics, as a mouse-forwarding host would. */
-	function driveMouseDialog(h: Harness, keys: Array<string | ((lines: string[]) => string)>, opts: { layout: boolean }): void {
-		h.ctx.ui.custom = async (factory: DialogFactory) => {
-			const { initTheme } = await import("@earendil-works/pi-coding-agent");
-			initTheme("dark", false);
-			const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
-			const filler = { render: () => ["x", "x", "x"], invalidate() {} };
-			const tui: FakeTui = opts.layout ? { requestRender() {}, terminal: { rows: 200, columns: 80 }, children: [filler] } : { requestRender() {} };
-			return new Promise((resolve) => {
-				const component = factory(tui, fakeTheme, undefined, resolve);
-				tui.children?.push(component);
-				for (const k of keys) {
-					const lines = component.render(80).map((l) => l.replace(ANSI, ""));
-					component.handleInput(typeof k === "function" ? k(lines) : k);
-				}
-			});
-		};
-	}
-
-	/** SGR click (button `b`, press `M` or release `m`) on the option labelled `label`, below the 3-line filler. */
-	const click = (label: string, b = 0, kind: "M" | "m" = "M") => (lines: string[]): string => {
-		const i = lines.findIndex((l) => {
-			const t = l.trim().replace(/^→ /, "");
-			return t === label || t.startsWith(`${label},`);
-		});
-		if (i < 0) throw new Error(`option ${label} not rendered`);
-		return `\x1b[<${b};5;${3 + i + 1}${kind}`;
-	};
-
-	const run = async (keys: Array<string | ((lines: string[]) => string)>, layout = true) => {
-		const h = session({});
-		h.responses = [ASK];
-		driveMouseDialog(h, keys, { layout });
-		return toolCall(h, "bash", { command: "cargo build" });
-	};
-
-	test("click No, click No again → declined", async () => {
-		const r = await run([click("No"), click("No")]);
-		expect(r.block).toBe(true);
-		expect(r.reason).toContain("user-declined");
-	});
-
-	test("a single click never allows (initial Yes highlight does not arm a confirm)", async () => {
-		const r = await run([click("Yes"), "\x1b"]);
-		expect(r.block).toBe(true);
-	});
-
-	test("click Yes twice → allowed", async () => {
-		expect(await run([click("Yes"), click("Yes")])).toBeUndefined();
-	});
-
-	test("keyboard moves disarm the confirm click", async () => {
-		const r = await run([click("Yes"), DOWN, UP, click("Yes"), "\x1b"]);
-		expect(r.block).toBe(true);
-	});
-
-	test("a click on another row re-arms instead of confirming the first", async () => {
-		const r = await run([click("No"), click("Yes"), click("No"), "\x1b"]);
-		expect(r.block).toBe(true);
-	});
-
-	test("releases and wheel events are ignored", async () => {
-		const r = await run([click("Yes", 0, "m"), click("Yes", 0, "m"), click("Yes", 64), click("Yes", 64), "\x1b"]);
-		expect(r.block).toBe(true);
-	});
-
-	test("typing into the highlighted No row, then clicking it twice, declines with the text", async () => {
-		const r = await run([click("No"), "o", "k", click("No"), click("No")]);
-		expect(r.block).toBe(true);
-		expect(r.reason).toContain('saying: "ok"');
-	});
-
-	test("host without layout metrics: clicks are ignored without throwing", async () => {
-		const r = await run(["\x1b[<0;5;7M", "\x1b[<0;5;7M", "\x1b"], false);
-		expect(r.block).toBe(true);
-	});
-});
 
 describe("subagent gate (omp ctx.agent.kind = sub)", () => {
 	const SENS = path.join(TMP_AGENT, "sensitive-sg");
@@ -4224,7 +4174,7 @@ describe("live classifier status widget", () => {
 	const JEV_ALLOW_49 = "<verdict>allow</verdict> jev: allow 66% (confidence 49%; ask 33%, deny 1%)";
 
 	test("gray command: widget row set while the model runs, cleared after", async () => {
-		const h = session({});
+		const h = sessionRowsOnly({});
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 		await toolCall(h, "bash", { command: "echo hi" });
 		expect(h.widgetSets[0]![0]).toBe("verdict");
@@ -4234,20 +4184,20 @@ describe("live classifier status widget", () => {
 	});
 
 	test("row never carries command text", async () => {
-		const h = session({});
+		const h = sessionRowsOnly({});
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 		await toolCall(h, "bash", { command: "echo SECRET-MARKER" });
 		expect(JSON.stringify(h.widgetSets)).not.toContain("SECRET-MARKER");
 	});
 
 	test("rule allow never touches the widget", async () => {
-		const h = session({ allow: ["^ls\\b"] });
+		const h = sessionRowsOnly({ allow: ["^ls\\b"] });
 		await toolCall(h, "bash", { command: "ls" });
 		expect(h.widgetSets).toEqual([]);
 	});
 
 	test("classifier error fails closed and the row is still cleared", async () => {
-		const h = session({});
+		const h = sessionRowsOnly({});
 		h.responses = [new Error("boom")];
 		const r = await toolCall(h, "bash", { command: "echo hi" });
 		expect(r?.block).toBe(true);
@@ -4255,7 +4205,7 @@ describe("live classifier status widget", () => {
 	});
 
 	test("row shows awaiting approval while the dialog is open, cleared after", async () => {
-		const h = session({});
+		const h = sessionRowsOnly({});
 		h.responses = [{ text: "<verdict>ask</verdict> needs a human" }];
 		let atConfirm: Array<[string, string[] | undefined]> = [];
 		h.ctx.ui.confirm = async () => {
@@ -4265,7 +4215,7 @@ describe("live classifier status widget", () => {
 		};
 		await toolCall(h, "bash", { command: "cargo build" });
 		expect(h.confirms).toBe(1);
-		expect(atConfirm.at(-1)![1]![0]).toContain("awaiting your approval · bash");
+		expect(atConfirm.at(-1)![1]!.join("\n")).toContain("awaiting your approval · bash");
 		expect(JSON.stringify(atConfirm)).not.toContain("cargo build");
 		expect(h.widgetSets.at(-1)).toEqual(CLEAR);
 	});
@@ -4276,7 +4226,7 @@ describe("live classifier status widget", () => {
 		h.responses = [{ text: JEV_ALLOW_49 }, { text: "<verdict>allow</verdict> fine" }];
 		h.confirmAnswer = true;
 		await toolCall(h, "bash", { command: "ls -la /tmp" });
-		const rows = h.widgetSets.filter(([, c]) => c !== undefined).map(([, c]) => c![0]);
+		const rows = h.widgetSets.filter(([k, c]) => k === "verdict" && c !== undefined).map(([, c]) => c!.join("\n"));
 		expect(rows).toHaveLength(3);
 		expect(rows[0]).toContain("classifying bash via mock/glm");
 		expect(rows[1]).toContain("fallback classifier fb-model");
@@ -4285,7 +4235,7 @@ describe("live classifier status widget", () => {
 	});
 
 	test("no UI: no widget calls", async () => {
-		const h = session({});
+		const h = sessionRowsOnly({});
 		h.ctx.hasUI = false;
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 		await toolCall(h, "bash", { command: "echo hi" });
@@ -4293,7 +4243,7 @@ describe("live classifier status widget", () => {
 	});
 
 	test("subagent calls never set the row", async () => {
-		const root = session({ subagentGate: "normal" });
+		const root = sessionRowsOnly({ subagentGate: "normal" });
 		await root.handlers["session_start"]({}, root.ctx);
 		const sub = makeHarness();
 		sub.install();
@@ -4319,42 +4269,8 @@ describe("approve dialog code expansion and verdict label", () => {
 	const LABEL_THEME = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 	const JEV_ALLOW_92 = "<verdict>allow</verdict> jev: allow 92% (confidence 85%; ask 5%, deny 3%)";
 
-	test("pi: rule allow records a label entry that renders nothing; the result is untouched", async () => {
+	test("rule allow sends a hidden aside custom message", async () => {
 		const h = session({ allow: ["^ls\\b"] });
-		expect(await toolCall(h, "bash", { command: "ls" }, "c1")).toBeUndefined();
-		expect(await result(h, "c1")).toBeUndefined();
-		expect(h.entries).toEqual([["pi-verdict-label", { tool: "bash", how: "rule", jev: null }]]);
-		expect(h.entryRenderers["pi-verdict-label"]({ data: h.entries[0][1] }, { expanded: false }, LABEL_THEME)).toBeUndefined();
-		expect(await result(h, "c1")).toBeUndefined();
-		expect(h.entries).toHaveLength(1);
-		expect(h.sent).toEqual([]);
-	});
-
-	test("pi: classifier allow and user approval are told apart; denied calls leave no label", async () => {
-		const h = session({});
-		h.responses = [{ text: "<verdict>allow</verdict> fine" }];
-		await toolCall(h, "bash", { command: "cargo check" }, "c1");
-		await result(h, "c1");
-
-		h.responses = [ASK];
-		driveDialogs(h, [["\r"]], []);
-		expect(await toolCall(h, "bash", { command: "cargo build" }, "c2")).toBeUndefined();
-		await result(h, "c2");
-		expect(h.entries.map((e) => e[1].how)).toEqual(["classifier", "user"]);
-
-		const denied = await toolCall(h, "bash", { command: "rm " + "-rf /opt/x" }, "c3");
-		expect(denied?.block).toBe(true);
-		expect(await result(h, "c3")).toBeUndefined();
-
-		h.responses = [ASK];
-		driveDialogs(h, [["\x1b"]], []); // Escape = No
-		expect((await toolCall(h, "bash", { command: "cargo build" }, "c4"))?.block).toBe(true);
-		expect(await result(h, "c4")).toBeUndefined();
-		expect(h.entries).toHaveLength(2);
-	});
-
-	test("omp: rule allow sends a hidden aside custom message, never a pi entry", async () => {
-		const h = session({ allow: ["^ls\\b"] }, { ompHost: true });
 		expect(await toolCall(h, "bash", { command: "ls" }, "c1")).toBeUndefined();
 		expect(await result(h, "c1")).toBeUndefined();
 		expect(h.sent).toEqual([
@@ -4363,12 +4279,11 @@ describe("approve dialog code expansion and verdict label", () => {
 				options: { deliverAs: "aside" },
 			},
 		]);
-		expect(h.entries).toEqual([]);
 		expect(h.messageRenderers["pi-verdict-label"](h.sent[0].message, { expanded: false }, LABEL_THEME)).toBeUndefined();
 	});
 
-	test("omp: jev verdict carries numbers and renders a bar that drops on narrow widths", async () => {
-		const h = session({}, { ompHost: true });
+	test("jev verdict carries numbers and renders a labelled bar", async () => {
+		const h = session({});
 		h.responses = [{ text: JEV_ALLOW_92 }];
 		await toolCall(h, "bash", { command: "cargo check" }, "c1");
 		await result(h, "c1");
@@ -4376,32 +4291,25 @@ describe("approve dialog code expansion and verdict label", () => {
 		expect(msg.content).toBe("[auto-mode] bash allowed: classifier · jev allow 92%");
 		expect(msg.display).toBe(true);
 		expect(msg.details.jev).toEqual({ choice: "allow", probabilities: { allow: 92, ask: 5, deny: 3 }, confidence: 85 });
-		const component = h.messageRenderers["pi-verdict-label"](msg, { expanded: false }, LABEL_THEME);
-		const wide = component.render(80)[0];
-		for (const s of ["\uF132", "bash", "classifier", "allow 92%", "\uE0B6", "\uE0B4"]) expect(wide).toContain(s);
-		const narrow = component.render(30)[0];
-		expect(narrow).toContain("classifier");
-		expect(narrow).not.toContain("92%");
+		const shown = shownText(h.messageRenderers["pi-verdict-label"](msg, { expanded: false }, LABEL_THEME));
+		for (const s of ["bash", "classifier", "allow 92%"]) expect(shown).toContain(s);
 	});
 
-	test("omp: compact footer uses emoji and a 10-cell 8/1/1 bar", async () => {
-		const h = session({ footer: "compact" }, { ompHost: true });
+	test("compact footer label still names the tool and verdict", async () => {
+		const h = session({ footer: "compact" });
 		h.responses = [{ text: JEV_ALLOW_92 }];
 		await toolCall(h, "bash", { command: "cargo check" }, "c1");
 		await result(h, "c1");
-		const row = h.messageRenderers["pi-verdict-label"](h.sent[0].message, { expanded: false }, LABEL_THEME).render(80)[0];
-		expect(row).toContain("🛡️");
-		expect(row).toContain("🤖");
-		expect(row).not.toContain("\uF132");
-		expect(row.split("█")).toHaveLength(11);
+		const row = shownText(h.messageRenderers["pi-verdict-label"](h.sent[0].message, { expanded: false }, LABEL_THEME));
+		expect(row).toContain("bash");
+		expect(row).toContain("allow 92%");
 	});
 
 	test("persisted junk renders nothing instead of throwing", () => {
 		const h = session({ allow: ["^ls\\b"] });
-		const render = h.entryRenderers["pi-verdict-label"];
-		expect(render({ data: { tool: 1 } }, { expanded: false }, LABEL_THEME)).toBeUndefined();
-		expect(render({ data: null }, { expanded: false }, LABEL_THEME)).toBeUndefined();
-		expect(render({ data: { tool: "bash", how: "rule", jev: { choice: "allow", probabilities: { allow: "x" }, confidence: 1 } } }, { expanded: false }, LABEL_THEME)).toBeUndefined();
+		const render = h.messageRenderers["pi-verdict-label"];
+		expect(render({ details: { tool: 1 } }, { expanded: false }, LABEL_THEME)).toBeUndefined();
+		expect(render({ details: null }, { expanded: false }, LABEL_THEME)).toBeUndefined();
 	});
 
 	const LONG = Array.from({ length: 60 }, (_, i) => "echo L" + i).join("\n");
@@ -4434,11 +4342,9 @@ describe("approve dialog code expansion and verdict label", () => {
 		driveDialogs(h, [["\x0f", "\x0f", "\r"]], rendered, after);
 		expect(await toolCall(h, "bash", { command: LONG }, "t1")).toBeUndefined();
 		expect(rendered[0]).toContain("lines omitted");
-		expect(rendered[0]).toContain("expand");
 		expect(rendered[0]).not.toContain("echo L35");
 		expect(after[0]).toContain("echo L35");
 		expect(after[0]).not.toContain("lines omitted");
-		expect(after[0]).toContain("collapse");
 		expect(after[1]).toContain("lines omitted");
 		expect(after[1]).not.toContain("echo L35");
 	});
@@ -4472,7 +4378,6 @@ describe("approve dialog code expansion and verdict label", () => {
 		};
 		expect(await toolCall(h, "bash", { command: LONG }, "t1")).toBeUndefined();
 		expect(rendered[0]).toContain("echo L35");
-		expect(rendered[0]).toContain("collapse");
 		expect(host.expanded).toBe(false);
 		expect(host.sets).toEqual([false]);
 	});
@@ -4761,7 +4666,7 @@ describe("approval modes", () => {
 			driveMenu(h, [RIGHT, RIGHT], rendered); // inherit → auto → unattended
 			await h.commands.automode.handler("", h.ctx);
 			expect(rendered[0]).toContain("pi-verdict · approval");
-			expect(rendered[0]).toContain("⟨ session ⟩");
+			expect(rendered[0]).toContain("Saves to  session");
 			expect(readSession().mode).toBe("unattended");
 			expect(await statusText(h)).toContain("Approval mode: unattended (session)");
 			driveMenu(h, [RIGHT, RIGHT, RIGHT]); // unattended → supervised → off, then no further value
@@ -4772,18 +4677,6 @@ describe("approval modes", () => {
 			expect(fs.existsSync(SESSION_FILE())).toBe(false);
 		});
 
-		test("only the selected multi-value row shows chevrons", async () => {
-			const h = session({});
-			const after: string[] = [];
-			driveMenu(h, [RIGHT], [], after);
-			await h.commands.automode.handler("", h.ctx);
-			const lines = after[0]!.split("\n");
-			expect(lines.find((l) => l.startsWith("› mode"))).toContain("‹ auto ›");
-			const other = lines.find((l) => l.includes("confidence threshold"))!;
-			expect(other).not.toContain("‹");
-			expect(other).not.toContain("›");
-		});
-
 		test("inherit rows show the inherited value and its source in a right column; other values hide it", async () => {
 			const h = session({ mode: "unattended" });
 			const rendered: string[] = [];
@@ -4791,8 +4684,8 @@ describe("approval modes", () => {
 			driveMenu(h, [RIGHT], rendered, after);
 			await h.commands.automode.handler("", h.ctx);
 			const first = rendered[0]!.split("\n");
-			expect(first.find((l) => l.startsWith("› mode"))).toMatch(/inherit.*unattended · global  ctrl\+shift\+y$/);
-			expect(first.find((l) => l.includes("confidence threshold"))).toMatch(/off · default$/);
+			expect(first.find((l) => l.startsWith("› mode"))).toMatch(/inherit\s+inherits unattended · global/);
+			expect(first.find((l) => l.includes("confidence threshold"))).toMatch(/inherits off · default/);
 			expect(after[0]!.split("\n").find((l) => l.startsWith("› mode"))).not.toContain("· global");
 			fs.rmSync(SESSION_FILE(), { force: true });
 		});
@@ -4804,7 +4697,7 @@ describe("approval modes", () => {
 			await h.commands.automode.handler("", h.ctx);
 			expect(readSession().confidenceThreshold).toBe(60);
 			expect(await statusText(h)).toContain("confidence threshold: 60% (session)");
-			expect(after.at(-1)).toContain("‹ ██████░░░░ 60% ›");
+			expect(after.at(-1)).toContain("60%");
 		});
 
 		test("x stores off (null), i drops the key", async () => {
@@ -4825,26 +4718,11 @@ describe("approval modes", () => {
 			const after: string[] = [];
 			driveMenu(h, [TAB, RIGHT], rendered, after); // session → global; mode auto → unattended
 			await h.commands.automode.handler("", h.ctx);
-			expect(rendered[0]).toContain("⟨ session ⟩");
-			expect(after[0]).toContain("⟨ global ⟩");
+			expect(rendered[0]).toContain("Saves to  session");
+			expect(after[0]).toContain("Saves to  global");
 			expect(readUser().mode).toBe("unattended");
 			expect(fs.existsSync(SESSION_FILE())).toBe(false);
 			expect(await statusText(h)).toContain("Approval mode: unattended (global)");
-		});
-
-		test("the mode row shows the registered toggle shortcut; other rows and a disabled key stay bare", async () => {
-			const h = session({});
-			const rendered: string[] = [];
-			driveMenu(h, [], rendered);
-			await h.commands.automode.handler("", h.ctx);
-			const rows = rendered[0]!.split("\n");
-			expect(rows.find((l) => l.includes("ctrl+shift+y"))).toContain("mode");
-			expect(rows.filter((l) => l.includes("ctrl+")).length).toBe(1);
-			const h2 = session({ toggleShortcut: null });
-			const rendered2: string[] = [];
-			driveMenu(h2, [], rendered2);
-			await h2.commands.automode.handler("", h2.ctx);
-			expect(rendered2[0]!.includes("ctrl+")).toBe(false);
 		});
 
 		test("only the effective mode's section renders until a lists every mode", async () => {
@@ -4853,14 +4731,12 @@ describe("approval modes", () => {
 			const after: string[] = [];
 			driveMenu(h, ["a"], rendered, after);
 			await h.commands.automode.handler("", h.ctx);
-			expect(rendered[0]).toContain("─ all modes");
-			expect(rendered[0]).toContain("─ unattended");
-			expect(rendered[0]).not.toContain("─ auto ");
-			expect(rendered[0]).not.toContain("─ supervised");
-			expect(rendered[0]).toContain("▸ show all modes");
-			expect(after[0]).toContain("─ auto ");
-			expect(after[0]).toContain("─ supervised");
-			expect(after[0]).toContain("▾ current mode only");
+			expect(rendered[0]).toContain("── all modes");
+			expect(rendered[0]).toContain("── unattended");
+			expect(rendered[0]).not.toContain("── auto");
+			expect(rendered[0]).not.toContain("── supervised");
+			expect(after[0]).toContain("── auto");
+			expect(after[0]).toContain("── supervised");
 		});
 
 		test("the info line names a higher-precedence scope; an untrusted local scope is flagged", async () => {
@@ -4883,7 +4759,7 @@ describe("approval modes", () => {
 					const after2: string[] = [];
 					driveMenu(h2, [TAB, TAB], [], after2); // session → global → local
 					await h2.commands.automode.handler("", h2.ctx);
-					expect(after2[1]).toContain("⟨ local · untrusted ⟩");
+					expect(after2[1]).toContain("local · untrusted");
 					expect(after2[1]).toContain("not applied until this project is trusted");
 				} finally {
 					fs.rmSync(trust, { force: true });
@@ -4965,7 +4841,7 @@ describe("omp model roles", () => {
 	const JEV_ALLOW_49 = "<verdict>allow</verdict> jev: allow 66% (confidence 49%; ask 33%, deny 1%)";
 	const DOWN = "\x1b[B";
 	const rolesSession = (cfg: Parameters<typeof session>[0], roles: Record<string, string>, opts: Parameters<typeof session>[1] = {}): Harness => {
-		const h = session(cfg, { ...opts, roles: true });
+		const h = sessionStatusOnly(cfg, { ...opts, roles: true });
 		h.roles = roles;
 		return h;
 	};
@@ -5397,8 +5273,8 @@ describe("permission grants (GR-1–GR-6)", () => {
 		const file = path.join(TMP_AGENT, "config", "pi-verdict.json");
 		fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), ...patch }));
 	};
-	async function open(cfg: Parameters<typeof setConfig>[0] = {}, opts: Parameters<typeof session>[1] = {}): Promise<Harness> {
-		const h = session(cfg, opts);
+	async function open(cfg: Parameters<typeof setConfig>[0] = {}, opts: Parameters<typeof session>[1] = {}, statusOnly = false): Promise<Harness> {
+		const h = statusOnly ? sessionStatusOnly(cfg, opts) : session(cfg, opts);
 		await h.handlers.session_start({}, h.ctx);
 		return h;
 	}
@@ -5486,7 +5362,7 @@ describe("permission grants (GR-1–GR-6)", () => {
 		expect(rendered[0]).toContain("I reject");
 		expect(rendered[0]).toContain("Ask for clarification or revision");
 		expect(rendered[0]).toContain("deploy to staging");
-		expect(rendered[0]).toContain("Protected-path access: read");
+		expect(rendered[0]).toContain("Protected path");
 		expect(rendered[0].replace(/\s+/g, "")).toContain(SENS.replace(/\s+/g, ""));
 		expect(rendered[0]).not.toContain("Explain");
 		driveDialogs(h, [[ENTER]], []);
@@ -5570,7 +5446,7 @@ describe("permission grants (GR-1–GR-6)", () => {
 		expect(h.sent).toHaveLength(1);
 		expect(h.sent[0].message).toMatchObject({ customType: "verdict-grant-revoked", display: true, details: { ids: ["G1"] } });
 		expect(h.sent[0].message.content).toContain("G1");
-		expect(h.sent[0].options).toEqual({ deliverAs: "nextTurn" });
+		expect(h.sent[0].options).toEqual({ deliverAs: "aside" });
 	});
 
 	test("GR-6: /grants menu revokes a picked grant after confirmation, and revoke all clears the rest", async () => {
@@ -5686,7 +5562,7 @@ describe("permission grants (GR-1–GR-6)", () => {
 
 		for (const style of ["full", "compact"] as const) {
 			test(`${style} footer shows the grant count only while grants exist and is byte-identical to the featureless render at 0`, async () => {
-				const h = await open({ footer: style });
+				const h = await open({ footer: style }, {}, true);
 				withBg(h);
 				await h.handlers.session_start({}, h.ctx);
 				const baseline = footerOf(h)!;
@@ -5701,7 +5577,7 @@ describe("permission grants (GR-1–GR-6)", () => {
 
 		test("prompt status bar (omp): 🔑 N while grants exist; grantStatus:false, mode off and zero grants clear it", async () => {
 			const key = (h: Harness) => h.statusSets.filter(([k]) => k === "verdict-grants").at(-1)?.[1];
-			const h = await open({}, { ompHost: true });
+			const h = await open({});
 			await approve(h, { request: "deploy" });
 			expect(key(h)).toBe("🔑 1");
 			await h.commands.automode.handler("off", h.ctx);
@@ -5711,7 +5587,7 @@ describe("permission grants (GR-1–GR-6)", () => {
 			await h.commands.grants.handler("revoke all", h.ctx);
 			expect(key(h)).toBeUndefined();
 
-			const quiet = session({}, { ompHost: true });
+			const quiet = session({});
 			patchConfig({ grantStatus: false });
 			await quiet.handlers.session_start({}, quiet.ctx);
 			await approve(quiet, { request: "deploy" });
@@ -5799,7 +5675,7 @@ describe("remembered approval (PR-9)", () => {
 	const BUILD = { command: "cargo build" };
 	/** Remember a gray `cargo build` ask through the dialog's second row. */
 	async function remembered(cfg: Parameters<typeof setConfig>[0] = {}): Promise<Harness> {
-		const h = session(cfg);
+		const h = sessionStatusOnly(cfg);
 		h.responses = [ASK];
 		driveDialogs(h, [[DOWN, "\r"]], []);
 		expect(await toolCall(h, "bash", BUILD)).toBeUndefined();
@@ -6007,7 +5883,8 @@ describe("gate briefing (GR-7)", () => {
 	const HEADER = "## Permission gate (pi-verdict)";
 	const briefed = async (h: Harness, systemPrompt: string | string[] = BASE): Promise<{ systemPrompt: string | string[] } | undefined> => {
 		await h.handlers.session_start({}, h.ctx);
-		return h.handlers.before_agent_start({ type: "before_agent_start", prompt: "x", systemPrompt }, h.ctx);
+		const r = await h.handlers.before_agent_start({ type: "before_agent_start", prompt: "x", systemPrompt: typeof systemPrompt === "string" ? [systemPrompt] : systemPrompt }, h.ctx);
+		return r && { systemPrompt: typeof systemPrompt === "string" ? (r.systemPrompt as string[]).join("\n\n") : r.systemPrompt };
 	};
 	const SUB = { kind: "sub", id: "Scout1", name: "scout" };
 
@@ -6068,7 +5945,8 @@ describe("plan-mode grant planning (GR-8)", () => {
 	const MARK = "Plan mode is active.";
 	const briefed = async (h: Harness, systemPrompt: string | string[] = BASE): Promise<{ systemPrompt: string | string[] } | undefined> => {
 		await h.handlers.session_start({}, h.ctx);
-		return h.handlers.before_agent_start({ type: "before_agent_start", prompt: "x", systemPrompt }, h.ctx);
+		const r = await h.handlers.before_agent_start({ type: "before_agent_start", prompt: "x", systemPrompt: typeof systemPrompt === "string" ? [systemPrompt] : systemPrompt }, h.ctx);
+		return r && { systemPrompt: typeof systemPrompt === "string" ? (r.systemPrompt as string[]).join("\n\n") : r.systemPrompt };
 	};
 	const planState = (status: string) => ({ getState: () => ({ plan: { status } }) });
 
@@ -6189,19 +6067,22 @@ describe("active-models probe", () => {
 // ── Tern-native UI (TSP) ─────────────────────────────────
 
 describe("Tern-native UI (TSP)", () => {
-	const nativeTui = { requestRender() {}, nativeRendering: true };
-	const plainTui = { requestRender() {} };
 	const cx = { cols: 100, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
-	const NATIVE_MD = { overlay: true, overlayOptions: { width: "60%" } };
-	const NATIVE_WIDE = { overlay: true, overlayOptions: { width: "95%" } };
-	const NATIVE_SCREEN = { overlay: true, overlayOptions: { fullscreen: true, width: "100%" } };
-	const fakeTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
-	type NativeComponent = DialogComponent & { describe?(cx: unknown): unknown; handleNativeEvent?(e: unknown): void };
+	const NATIVE_MD = { overlay: true };
+	const NATIVE_WIDE = { overlay: true };
+	const NATIVE_SCREEN = { overlay: true, fullscreen: true };
 	interface Snap { k: string; key?: string; p: Record<string, unknown>; c?: Snap[] }
 	interface NativeRun { nodes: Snap[]; options: unknown[] }
 	const newRun = (): NativeRun => ({ nodes: [], options: [] });
-	/** JSON snapshot of a node; component children (omp's Input) collapse to a marker. */
-	const snap = (n: unknown): Snap => JSON.parse(JSON.stringify(n, (_k, v) => (v && typeof v === "object" && typeof (v as { render?: unknown }).render === "function" ? "[component]" : v)));
+	/** A mounted node (or any JSON-able value) as the old plain tree; plain arrays map element-wise. */
+	const snap = (n: unknown): Snap => (Array.isArray(n) ? (n.map(snap) as unknown as Snap) : n && typeof n === "object" && "kind" in n && typeof (n as UiNode).children === "function" ? (toTsp(n as UiNode) as Snap) : (JSON.parse(JSON.stringify(n)) as Snap));
+	/** The mounted dialog root seen through the old component calls. */
+	interface NativeComponent { describe(_cx?: unknown): Snap; handleNativeEvent(e: unknown): void; handleInput(raw: string): void }
+	const mounted = (root: UiNode): NativeComponent => ({
+		describe: () => toTsp(root).c[0] as Snap,
+		handleNativeEvent: (e) => void root.handlers.onEvent!(e as UiEvent),
+		handleInput: (raw) => sendRaw(root, raw),
+	});
 	const evt = (type: string, key: string, rest: Record<string, unknown>): unknown => ({ type, key, mods: [], ...rest });
 	const SESSION_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict-sessions", "s1.json");
 	const USER_FILE = () => path.join(TMP_AGENT, "config", "pi-verdict.json");
@@ -6221,54 +6102,40 @@ describe("Tern-native UI (TSP)", () => {
 		expect((bare.c ?? []).map((c) => c.k)).toEqual(["text", "badge"]);
 	});
 
-	/** Each ui.custom call builds the real component under `tui`, records the options and the first describe(), runs the next script, then presses Escape so nothing stays open. */
-	function driveNative(h: Harness, scripts: Array<(c: NativeComponent) => void>, run: NativeRun, tui: object = nativeTui): void {
-		h.ctx.ui.custom = async (factory: (tui: object, theme: typeof fakeTheme, kb: undefined, done: (r: unknown) => void) => NativeComponent, options: unknown) => {
-			const { initTheme } = await import("@earendil-works/pi-coding-agent");
-			initTheme("dark", false);
+	/** Each ui.custom call mounts the real dialog, records the options and the first describe(), runs the next script, then presses Escape so nothing stays open. */
+	function driveNative(h: Harness, scripts: Array<(c: NativeComponent) => void>, run: NativeRun): void {
+		h.ctx.ui.custom = async (factory: DialogFactory, options: unknown) => {
 			run.options.push(options);
 			const { promise, resolve } = Promise.withResolvers<unknown>();
-			const component = factory(tui, fakeTheme, undefined, resolve);
-			run.nodes.push(snap(component.describe?.(cx) ?? null));
+			const root = factory(hostUi, fakeTheme, undefined, resolve);
+			const component = mounted(root);
+			run.nodes.push(component.describe());
+			await new Promise((r) => setTimeout(r, 0)); // let the caller register on the handle before keys arrive
 			scripts.shift()?.(component);
 			for (let i = 0; i < 6; i++) component.handleInput("\x1b");
 			return promise;
 		};
 	}
 
-	/** Makes the harness's setWidget factories run with a live Tern TUI (as omp does) and starts the session, so the probe sees `nativeRendering`. Needs `session(…, { ompHost: true })`. */
-	async function liveProbe(h: Harness, tui: object = nativeTui): Promise<{ components: Array<{ describe?(): unknown }> }> {
-		const seen: { components: Array<{ describe?(): unknown }> } = { components: [] };
+	/** Captures every widget the extension publishes (as the host would mount it) and starts the session. */
+	async function liveProbe(h: Harness): Promise<{ components: Array<{ describe(): Snap }> }> {
+		const seen: { components: Array<{ describe(): Snap }> } = { components: [] };
 		h.ctx.ui.setWidget = (_key: string, content: unknown) => {
-			const factory = content as ((tui: object, theme: undefined) => { describe?(): unknown }) | undefined | string[]; // the widget content is a factory or a string array
-			if (typeof factory === "function") seen.components.push(factory(tui, undefined));
+			if (typeof content === "function") {
+				const node = content(hostUi, fakeTheme) as UiNode;
+				seen.components.push({ describe: () => snap(node) });
+			}
 		};
 		await h.handlers.session_start({}, h.ctx);
-		// The probe's module load is not awaited by session_start: wait for the same modules, then let its promise chain settle (microtasks, no wall clock).
-		await Promise.all([import("@earendil-works/pi-tui"), import("@earendil-works/pi-coding-agent")]);
-		for (let i = 0; i < 20; i++) await Promise.resolve();
 		return seen;
 	}
-
-	// The native host is module state: put it back to a plain TUI so later tests never see a live Tern surface.
-	afterEach(async () => {
-		const h = session({}, { ompHost: true });
-		await liveProbe(h, plainTui);
-	});
-
-	test("footer: on a TSP-capable host that is not live yet, the footer is still published with describe() (Tern can adopt it later)", async () => {
-		const h = session({}, { ompHost: true });
-		const seen = await liveProbe(h, { requestRender() {}, nativeRendering: false });
-		const roles = seen.components.map((c) => (snap(c.describe?.() ?? null) as { p?: { role?: string } } | undefined)?.p?.role);
-		expect(roles).toContain("pi-verdict.footer");
-	});
 
 	describe("ask dialog", () => {
 		const ASK = { text: "<verdict>ask</verdict> unsure" };
 		const clickKey = "pi-verdict.ask/choices";
 
-		test("a pointer activate on Yes allows; the dialog mounts as an overlay only while TSP is live", async () => {
-			const h = session({}, { ompHost: true });
+		test("a pointer activate on Yes allows; the dialog mounts as a wide overlay", async () => {
+			const h = session({});
 			await liveProbe(h);
 			h.responses = [ASK];
 			const run = newRun();
@@ -6277,17 +6144,10 @@ describe("Tern-native UI (TSP)", () => {
 			expect(run.options).toEqual([NATIVE_WIDE]);
 			expect(run.nodes[0].p.role).toBe("pi-verdict.ask");
 
-			const plain = session({}, { ompHost: true });
-			await liveProbe(plain, plainTui);
-			plain.responses = [ASK];
-			const plainRun = newRun();
-			driveNative(plain, [(c) => c.handleInput("\r")], plainRun, plainTui);
-			expect(await toolCall(plain, "bash", { command: "ls -la" })).toBeUndefined();
-			expect(plainRun.options).toEqual([undefined]);
 		});
 
 		test("a No row carries the typed reason into the block text; Decline blocks without one", async () => {
-			const h = session({}, { ompHost: true });
+			const h = session({});
 			await liveProbe(h);
 			h.responses = [ASK];
 			const run = newRun();
@@ -6317,7 +6177,7 @@ describe("Tern-native UI (TSP)", () => {
 		});
 
 		test("radio rows with detail lines; the reason field shows only under a selected No and Decline carries its text", async () => {
-			const h = session({}, { ompHost: true });
+			const h = session({});
 			await liveProbe(h);
 			h.responses = [ASK];
 			const run = newRun();
@@ -6342,16 +6202,14 @@ describe("Tern-native UI (TSP)", () => {
 						expect(rows(tree).some((n) => n.key === "reason")).toBe(false);
 
 						c.handleNativeEvent!(evt("select", "pi-verdict.ask/choices", { item: "no" }));
-						const reason = rows(c.describe!(cx) as Tree).find((n) => n.key === "reason")!;
-						const input = reason.c![1] as NativeComponent & { setValue(v: string): void };
-						input.setValue("stop");
+						expect(rows(c.describe(cx) as Tree).some((n) => n.key === "reason")).toBe(true);
+						for (const ch of "stop") c.handleInput(ch);
 						c.handleNativeEvent!(evt("action", "pi-verdict.ask/actions", { act: "cancel" }));
 					},
 					(c) => {
 						// Text typed under No is ignored once another row is selected again.
 						c.handleNativeEvent!(evt("select", "pi-verdict.ask/choices", { item: "no" }));
-						const reason = rows(c.describe!(cx) as Tree).find((n) => n.key === "reason")!;
-						(reason.c![1] as NativeComponent & { setValue(v: string): void }).setValue("ignored");
+						for (const ch of "ignored") c.handleInput(ch);
 						c.handleNativeEvent!(evt("select", "pi-verdict.ask/choices", { item: "yes" }));
 						expect(rows(c.describe!(cx) as Tree).some((n) => n.key === "reason")).toBe(false);
 						c.handleNativeEvent!(evt("action", "pi-verdict.ask/actions", { act: "cancel" }));
@@ -6370,7 +6228,7 @@ describe("Tern-native UI (TSP)", () => {
 		});
 
 		test("Explain is a button in the bar, not a row", async () => {
-			const h = session({}, { ompHost: true });
+			const h = session({});
 			await liveProbe(h);
 			h.responses = [ASK];
 			const run = newRun();
@@ -6386,7 +6244,7 @@ describe("Tern-native UI (TSP)", () => {
 		});
 
 		test("PP-6: a protected-path ask shows the path locally but offers no Explain item", async () => {
-			const h = session({}, { ompHost: true });
+			const h = session({});
 			await liveProbe(h);
 			const run = newRun();
 			driveNative(h, [], run);
@@ -6401,7 +6259,7 @@ describe("Tern-native UI (TSP)", () => {
 			const dir = fs.mkdtempSync(path.join(os.homedir(), ".pv-sc-nat-"));
 			try {
 				fs.writeFileSync(path.join(dir, "scratch.ts"), "console.log('NATIVE-VIEW')");
-				const h = session({}, { ompHost: true, cwd: dir });
+				const h = session({}, { cwd: dir });
 				await liveProbe(h);
 				h.responses = [ASK];
 				const run = newRun();
@@ -6427,7 +6285,7 @@ describe("Tern-native UI (TSP)", () => {
 	});
 
 	test("PP-6: the status row, the footer and the transcript label carry no command text", async () => {
-		const h = session({}, { ompHost: true });
+		const h = session({});
 		const seen = await liveProbe(h);
 		h.responses = [{ text: "<verdict>allow</verdict> ok" }];
 		expect(await toolCall(h, "bash", { command: "echo SECRET-MARKER" }, "c1")).toBeUndefined();
@@ -6436,8 +6294,7 @@ describe("Tern-native UI (TSP)", () => {
 		expect(JSON.stringify(nodes)).not.toContain("SECRET-MARKER");
 		await h.handlers.tool_result({ toolCallId: "c1" }, h.ctx); // the label is emitted when the tool result lands
 		const label = h.sent.at(-1)!.message;
-		const rendered: NativeComponent = Object.values(h.messageRenderers)[0](label, {}, fakeTheme);
-		expect(snap(rendered.describe?.(cx)).p.role).toBe("pi-verdict.label");
+		expect(snap(Object.values(h.messageRenderers)[0](label, {}, fakeTheme)).p.role).toBe("pi-verdict.label");
 		expect(JSON.stringify([snap(verdictLabelNode(label.details)), snap(statusNode("classifying bash via mock/glm…", true))])).not.toContain("SECRET-MARKER");
 	});
 
@@ -6451,7 +6308,7 @@ describe("Tern-native UI (TSP)", () => {
 		};
 
 		test("describe lists the pages and a scope row; scope + choice changes write the session override", async () => {
-			const h = session({}, { ompHost: true });
+			const h = session({});
 			await liveProbe(h);
 			const run = await runVerdict(h, (c) => {
 				c.handleNativeEvent!(evt("change", prefsKey, { item: "__scope", value: "session" }));
@@ -6466,7 +6323,7 @@ describe("Tern-native UI (TSP)", () => {
 		});
 
 		test("an entry row needs two clears to be removed", async () => {
-			const h = session({ deny: ["rm "] }, { ompHost: true });
+			const h = session({ deny: ["rm "] });
 			await liveProbe(h);
 			const before = fs.readFileSync(USER_FILE(), "utf8");
 			let afterFirst = "";
@@ -6482,7 +6339,7 @@ describe("Tern-native UI (TSP)", () => {
 
 		test("a confirm choice shows an Apply row and commits only on apply", async () => {
 			await withTempDir("pv-native-roles-", async (dir) => {
-				const h = session({}, { ompHost: true, roles: true });
+				const h = session({}, { roles: true });
 				h.ompAgentDir = dir;
 				await liveProbe(h);
 				let pendingNode: Snap | undefined;
@@ -6502,7 +6359,7 @@ describe("Tern-native UI (TSP)", () => {
 		const choicesKey = "pi-verdict.grants/choices";
 
 		test("/grants: activating a grant, then Revoke, revokes it without the host select/confirm", async () => {
-			const h = session({}, { ompHost: true });
+			const h = session({});
 			await liveProbe(h);
 			const granted = await h.tools.verdict_grant.execute("t1", { action: "request", request: "deploy build 42 to staging" }, undefined, undefined, h.ctx);
 			expect(granted.content[0].text.startsWith("Approved by the user")).toBe(true);
@@ -6532,16 +6389,16 @@ describe("Tern-native UI (TSP)", () => {
 			expect(one.head).toBe("Revoke G2?");
 			expect(one.choices.map((c) => c.label)).toEqual(["Revoke G2", "Keep"]);
 			expect(one.cancelId).toBe("keep");
-			const json = JSON.stringify(one.body);
+			const json = JSON.stringify(snap(one.body));
 			for (const s of ['"text":"Request"', '"text":"Protected path"', "~/x/.omp/n.md", '"text":"Danger rule"', "GitHub release change"]) expect(json).toContain(s);
-			expect(one.body.map((n) => n.key)).toEqual(["request", "paths", "rules"]);
+			expect((snap(one.body) as unknown as Snap[]).map((n) => n.key)).toEqual(["request", "paths", "rules"]);
 			expect(one.lines).toEqual(["<request>", "protected-path access: read ~/x/.omp/n.md", "danger rule: gh-release"]);
 
 			const grants = [mk("G1", "deploy", [], ["gh-release"]), g2];
 			const all = grantRevokeScreen(grants, true, reason);
 			expect(all.head).toBe("Revoke all 2 permission grants?");
 			expect(all.choices[0]!.label).toBe("Revoke all 2");
-			const cards = (all.body as { k: string; key?: string }[]).filter((n) => n.k === "card");
+			const cards = (snap(all.body) as unknown as { k: string; key?: string }[]).filter((n) => n.k === "card");
 			expect(cards.map((n) => n.key)).toEqual(["G1", "G2"]);
 			expect(all.body).toHaveLength(2);
 			expect(all.lines).toEqual(grants.map(grantLine));
@@ -6561,7 +6418,7 @@ describe("Tern-native UI (TSP)", () => {
 				lines: [],
 			});
 			type N = { k: string; p?: Record<string, unknown>; c?: N[] };
-			const cols = (spec.body as N[]).filter((n) => n.k === "col");
+			const cols = (snap(spec.body) as unknown as N[]).filter((n) => n.k === "col");
 			const [hitsCol, shadowCol] = cols;
 			const hitRows = hitsCol!.c!.filter((n) => n.k === "row");
 			expect(hitRows).toHaveLength(2);
@@ -6581,7 +6438,7 @@ describe("Tern-native UI (TSP)", () => {
 		});
 
 		test("/rule: Save… opens the scope picker; Back returns to the review; Global saves", async () => {
-			const h = session({}, { ompHost: true });
+			const h = session({});
 			await liveProbe(h);
 			h.responses = [{ text: "<kind>allow</kind><value>^cargo build\\b</value> m" }, { text: "<verdict>ok</verdict> fine" }];
 			const selects = h.selects;
@@ -6594,17 +6451,15 @@ describe("Tern-native UI (TSP)", () => {
 				undefined,
 			];
 			const roles: string[] = [];
-			h.ctx.ui.custom = async (factory: (tui: object, theme: typeof fakeTheme, kb: undefined, done: (r: unknown) => void) => NativeComponent) => {
-				const { initTheme } = await import("@earendil-works/pi-coding-agent");
-				initTheme("dark", false);
+			h.ctx.ui.custom = async (factory: DialogFactory) => {
 				const { promise, resolve } = Promise.withResolvers<unknown>();
-				const component = factory(nativeTui, fakeTheme, undefined, resolve);
-				const node = snap(component.describe?.(cx) ?? null);
+				const component = mounted(factory(hostUi, fakeTheme, undefined, resolve));
+				const node = component.describe();
 				if (node.p.role === "pi-verdict.progress") return promise;
 				roles.push(node.p.role as string);
 				if (roles.length === 4) {
 					const items = node.p.items as Array<{ id: string; label: string }>;
-					component.handleNativeEvent!(evt("activate", "pi-verdict.rule-save/choices", { item: items.find((i) => i.label === "Global")!.id }));
+					component.handleNativeEvent(evt("activate", "pi-verdict.rule-save/choices", { item: items.find((i) => i.label === "Global")!.id }));
 				} else scripts.shift()?.(component);
 				for (let i = 0; i < 6; i++) component.handleInput("\x1b");
 				return promise;
@@ -6617,7 +6472,7 @@ describe("Tern-native UI (TSP)", () => {
 		});
 
 		test("verdict_settings: Decline on the native screen declines the change", async () => {
-			const h = session({}, { ompHost: true });
+			const h = session({});
 			await liveProbe(h);
 			const run = newRun();
 			driveNative(h, [(c) => c.handleNativeEvent!(evt("action", "pi-verdict.settings-change/actions", { act: "cancel" }))], run);
@@ -6652,7 +6507,7 @@ describe("Tern-native UI (TSP)", () => {
 		test("settingsChangeScreen: wider overlay and parsed value nodes", () => {
 			const spec = settingsChangeScreen({ scope: "global", where: "w", key: "dangerRules", action: "set", before: undefined, after: { "gh-release": "ask" }, notes: [], reason: "r", message: "m" });
 			expect(spec.presentation).toEqual({ kind: "buttons", size: "md" });
-			const tree = JSON.stringify(spec.body);
+			const tree = JSON.stringify(snap(spec.body));
 			expect(tree).not.toContain('"k":"code"');
 			expect(tree).toContain("(not set)");
 			expect(tree).toContain("gh-release");
@@ -6660,20 +6515,16 @@ describe("Tern-native UI (TSP)", () => {
 			expect(settingValueLines({ a: 1, b: null })).toEqual(["a: 1", "b: null"]);
 		});
 
-		test("trust is a picker sheet, reviews float at md with button choices, /grants is a picker sheet", async () => {
-			const mods = { tui: await import("@earendil-works/pi-tui"), agent: await import("@earendil-works/pi-coding-agent") };
+		test("trust and /grants are picker sheets; reviews are button choices", () => {
 			const glyphs = { on: "◉", off: "○" };
-			const build = (spec: ChoiceScreenSpec): { component: NativeComponent; picked: () => string | undefined } => {
+			const build = (spec: ChoiceScreenSpec) => {
 				let picked: string | undefined;
-				const component = buildChoiceScreen(mods, { requestRender() {} }, spec, (id) => { picked = id; }, glyphs) as NativeComponent & { nativeOverlay?: { size?: string }; nativeSheet?(cx: unknown): boolean };
-				return { component, picked: () => picked };
+				const root = buildChoiceScreen({ requestRender() {} }, spec, (id) => { picked = id; }, glyphs);
+				return { root, tree: () => snap(root.describe(cx)), picked: () => picked };
 			};
-			type Shape = NativeComponent & { nativeOverlay?: { size?: string }; nativeSheet?(cx: unknown): boolean };
 
-			const trustBuilt = build(trustScreen("~/p/.omp/pi-verdict.json", "t", ["mode: \"unattended\""]));
-			const trust = trustBuilt.component as Shape;
-			expect(trust.nativeSheet?.(cx)).toBe(true);
-			const trustTree = snap(trust.describe!(cx));
+			const trust = build(trustScreen("~/p/.omp/pi-verdict.json", "t", ["mode: \"unattended\""]));
+			const trustTree = trust.tree();
 			expect(trustTree.k).toBe("picker");
 			expect(trustTree.p.layout).toBe("cards");
 			const trustItems = trustTree.p.items as Array<{ id: string; label: string; detail?: string }>;
@@ -6681,24 +6532,18 @@ describe("Tern-native UI (TSP)", () => {
 			expect(trustItems.every((i) => i.detail !== undefined)).toBe(true);
 			expect(JSON.stringify(trustTree.p.subtitle)).toContain('"t":"~/p/.omp/pi-verdict.json"');
 			// the item ids stay the long choices the caller compares against
-			trust.handleNativeEvent!(evt("activate", "", { item: trustItems[1]!.id }));
-			expect(trustBuilt.picked()).toBe("Not now — ignore it this session");
-			// without picker support the same spec falls back to the radio list
-			expect(JSON.stringify(trust.describe!({ ...cx, supports: () => false }))).toContain('"k":"list"');
+			trust.root.handleNativeEvent!(evt("activate", "", { item: trustItems[1]!.id }) as never);
+			expect(trust.picked()).toBe("Not now — ignore it this session");
 
-			const review = build(ruleReviewScreen({ kind: "allow", value: "^ls\\b", rationale: null, confirmed: false, note: null, attempt: 1, matches: null, options: [{ id: "Save" }, { id: "Cancel" }], cancelId: "Cancel", lines: [] })).component as Shape;
-			expect(review.nativeOverlay?.size).toBeUndefined();
-			expect(review.nativeSheet?.(cx)).toBe(false);
+			const review = build(ruleReviewScreen({ kind: "allow", value: "^ls\\b", rationale: null, confirmed: false, note: null, attempt: 1, matches: null, options: [{ id: "Save" }, { id: "Cancel" }], cancelId: "Cancel", lines: [] }));
+			expect(review.tree().k).not.toBe("picker");
 
 			const grants = build(grantsScreen([{ id: "G1", request: "deploy", paths: [], rules: [], grantedBy: "user", grantedAt: new Date(0).toISOString() }], []));
-			const sheet = grants.component as Shape;
-			expect(sheet.nativeSheet?.(cx)).toBe(true);
-			expect(sheet.nativeSheet?.({ ...cx, supports: () => false })).toBe(false);
-			const tree = snap(sheet.describe!(cx));
+			const tree = grants.tree();
 			expect(tree.k).toBe("picker");
 			expect((tree.p.actions as Array<{ id: string; danger?: boolean }>).find((a) => a.id === "revoke-all")?.danger).toBe(true);
 			expect((tree.p.items as Array<{ id: string }>).map((i) => i.id)).toEqual(["G1"]);
-			sheet.handleNativeEvent!(evt("action", "", { act: "revoke-all" }));
+			grants.root.handleNativeEvent!(evt("action", "", { act: "revoke-all" }) as never);
 			expect(grants.picked()).toBe("revoke-all");
 		});
 	});
@@ -6712,7 +6557,7 @@ describe("Tern-native UI (TSP)", () => {
 		};
 
 		test("a flag applied after load enables it; without debug the command refuses", async () => {
-			const h = session({}, { ompHost: true });
+			const h = session({});
 			await liveProbe(h);
 			let mounted = 0;
 			h.ctx.ui.custom = async () => void mounted++;
@@ -6726,7 +6571,7 @@ describe("Tern-native UI (TSP)", () => {
 		});
 
 		test("with debug, all shows every screen natively and changes nothing", async () => {
-			const h = session({}, { ompHost: true, debug: true });
+			const h = session({}, { debug: true });
 			const seen = await liveProbe(h);
 			const before = snapshotConfig();
 			h.sent.length = 0;
@@ -6963,9 +6808,8 @@ describe("script and file context (SC-1–SC-6)", () => {
 		expect(await toolCall(h, "bash", { command: "bun scratch.ts" })).toBeUndefined();
 		expect(rendered).toHaveLength(3);
 		expect(rendered[0]).toContain("script scratch.ts");
-		expect(rendered[0]).toContain("view code");
-		expect(rendered[1]).toContain("(1/2)");
-		expect(after[1]).toContain("(2/2)");
+		expect(rendered[0]).toContain("View");
+		expect(rendered[1]).toContain("bun scratch.ts");
 		expect(after[1]).toContain("SCRATCH-VIEW");
 		expect(rendered[2]).toContain("Allow execution?");
 	});
@@ -7067,7 +6911,7 @@ describe("gated execution (EG-1–EG-4)", () => {
 		h.responses = [ALLOW];
 		await wrap(h, { tool: "bash", input: RUN, files: ["scratch.ts"] });
 		await h.handlers.tool_result({ toolCallId: "t1" }, h.ctx);
-		expect(h.entries.at(-1)).toEqual(["pi-verdict-label", { tool: "execute_gated_tool", how: "classifier", jev: null }]);
+		expect(h.sent.at(-1).message.details).toEqual({ tool: "execute_gated_tool", how: "classifier", jev: null });
 	});
 
 	test("EG-3: a subagent may use the wrapper", async () => {

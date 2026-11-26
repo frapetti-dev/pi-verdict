@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**pi-verdict** (`@frapetti-dev/pi-verdict`) is a minimal permission-gate extension for [Pi](https://github.com/earendil-works/pi-coding-agent) and oh-my-pi (`omp`): a deterministic **rule layer** plus a **model classifier** for the gray zone. Every tool call is adjudicated to one of three states: `allow` / `ask` / `deny`. Default posture is allow-unless-intercepted ("Auto Mode"), the reverse of Claude Code.
+**pi-verdict** (`@frapetti-dev/pi-verdict`) is a minimal permission-gate extension for oh-my-pi (`omp`, requires 19.2.1+): a deterministic **rule layer** plus a **model classifier** for the gray zone. Every tool call is adjudicated to one of three states: `allow` / `ask` / `deny`. Default posture is allow-unless-intercepted ("Auto Mode"), the reverse of Claude Code.
 
 Domain terms live in `CONTEXT.md` (English glossary); normative behavior lives in `docs/adjudication-rules.md` (rule IDs such as `PP-6`; a behavior change is an edit to that spec plus a CHANGELOG entry); design conclusions are backed by measurements under `research/`. Read those before changing behavior, and use the glossary terms exactly (e.g. adjudication pipeline, dual-form matching, gray zone, `denyPaths` — always plural).
 
@@ -72,7 +72,7 @@ No `build`, `lint`, or `format` script exists and no eslint/prettier/biome confi
 
 - `extensions/pi-verdict.ts` — gate: `adjudicate`, `classifyByRules`, `SessionState`, `presentVerdict`, `USER_CONFIG_TEMPLATE`, `DEFAULT_ALLOWED_TOOLS`, `autoMode`.
 - `extensions/jev-adapter.ts` — jev provider/transport (env `PI_VERDICT_JEV_TRANSPORT` = `openrouter|typesafe`, `PI_VERDICT_JEV_URL`, keys `OPENROUTER_API_KEY` / `TYPESAFE_API_KEY`).
-- `package.json` — `files` whitelist (a new runtime file under `extensions/` MUST be added or it won't publish), version, peer dep `@earendil-works/pi-coding-agent >=0.84.0` (optional; dev-pinned 0.84.3).
+- `package.json` — `files` whitelist (a new runtime file under `extensions/` MUST be added or it won't publish), version; dev-pinned `@oh-my-pi/*` 19.2.1 (types only, no peer dependency).
 - `tsconfig.json` — `paths` maps the pi package to `node_modules/.../dist/index.d.ts`.
 - `CONTEXT.md`, `docs/adjudication-rules.md` (normative rules; code comments and test titles cite its IDs), `docs/configuration.md`, `CHANGELOG.md`.
 
