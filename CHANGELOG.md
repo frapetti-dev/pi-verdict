@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-26
+
 - **BREAKING**: drops upstream Pi (@earendil-works) support and requires omp 19.2.1+; every dialog (settings menu, approval, code viewer, choice screens, rule progress) renders as omp pi-tui nodes in both the terminal and Tern; ANSI rendering and the Tern-only native gate are removed.
 
 ## [1.0.0] - 2026-11-20
