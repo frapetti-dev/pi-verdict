@@ -51,27 +51,24 @@ Published on the GitHub Package Registry as `@frapetti-dev/pi-verdict` (not npmj
 (`GITHUB_TOKEN` here is a personal access token — classic or fine-grained with `read:packages` — exported in your shell, or hardcode it in `~/.npmrc` instead of the env-var form.)
 
 ```bash
-# install from GitHub Packages (pi):
-pi install npm:@frapetti-dev/pi-verdict
-
-# install from GitHub Packages (oh-my-pi / omp):
+# install from GitHub Packages (requires omp 19.2.1+):
 omp plugin install npm:@frapetti-dev/pi-verdict
 
-# or directly from git — try it once
-pi --extension ./extensions/pi-verdict.ts
+# or directly from a checkout — try it once
+omp -e ./extensions/pi-verdict.ts
 
 ```
 
 ### Hosts
 
-pi-verdict runs on both [pi](https://github.com/badlogic/pi-mono) and [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) — it self-anchors to whichever agent tree it is installed in, and follows the extension copy's own location on dual-install machines. On omp 18 the classifier's completion call falls back to the pi-ai compat API (still fail-closed). Details: [docs/configuration.md](docs/configuration.md#host-notes-pi-and-oh-my-pi).
+pi-verdict requires [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) 19.2.1 or newer; it self-anchors to the agent tree it is installed in. Upstream Pi (`@earendil-works`) is no longer supported. Details: [docs/configuration.md](docs/configuration.md#host-notes-oh-my-pi).
 
-| | pi | omp |
-|---|---|---|
-| install | `pi install npm:@frapetti-dev/pi-verdict` | `omp plugin install npm:@frapetti-dev/pi-verdict` |
-| extension copy | `~/.pi/agent/extensions/` | `~/.omp/plugins/node_modules/pi-verdict/` (omp 18.1+; ≤18.0: under `agent/`) |
-| user rules | `~/.pi/agent/config/pi-verdict.json` | `~/.omp/agent/config/pi-verdict.json` |
-| credential file (S0 hard deny) | `~/.pi/agent/auth.json` | `~/.omp/agent/auth.json` |
+| | omp |
+|---|---|
+| install | `omp plugin install npm:@frapetti-dev/pi-verdict` |
+| extension copy | `~/.omp/plugins/node_modules/pi-verdict/` |
+| user rules | `~/.omp/agent/config/pi-verdict.json` |
+| credential file (S0 hard deny) | `~/.omp/agent/auth.json` |
 
 - `/automode` — open the approval settings menu (opens at session scope; `←/→` change the selected row, `Tab` cycles the scope badge global · local · session, percent thresholds step with a bar, `a` shows every mode's settings); without a UI it prints the status
 - `/automode status` — read-only status: effective approval mode and where it comes from, thresholds, shadow-cache stats
@@ -119,13 +116,13 @@ A minimal config (the first run writes a fuller starter template, including a st
 
 Every key with its default, the approval modes, scopes (`session` > `local` > `global`), project trust, thresholds, the fallback cascade, the subagent gate, audit and the settings menus are in [docs/configuration.md](docs/configuration.md); the normative rules are in [docs/adjudication-rules.md](docs/adjudication-rules.md).
 
-**Tern.** On oh-my-pi inside Tern with the Tern Surface Protocol live, every dialog, menu, status row and the footer is drawn natively (cards, lists, meters, a `prefs` sheet, clickable buttons); anywhere else — pi, other terminals, `PI_TUI_NATIVE=0` — the ANSI UI is unchanged. There is no config key.
+**UI.** Every dialog (settings menus, approval, code viewer, choice screens, rule progress), the status row, the footer and the verdict label render as omp pi-tui nodes, in the terminal and in Tern alike. There is no config key.
 
 ### Jev decisions backend (experimental)
 
-1. Install a version that ships the adapter (v0.8+): `pi install npm:@frapetti-dev/pi-verdict`
+1. Install a version that ships the adapter (v0.8+): `omp plugin install npm:@frapetti-dev/pi-verdict`
 2. Pick a transport (both serve the same decisions wire contract):
-   - **OpenRouter (default)**: run `/login openrouter` inside pi, or `export OPENROUTER_API_KEY=sk-or-v1...` in your shell
+   - **OpenRouter (default)**: run `/login openrouter` inside omp, or `export OPENROUTER_API_KEY=sk-or-v1...` in your shell
    - **TypeSafe direct (official v1 API)**: grab a self-service key at console.typesafe.ai, then `export TYPESAFE_API_KEY=apikey_...` and `export PI_VERDICT_JEV_TRANSPORT=typesafe`
 3. Point the classifier at jev (applies to new sessions)
    - persistent: edit `~/.pi/agent/config/pi-verdict.json` outside pi and set `{ "classifierModel": "typesafe/jev-latest" }`

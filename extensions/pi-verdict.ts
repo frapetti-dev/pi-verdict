@@ -84,10 +84,9 @@ import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type * as PiAgent from "@earendil-works/pi-coding-agent";
-import type * as PiTui from "@earendil-works/pi-tui";
-import type { BeforeAgentStartEventResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { Context } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext, ExtensionTheme as Theme } from "@oh-my-pi/pi-coding-agent";
+import type { Context } from "@oh-my-pi/pi-ai";
+import { jsx, signal, type JSXNode, type KeyEvent, type UiEvent } from "@oh-my-pi/pi-tui";
 import { activeTransport, type JevReason, jevUrlOverrideError, OMP_OPENROUTER_API_ID, parseJevConfidence, parseJevReason, PROVIDER_ID as JEV_PROVIDER_ID, streamDecisions, TRANSPORT_DEFAULTS, USER_RULES_HEADER, VERDICT_CHOICES_PREFIX } from "./jev-adapter";
 
 // ============================================================================
@@ -2181,10 +2180,7 @@ type ApiKeyAndHeadersResolver = (
 
 /**
  * Bind the host runtime's completion capability (#35): registry.complete when
- * present (pi), else the pi-ai compat module (omp 18). The literal dynamic
- * import specifier must stay inline — omp's legacy compat rewrites exactly
- * this literal to its bundled pi-ai; the ./compat subpath also exists on pi,
- * so resolution is safe on both hosts. The loader promise is cached; any
+ * present, else omp's bundled `@oh-my-pi/pi-ai` `complete` (omp's ModelRegistry has none). The loader promise is cached; any
  * rejection propagates to the caller (the classifier's fail-closed path owns it).
  *
  * [pi-verdict local patch: omp 18.3.0 compat auth gap] The bundled pi-ai
@@ -2202,7 +2198,7 @@ type ApiKeyAndHeadersResolver = (
  */
 export function bindCompletion(
 	registry: { complete?: unknown; getApiKeyAndHeaders?: ApiKeyAndHeadersResolver },
-	compatLoader: CompatLoader = () => import("@earendil-works/pi-ai/compat") as Promise<{ complete: CompletionFn }>,
+	compatLoader: CompatLoader = () => import("@oh-my-pi/pi-ai") as unknown as Promise<{ complete: CompletionFn }>,
 ): CompletionFn {
 	if (typeof registry.complete === "function") {
 		const complete = registry.complete as CompletionFn;
@@ -3646,23 +3642,15 @@ async function projectListStart(ui: ExtensionContext["ui"], key: EditableListKey
 }
 
 // ============================================================================
-// Tern-native UI (TSP)
+// omp pi-tui nodes
 //
-// When omp runs inside Tern with the Tern Surface Protocol live, every pi-verdict surface
-// describes itself as a native node tree (describe()) instead of ANSI rows. Everywhere else
-// (pi, omp in other terminals, PI_TUI_NATIVE=0, tests) the ANSI path is untouched. The types
-// below are a local structural mirror of omp's pi-wire/pi-tui types: the shipped type packages
-// are earendil's and carry no native hooks, and omp's modules are never value-imported.
+// Every pi-verdict surface describes itself as a node tree (describe()); omp draws it in the terminal and in Tern.
+// `mount` turns a view (tree + key/paste/event handlers) into the root node `ctx.ui.custom` takes.
 // ============================================================================
 
 export type TspTone = "neutral" | "accent" | "info" | "success" | "warning" | "error" | "pending" | "muted" | "user";
 export type TspSpan = { t: string; s?: string };
-export interface TspNode {
-	k: string;
-	p?: Record<string, unknown>;
-	c?: readonly (TspNode | object)[];
-	key?: string;
-}
+export type TspNode = JSXNode;
 export interface DescribeCtx {
 	readonly cols: number;
 	readonly dark: boolean;
@@ -3670,30 +3658,121 @@ export interface DescribeCtx {
 	supports(kind: string): boolean;
 	feature(name: string): boolean;
 }
-export type NativeEvent =
-	| { type: "toggle"; key: string; collapsed: boolean }
-	| { type: "select"; key: string; item: string }
-	| { type: "activate"; key: string; item: string }
-	| { type: "action"; key: string; act: string; value?: string; mods: readonly string[] }
-	| { type: "change"; key: string; item: string; value: boolean | number | string | readonly string[] | null }
-	| { type: "edit"; key: string; from: number; to: number; text: string; cursor: number; len: number }
-	| { type: "undo"; key: string }
-	| { type: "send"; key: string; text: string };
-export interface NativeHooks {
-	describe?(cx: DescribeCtx): TspNode | null;
-	handleNativeEvent?(event: NativeEvent): void;
-	nativeOverlay?: { role?: string; head?: string; size?: "sm" | "md" | "lg" | "full"; anchor?: "center" | "top" | "bottom" };
-	nativeSheet?(cx: DescribeCtx): boolean;
-	describeScreen?(cx: DescribeCtx): { role?: string; main?: readonly object[]; dock?: readonly object[] };
+
+/** A focused view: its tree plus its input handlers. */
+export interface View {
+	describe(): JSXNode;
+	handleKey(key: KeyEvent): void;
+	handlePaste?(text: string): void;
+	handleEvent?(e: UiEvent): void;
 }
 
-/** Node builder: `{k, p, c, key}` with absent parts omitted. */
-export function tn(k: string, p?: Record<string, unknown>, c?: readonly (TspNode | object)[], key?: string): TspNode {
-	const n: TspNode = { k };
-	if (p !== undefined) n.p = p;
-	if (c !== undefined) n.c = c;
-	if (key !== undefined) n.key = key;
-	return n;
+/** Root node for ctx.ui.custom: rebuilds `describe()` whenever `refresh` runs; routes keys/paste/events to the view. */
+export function mount(build: (refresh: () => void) => View): JSXNode {
+	const tick = signal(0);
+	const view = build(() => tick.update((v) => v + 1));
+	return jsx("col", {
+		children: () => {
+			tick();
+			return view.describe();
+		},
+		onKey: (key: KeyEvent) => {
+			if (key.kind === "release") return false;
+			view.handleKey(key);
+			return true;
+		},
+		onPaste: (p: { text: string }) => {
+			view.handlePaste?.(p.text);
+			return true;
+		},
+		onEvent: (e: UiEvent) => view.handleEvent?.(e),
+	});
+}
+
+/** What every dialog builder returns: the tree (`describe(cx)`) and its input handlers. */
+export interface DialogRoot {
+	describe(cx: DescribeCtx): JSXNode;
+	handleKey(key: KeyEvent): void;
+	handlePaste?(text: string): void;
+	handleNativeEvent?(e: UiEvent): void;
+}
+
+/** Mounts a dialog builder: `tui.requestRender` is the mount's refresh; the describe context is constant (omp always has every node kind). */
+export function mountDialog(ui: { size(): { columns: number } }, build: (tui: { requestRender(): void }) => DialogRoot): JSXNode {
+	const cx: DescribeCtx = { cols: ui.size().columns, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
+	return mount((refresh) => {
+		const root = build({ requestRender: refresh });
+		return { describe: () => root.describe(cx), handleKey: (k) => root.handleKey(k), handlePaste: (t) => root.handlePaste?.(t), handleEvent: (e) => root.handleNativeEvent?.(e) };
+	});
+}
+
+/** Single-line text editing state for inline fields (add/edit entry, the approval "No" reason). */
+export class LineInput {
+	value: string;
+	cursor: number;
+
+	constructor(initial = "") {
+		this.value = initial;
+		this.cursor = initial.length;
+	}
+
+	/** Returns true when the key was consumed. */
+	handleKey(key: KeyEvent): boolean {
+		const id = key.id;
+		if (id === "backspace") {
+			if (this.cursor > 0) {
+				this.value = this.value.slice(0, this.cursor - 1) + this.value.slice(this.cursor);
+				this.cursor--;
+			}
+			return true;
+		}
+		if (id === "delete") {
+			this.value = this.value.slice(0, this.cursor) + this.value.slice(this.cursor + 1);
+			return true;
+		}
+		if (id === "left") {
+			this.cursor = Math.max(0, this.cursor - 1);
+			return true;
+		}
+		if (id === "right") {
+			this.cursor = Math.min(this.value.length, this.cursor + 1);
+			return true;
+		}
+		if (id === "home") {
+			this.cursor = 0;
+			return true;
+		}
+		if (id === "end") {
+			this.cursor = this.value.length;
+			return true;
+		}
+		if (id === "ctrl+u") {
+			this.value = "";
+			this.cursor = 0;
+			return true;
+		}
+		const text = key.text?.replace(/[\r\n]/g, "");
+		if (text && !/[\x00-\x1f\x7f]/.test(text) && !/^(ctrl|alt|super)\+/.test(id)) {
+			this.paste(text);
+			return true;
+		}
+		return false;
+	}
+
+	paste(text: string): void {
+		const flat = text.replace(/\r?\n/g, "");
+		this.value = this.value.slice(0, this.cursor) + flat + this.value.slice(this.cursor);
+		this.cursor += flat.length;
+	}
+
+	node(p: { key: string; focused: boolean; placeholder?: string }): JSXNode {
+		return tn("input", { text: this.value, cursor: p.focused ? this.cursor : undefined, placeholder: p.placeholder, readonly: !p.focused }, undefined, p.key);
+	}
+}
+
+/** Node builder: `jsx(kind, props + children, key)`. */
+export function tn(k: string, p?: Record<string, unknown>, c?: readonly TspNode[], key?: string): TspNode {
+	return jsx(k, c === undefined ? { ...p } : { ...p, children: c }, key);
 }
 /** Text node: a plain string, or styled spans. */
 export function tnText(t: string | readonly TspSpan[], p?: Record<string, unknown>, key?: string): TspNode {
@@ -3730,7 +3809,7 @@ export function tnBar(buttons: readonly (TspNode | null)[], key = "actions"): Ts
  * Dialog content inset from the overlay frame without a box: a vertical `spacer` above and below, and an empty `spacer` with a minimum width on each side
  * of the content column. TSP has no padding prop on `col`/`row`, an overlay role does not pad, and a head-less `card` draws a ring.
  */
-export function tnFramed(kids: readonly (TspNode | object)[], gap: "sm" | "md" | "lg"): TspNode {
+export function tnFramed(kids: readonly TspNode[], gap: "sm" | "md" | "lg"): TspNode {
 	const side = (key: string): TspNode => tn("spacer", { min: { w: "2ch" } }, undefined, key);
 	return tn(
 		"col",
@@ -3739,12 +3818,12 @@ export function tnFramed(kids: readonly (TspNode | object)[], gap: "sm" | "md" |
 		"frame",
 	);
 }
-/** Overlay width that maps to an undeclared `md` on omp's TSP backend: a floating dialog at every pane width (a declared `md`/`lg` fills panes under 100 columns). */
-const NATIVE_MD_OVERLAY = { overlay: true, overlayOptions: { width: "60%" } } as const;
-/** Wider variant for the approval dialog, which holds a command or code diff and the script files it runs. Same undeclared-`md` mapping as `NATIVE_MD_OVERLAY`, just more columns. */
-const NATIVE_WIDE_OVERLAY = { overlay: true, overlayOptions: { width: "95%" } } as const;
-/** Full-pane viewer: on omp's TSP backend a fullscreen overlay without `nativeOverlay` becomes a Tern `screen` surface; `width` keeps pi's weak `OverlayOptions` type satisfied. */
-const NATIVE_SCREEN_OVERLAY = { overlay: true, overlayOptions: { fullscreen: true, width: "100%" } } as const;
+/** Floating dialog overlay. */
+const NATIVE_MD_OVERLAY = { overlay: true } as const;
+/** Approval dialog overlay (the dialog holds a command or code diff and the script files it runs). */
+const NATIVE_WIDE_OVERLAY = { overlay: true } as const;
+/** Full-pane viewer. */
+const NATIVE_SCREEN_OVERLAY = { overlay: true, fullscreen: true } as const;
 interface RadioGlyphs {
 	on: string;
 	off: string;
@@ -3764,44 +3843,9 @@ export function leafKey(key: string): string {
 	return key.slice(key.lastIndexOf("/") + 1);
 }
 
-let nativeHost: { nativeRendering?: unknown } | undefined;
-/** Record the host TUI handed to any factory (ui.custom, setWidget). */
-function noteHostTui(tui: unknown): void {
-	if (tui && typeof tui === "object") nativeHost = tui as { nativeRendering?: unknown };
-}
-/** True only while omp renders through a live Tern surface. pi's TUI has no such getter, so this is always false on pi. */
-export function nativeLive(): boolean {
-	return nativeHost?.nativeRendering === true;
-}
-/** True when the host TUI can render through a Tern surface at all (omp's TUI has the `nativeRendering` getter; pi's does not), live or not yet. */
-function nativeCapable(): boolean {
-	return nativeHost !== undefined && "nativeRendering" in nativeHost;
-}
-const TUI_PROBE_KEY = "pi-verdict-tui-probe";
-
-/**
- * `ui.setWidget` that publishes, on a TSP-capable host, a component carrying both `render` (identical to omp's string-array
- * rendering: one `Text` per line) and `describe`; the host uses `describe` whenever its surface is live, including when TSP goes
- * live after publication. Elsewhere it publishes the plain `lines` (`undefined` clears).
- */
+/** Publishes `node` as a widget (`undefined` clears). `lines` only marks whether to publish. */
 function setWidgetNative(ui: UiContext, key: string, lines: string[] | undefined, node: () => TspNode, options?: Parameters<UiContext["setWidget"]>[2]): void {
-	const mods = dialogModulesReady;
-	if (lines === undefined || !nativeCapable() || !mods) {
-		ui.setWidget(key, lines, options);
-		return;
-	}
-	ui.setWidget(
-		key,
-		(tui) => {
-			noteHostTui(tui);
-			return {
-				render: (w: number): string[] => lines.flatMap((l) => new mods.tui.Text(l, 1, 0).render(w)),
-				invalidate(): void {},
-				describe: node,
-			};
-		},
-		options,
-	);
+	ui.setWidget(key, lines === undefined ? undefined : () => node(), options);
 }
 
 /** Native classifier-status row: spinner while a model runs, a badge while waiting for the user. Phase, tool name and model id only (PP-6). */
@@ -3809,7 +3853,7 @@ export function statusNode(text: string, busy: boolean): TspNode {
 	return tn("row", { gap: "sm", align: "center", role: "pi-verdict.status" }, [busy ? tn("spinner", { style: "dots" }) : tn("badge", { text: "verdict", tone: "warning" }), tnProse(text)]);
 }
 
-/** Show the classifier-status row (native node in a live Tern surface, ANSI line elsewhere). Phase, tool name and model id only (PP-6). */
+/** Show the classifier-status row. Phase, tool name and model id only (PP-6). */
 function showStatusRow(ui: UiContext, text: string, busy: boolean): void {
 	setWidgetNative(ui, STATUS_WIDGET_KEY, [ui.theme.fg("warning", `🛡️ verdict: ${text}`)], () => statusNode(text, busy));
 }
@@ -3936,29 +3980,16 @@ function stepPercent(cur: string, delta: number, allowInherit: boolean): string 
  * list pages with inline add/edit, per-row descriptions, and a scope badge in the title border cycled with Tab.
  * All state lives in the controller; rows are re-read on every render and keypress.
  */
-export function buildSettingsMenu(
-	mods: DialogModules,
-	tui: { requestRender(): void },
-	theme: Pick<Theme, "fg" | "bold">,
-	ctl: MenuController,
-	done: () => void,
-): PiTui.Component & { handleInput(data: string): void; focused: boolean } & NativeHooks {
-	const { CURSOR_MARKER, Input, getKeybindings, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } = mods.tui;
-	const { DynamicBorder } = mods.agent;
-	type ColorName = Parameters<Theme["fg"]>[0];
-	const fg = (c: string, t: string): string => theme.fg(c as ColorName, t);
-	const bottom = new DynamicBorder();
-
+export function buildSettingsMenu(tui: { requestRender(): void }, ctl: MenuController, done: () => void): DialogRoot {
 	let scope = ctl.scope;
 	let page: string | null = null;
 	let index = 0;
 	const parents: number[] = []; // selected index of each ancestor page, restored on back
 	let pending: { id: string; value: string } | undefined; // confirm-row value awaiting Enter
 	let armed: string | undefined; // row id awaiting a second Enter / d
-	let editing: { id: string; placeholder: string; input: PiTui.Input } | undefined;
+	let editing: { id: string; placeholder: string; input: LineInput } | undefined;
 
 	const selectable = (r: MenuRow): boolean => r.kind !== "section" && !(r.kind === "entry" && !r.editable);
-	const labelOf = (r: MenuRow): string => (r.kind === "choice" || r.kind === "percent" || r.kind === "page" ? r.label : "");
 	/** Rows for the current scope/page with `index` clamped onto a selectable one. */
 	const current = (): { rs: MenuRow[]; row: MenuRow | undefined } => {
 		const rs = ctl.rows(scope, page);
@@ -3972,80 +4003,6 @@ export function buildSettingsMenu(
 		}
 		const row = rs[index];
 		return { rs, row: row !== undefined && selectable(row) ? row : undefined };
-	};
-
-	const pad = (s: string, n: number): string => s + " ".repeat(Math.max(0, n - visibleWidth(s)));
-	/** `left` flush left, `right` flush right with a two-column margin; the left side is truncated first. */
-	const rightAlign = (left: string, right: string, w: number): string => {
-		const rw = visibleWidth(right);
-		if (rw === 0) return left;
-		const l = truncateToWidth(left, Math.max(0, w - rw - 3));
-		return l + " ".repeat(Math.max(1, w - 2 - visibleWidth(l) - rw)) + right;
-	};
-	const bar = (n: number | null): string => {
-		const filled = n === null ? 0 : Math.max(0, Math.min(10, Math.round(n / 10)));
-		return fg("accent", "█".repeat(filled)) + fg("dim", "░".repeat(10 - filled));
-	};
-	/** Right column of a row showing `inherit`: the inherited value (accent) · its source scope (muted). */
-	const inheritedSeg = (row: { inherited?: { text: string; source: string } }, shown: string): string =>
-		shown === "inherit" && row.inherited ? fg("accent", row.inherited.text) + fg("dim", " · ") + fg("muted", row.inherited.source) : "";
-
-	const inputLine = (pfx: string, w: number): string => {
-		const e = editing!;
-		e.input.focused = component.focused;
-		if (e.input.getValue() === "") return pfx + (component.focused ? CURSOR_MARKER : "") + "\x1b[7m \x1b[27m" + " " + fg("dim", e.placeholder);
-		const inner = w - 2 - visibleWidth(pfx);
-		// Input.render prepends its own "> " prompt; strip it.
-		return inner > 0 ? pfx + e.input.render(inner + 2)[0]!.slice(2) : pfx;
-	};
-
-	const renderRow = (row: MenuRow, selected: boolean, labelW: number, w: number): string => {
-		const pfx = selected ? fg("accent", "› ") : "  ";
-		const lab = (r: { label: string }): string => pad(truncateToWidth(r.label, labelW - 2), labelW);
-		switch (row.kind) {
-			case "section": {
-				if (row.label === "") return "  " + fg("border", "─".repeat(Math.max(0, w - 4)));
-				const head = "  " + fg("border", "─ ") + fg("muted", row.label) + fg("border", " ");
-				return head + fg("border", "─".repeat(Math.max(0, w - 2 - visibleWidth(head))));
-			}
-			case "choice": {
-				const isPending = pending?.id === row.id;
-				const shown = isPending ? pending!.value : row.value;
-				if (row.locked !== undefined) return rightAlign(pfx + fg("dim", lab(row) + "  " + shown), fg("dim", row.locked), w);
-				let seg: string;
-				if (selected) {
-					const i = row.values.indexOf(shown);
-					const l = i > 0 ? "‹" : " ";
-					const r = i >= 0 && i < row.values.length - 1 ? "›" : " ";
-					seg = fg("dim", l) + " " + fg(isPending ? "warning" : "text", shown) + " " + fg("dim", r);
-				} else seg = "  " + fg(isPending ? "warning" : "muted", shown);
-				return rightAlign(pfx + fg("text", lab(row)) + seg, [inheritedSeg(row, shown), row.shortcut ? fg("dim", row.shortcut) : ""].filter((s) => s !== "").join("  "), w);
-			}
-			case "percent": {
-				const n = /^\d+(?:\.\d+)?%$/.test(row.value) ? Number.parseFloat(row.value) : null;
-				let seg: string;
-				if (selected) {
-					const l = row.value === "inherit" || (row.value === "off" && !row.allowInherit) ? " " : "‹";
-					const r = row.value === "100%" ? " " : "›";
-					seg = `${fg("dim", l)} ${bar(n)} ${fg("text", row.value)} ${fg("dim", r)}`;
-				} else seg = "  " + fg("muted", row.value);
-				return rightAlign(pfx + fg("text", lab(row)) + seg, inheritedSeg(row, row.value), w);
-			}
-			case "page":
-				if (row.locked !== undefined) return rightAlign(pfx + fg("dim", row.label), fg("dim", row.locked), w);
-				return pfx + fg("text", lab(row)) + fg("dim", "›");
-			case "action":
-				return rightAlign(pfx + fg(selected ? "text" : "muted", row.label), row.key ? fg("dim", row.key) : "", w);
-			case "add":
-				if (selected && editing?.id === row.id) return inputLine(pfx + "+ ", w);
-				return pfx + fg(selected ? "text" : "muted", "+ add");
-			case "entry": {
-				if (selected && editing?.id === row.id) return inputLine(pfx, w);
-				const text = displaySafe(row.text.replace(/\r?\n/g, "⏎"));
-				if (!row.editable) return rightAlign("  " + fg("dim", text), row.tag ? fg("dim", row.tag) : "", w);
-				return rightAlign(pfx + fg("text", text), row.tag ? fg("muted", row.tag) : "", w);
-			}
-		}
 	};
 
 	const WARN_APPLY = "press enter to apply";
@@ -4062,87 +4019,6 @@ export function buildSettingsMenu(
 		if (row.kind === "action" && row.confirm && armed === row.id) info = [...info, { tone: "warning", text: WARN_CONFIRM }];
 		if (row.kind === "entry" && armed === row.id) info = [...info, { tone: "warning", text: WARN_REMOVE }];
 		return info;
-	};
-
-	/** Wrapped line count of a description at width `w` (same wrapping as `render`). */
-	const wrappedCount = (info: MenuInfo, w: number): number => {
-		let n = 0;
-		for (const item of info) n += wrapTextWithAnsi(item.text, Math.max(1, w - 4)).length;
-		return n;
-	};
-	/** Description lines to reserve on the current page: the tallest description any selectable row can show
-	 *  (every choice value, percent states, transient warnings), so the menu keeps one height while the selection moves or values change. */
-	const infoHeight = (rs: MenuRow[], w: number): number => {
-		let height = 0;
-		for (const r of rs) {
-			if (r.kind === "section" || !selectable(r)) continue;
-			let candidates: MenuInfo[];
-			let warning: string | undefined;
-			if (r.kind === "choice") {
-				candidates = [...new Set([...r.values, r.value])].map((v) => (r.maxInfo ?? r.info)(v));
-				if (r.confirm) warning = WARN_APPLY;
-			} else if (r.kind === "percent") {
-				candidates = [...new Set([r.value, "off", "100%", ...(r.allowInherit ? ["inherit"] : [])])].map((v) => (r.maxInfo ?? r.info)(v));
-			} else {
-				candidates = [r.info()];
-				if (r.kind === "action" && r.confirm) warning = WARN_CONFIRM;
-				else if (r.kind === "entry" && r.editable) warning = WARN_REMOVE;
-			}
-			const extra = warning === undefined ? 0 : wrappedCount([{ tone: "warning", text: warning }], w);
-			for (const c of candidates) height = Math.max(height, wrappedCount(c, w) + extra);
-		}
-		return height;
-	};
-
-	const hintFor = (row: MenuRow | undefined, rs: MenuRow[]): string => {
-		if (editing) return "enter save · esc cancel";
-		if (page !== null) {
-			if (row?.kind === "choice") return "←→ change · enter next value · esc back · tab scope";
-			const first = row?.kind === "entry" ? "enter edit · d remove" : row?.kind === "add" ? "enter add" : "enter select";
-			return `${first} · ← / esc back · tab scope`;
-		}
-		const parts = ["↑↓ move"];
-		if (rs.some((r) => r.kind === "choice" || r.kind === "percent")) parts.push("←→ change");
-		if (row?.kind === "page") parts.push("enter open");
-		else if (row?.kind === "choice") parts.push("enter next value");
-		else if (row?.kind === "action") parts.push("enter select");
-		if (ctl.hotkeyHint) parts.push(ctl.hotkeyHint);
-		parts.push("tab scope", "esc close");
-		return parts.join(" · ");
-	};
-
-	const titleLine = (w: number): string => {
-		const b = ctl.badge(scope);
-		const right = " " + fg(b.warn ? "warning" : "accent", `⟨ ${b.label} ⟩`) + " " + fg("dim", "tab ⇥") + " " + fg("border", "──");
-		const title = `pi-verdict · ${ctl.title}${page !== null ? ` › ${ctl.pageTitle(page)}` : ""}`;
-		const left = fg("border", "── ") + fg("accent", truncateToWidth(title, Math.max(1, w - visibleWidth(right) - 4))) + " ";
-		return left + fg("border", "─".repeat(Math.max(0, w - visibleWidth(left) - visibleWidth(right)))) + right;
-	};
-
-	const render = (w: number): string[] => {
-		const { rs, row } = current();
-		const labelW = Math.min(28, Math.max(0, ...rs.map((r) => visibleWidth(labelOf(r))))) + 2;
-		const lines: string[] = [titleLine(w)];
-		rs.forEach((r, i) => {
-			const line = renderRow(r, i === index && selectable(r), labelW, w);
-			lines.push(editing && i === index ? line : truncateToWidth(line, w));
-		});
-		lines.push("");
-		const info = infoOf(row);
-		const allScopeRows = ctl.scopes.flatMap((s) => (s === scope ? rs : ctl.rows(s, page)));
-		const reserve = Math.max(infoHeight(allScopeRows, w), wrappedCount(info, w));
-		let emitted = 0;
-		for (const item of info) {
-			for (const l of wrapTextWithAnsi(item.text, Math.max(1, w - 4))) {
-				lines.push("  " + fg(item.tone, l));
-				emitted++;
-			}
-		}
-		for (; emitted < reserve; emitted++) lines.push("");
-		if (reserve > 0) lines.push("");
-		lines.push(truncateToWidth("  " + fg("dim", hintFor(row, rs)), w));
-		lines.push(...bottom.render(w));
-		return lines;
 	};
 
 	const commit = (row: Extract<MenuRow, { kind: "choice" | "percent" }>, value: string): void => {
@@ -4188,14 +4064,11 @@ export function buildSettingsMenu(
 				else ctl.action(scope, row.id);
 				break;
 			case "add":
-				editing = { id: row.id, placeholder: row.placeholder, input: new Input() };
+				editing = { id: row.id, placeholder: row.placeholder, input: new LineInput() };
 				break;
 			case "entry": {
 				if (row.text.includes("\n")) break; // multi-line entries are removable only (the inline field is single-line)
-				const input = new Input();
-				input.setValue(row.text);
-				input.handleInput("\x05"); // setValue keeps the cursor at 0; ctrl+e (cursorLineEnd) moves it behind the prefilled text
-				editing = { id: row.id, placeholder: "", input };
+				editing = { id: row.id, placeholder: "", input: new LineInput(row.text) };
 				break;
 			}
 			default:
@@ -4212,9 +4085,7 @@ export function buildSettingsMenu(
 	const nativeWarning = (text: string): string => (text === WARN_APPLY ? "press Apply to commit" : text === WARN_CONFIRM ? "activate again to confirm" : text === WARN_REMOVE ? "clear the value again to remove" : text);
 	type PrefRow = Record<string, unknown>;
 	type PrefSection = { id: string; title: string; rows: PrefRow[] };
-	let prefsMemo: { sig: string; node: TspNode } | undefined;
-	const describePrefs = (cx: DescribeCtx): TspNode | null => {
-		if (!cx.supports("prefs")) return null;
+	const describePrefs = (): TspNode => {
 		const { rs, row: selected } = current();
 		const pages = [
 			{ id: "__main", label: ctl.title, ...(ctl.icon ? { icon: ctl.icon } : {}) },
@@ -4295,8 +4166,6 @@ export function buildSettingsMenu(
 					break;
 			}
 		});
-		// omp's Input exposes its cursor; earendil's Input has no such method.
-		const draft: (PiTui.Input & { getCursor?(): number }) | undefined = editing?.input;
 		const props = {
 			title: `pi-verdict · ${ctl.title}`,
 			pages,
@@ -4304,12 +4173,9 @@ export function buildSettingsMenu(
 			lead: [ctl.hotkeyHint ? `keys: ${ctl.hotkeyHint}` : null, "tab scope", "esc close"].filter((s) => s !== null).join(" · "),
 			sections: [scopeSection, ...body],
 			focus: selected && selected.kind !== "section" ? selected.id : null,
-			editing: editing && draft ? { row: editing.id, draft: draft.getValue(), cursor: draft.getCursor?.() } : null,
+			editing: editing ? { row: editing.id, draft: editing.input.value, cursor: editing.input.cursor } : null,
 		};
-		const sig = JSON.stringify(props);
-		if (prefsMemo?.sig === sig) return prefsMemo.node;
-		prefsMemo = { sig, node: tn("prefs", props) };
-		return prefsMemo.node;
+		return tn("prefs", props);
 	};
 	/** Move the selection onto row `id` (when selectable); returns the row. */
 	const selectRow = (id: string): MenuRow | undefined => {
@@ -4327,7 +4193,7 @@ export function buildSettingsMenu(
 			ctl.remove(scope, page, row.id);
 		} else armed = row.id;
 	};
-	const nativeEvent = (e: NativeEvent): void => {
+	const nativeEvent = (e: UiEvent): void => {
 		if (e.type === "action") {
 			if (e.act === "close") {
 				done();
@@ -4384,6 +4250,7 @@ export function buildSettingsMenu(
 			armed = undefined;
 			enter(row, prevPending, prevArmed);
 		} else if (e.type === "change") {
+			if (!("item" in e)) return;
 			const v = e.value;
 			if (e.item === "__scope") {
 				const next = ctl.scopes.find((s) => s === v);
@@ -4414,29 +4281,28 @@ export function buildSettingsMenu(
 		tui.requestRender();
 	};
 
-	const component: PiTui.Component & { handleInput(data: string): void; focused: boolean } & NativeHooks = {
-		focused: false,
-		invalidate() {},
-		render,
-		nativeSheet: (cx) => cx.supports("prefs"),
-		nativeOverlay: { role: "pi-verdict.settings", head: `pi-verdict · ${ctl.title}`, size: "lg", anchor: "center" },
+	return {
 		describe: describePrefs,
 		handleNativeEvent: nativeEvent,
-		handleInput(data: string): void {
-			if (data.startsWith("\x1b[<") || data.startsWith("\x1b[M")) return; // mouse reports are never keys
-			const kb = getKeybindings();
-			const isEnter = kb.matches(data, "tui.select.confirm") || data === "\n";
-			const isEsc = kb.matches(data, "tui.select.cancel");
-			const isTab = matchesKey(data, "tab");
-			const isShiftTab = matchesKey(data, "shift+tab");
+		handlePaste(text: string): void {
+			if (!editing) return;
+			editing.input.paste(text);
+			tui.requestRender();
+		},
+		handleKey(key: KeyEvent): void {
+			const id = key.id;
+			const isEnter = id === "enter";
+			const isEsc = id === "escape";
+			const isTab = id === "tab";
+			const isShiftTab = id === "shift+tab";
 
 			if (editing) {
 				if (isTab || isShiftTab) return;
 				if (isEsc) editing = undefined;
 				else if (isEnter) {
-					const text = editing.input.getValue();
+					const text = editing.input.value;
 					if (text.trim() === "" || ctl.submit(scope, page!, editing.id, text)) editing = undefined;
-				} else editing.input.handleInput(data);
+				} else editing.input.handleKey(key);
 				tui.requestRender();
 				return;
 			}
@@ -4446,9 +4312,9 @@ export function buildSettingsMenu(
 			pending = undefined;
 			armed = undefined;
 			const { row } = current();
-			const left = matchesKey(data, "left");
-			const right = matchesKey(data, "right");
-			const hot = ctl.hotkeys?.[data];
+			const left = id === "left";
+			const right = id === "right";
+			const hot = ctl.hotkeys?.[id];
 
 			if (isTab || isShiftTab) {
 				const n = ctl.scopes.length;
@@ -4460,19 +4326,19 @@ export function buildSettingsMenu(
 					done();
 					return;
 				}
-			} else if (kb.matches(data, "tui.select.up") || data === "k") move(-1);
-			else if (kb.matches(data, "tui.select.down") || data === "j") move(1);
+			} else if (id === "up" || id === "k") move(-1);
+			else if (id === "down" || id === "j") move(1);
 			else if (left && page !== null && row?.kind !== "choice") back();
 			else if ((left || right) && row?.kind === "choice" && row.locked === undefined) stepChoice(row, right ? 1 : -1, false, prevPending?.id === row.id ? prevPending.value : row.value);
-			else if ((left || right || data === "-" || data === "+" || data === "=") && row?.kind === "percent") {
-				const delta = left ? -5 : right ? 5 : data === "-" ? -1 : 1;
+			else if ((left || right || key.text === "-" || key.text === "+" || key.text === "=") && row?.kind === "percent") {
+				const delta = left ? -5 : right ? 5 : key.text === "-" ? -1 : 1;
 				const next = stepPercent(row.value, delta, row.allowInherit);
 				if (next !== null) commit(row, next);
-			} else if (data === "x" && row?.kind === "percent") commit(row, "off");
-			else if (data === "i" && row?.kind === "percent" && row.allowInherit) commit(row, "inherit");
+			} else if (id === "x" && row?.kind === "percent") commit(row, "off");
+			else if (id === "i" && row?.kind === "percent" && row.allowInherit) commit(row, "inherit");
 			else if (isEnter && row) {
 				enter(row, prevPending, prevArmed);
-			} else if ((data === "d" || matchesKey(data, "delete")) && row?.kind === "entry" && page !== null) {
+			} else if ((id === "d" || id === "delete") && row?.kind === "entry" && page !== null) {
 				if (prevArmed === row.id) ctl.remove(scope, page, row.id);
 				else armed = row.id;
 			}
@@ -4480,7 +4346,6 @@ export function buildSettingsMenu(
 			tui.requestRender();
 		},
 	};
-	return component;
 }
 
 // ============================================================================
@@ -5613,21 +5478,6 @@ export function renderVerdictLabel(l: VerdictLabel, theme: Pick<Theme, "fg" | "b
 	return baseWidth + 1 <= width ? [base] : [];
 }
 
-type DialogModules = { tui: typeof PiTui; agent: typeof PiAgent };
-let dialogModules: Promise<DialogModules | null> | undefined;
-/** The resolved value of `dialogModules`, for synchronous widget code (undefined until loaded, null when unavailable). */
-let dialogModulesReady: DialogModules | null | undefined;
-/** Value imports are lazy so hosts and test mocks that never open the rich dialog do not load pi-tui / pi-coding-agent. */
-function loadDialogModules(): Promise<DialogModules | null> {
-	dialogModules ??= Promise.all([import("@earendil-works/pi-tui"), import("@earendil-works/pi-coding-agent")])
-		.then(
-			([tui, agent]): DialogModules | null => ({ tui, agent }),
-			() => null,
-		)
-		.then((m) => (dialogModulesReady = m));
-	return dialogModules;
-}
-
 /** What a permission grant covers, as shown in the grant dialog (GR-2). */
 interface GrantScope {
 	paths: readonly { path: string; access: GrantAccess }[];
@@ -5759,38 +5609,8 @@ function isAskPick(x: unknown): x is AskPick {
 	return x.allow === false && (!("reason" in x) || x.reason === undefined || typeof x.reason === "string");
 }
 
-/** 0-based dialog line under 0-based terminal row `screenRow`, or null when the host
- *  exposes no layout (`children`/`terminal.rows`) or the row is outside the dialog. */
-function dialogLineAtRow(tui: unknown, root: PiTui.Component, width: number, screenRow: number): number | null {
-	try {
-		if (!tui || typeof tui !== "object" || !("children" in tui) || !Array.isArray(tui.children)) return null;
-		const rows = "terminal" in tui && tui.terminal && typeof tui.terminal === "object" && "rows" in tui.terminal ? tui.terminal.rows : undefined;
-		if (typeof rows !== "number") return null;
-		const offsetOf = (components: readonly PiTui.Component[]): number | null => {
-			let acc = 0;
-			for (const c of components) {
-				if (c === root) return acc;
-				if ("children" in c && Array.isArray(c.children)) {
-					const inner = offsetOf(c.children);
-					if (inner !== null) return acc + inner;
-				}
-				acc += c.render(width).length;
-			}
-			return null;
-		};
-		const hostChildren: PiTui.Component[] = tui.children;
-		const offset = offsetOf(hostChildren);
-		if (offset === null) return null;
-		let total = 0;
-		for (const c of hostChildren) total += c.render(width).length;
-		// Alt-screen exposes `viewportTop`; the main screen shows the bottom `rows` lines [INFERENCE: short content starts at row 0].
-		const top = "viewportTop" in tui && typeof tui.viewportTop === "number" ? tui.viewportTop : Math.max(0, total - rows);
-		const line = screenRow - (offset - top);
-		return line >= 0 && line < root.render(width).length ? line : null;
-	} catch {
-		return null;
-	}
-}
+// shortcut: extension as language id, use host lang mapping if highlighting misses
+const langFromPath = (file: string): string | undefined => path.extname(file).slice(1) || undefined;
 
 /** One code block of the ask dialog: the action itself, or a file of the file context. `collapsed` is the in-dialog view, `full` the untruncated one the viewer shows, `pretty` that full text formatted for reading (null when formatting changes nothing). */
 interface DialogBlock { kind: "action" | "file"; header: string; collapsed: string; full: string; pretty: string | null }
@@ -5816,81 +5636,35 @@ function dialogViewBlocks(spec: ApproveDialogSpec, langFromPath: (p: string) => 
 	return blocks;
 }
 
-/** Selector-style dialog mirroring ExtensionSelectorComponent. Resolves `done(undefined)`
- *  with an empty container if construction throws, so the caller falls back to `confirm`.
- *  Left clicks are handled when the host forwards SGR mouse input to the dialog (a click highlights
- *  an option, a second click on the same mouse-highlighted option confirms it); the dialog never
- *  enables mouse tracking itself. */
+/** Approval dialog (ask / grant): code blocks, jev verdict, choices with an inline No reason. Resolves `done(undefined)`
+ *  with an empty view if construction throws, so the caller falls back to `confirm`. */
 export function buildApproveDialog(
-	mods: DialogModules,
 	tui: { requestRender(): void },
-	theme: Theme,
+	theme: unknown,
 	spec: ApproveDialogSpec,
 	done: (result: AskPick | undefined) => void,
-): PiTui.Container {
-	const { Container, CURSOR_MARKER, Input, Markdown, Spacer, Text, getKeybindings, visibleWidth } = mods.tui;
-	const { DynamicBorder, getLanguageFromPath, getMarkdownTheme, keyHint, rawKeyHint } = mods.agent;
+): DialogRoot {
 	try {
-		const root = new Container() as PiTui.Container & { handleInput(data: string): void; focused: boolean } & NativeHooks;
-		root.focused = false; // pi's ui.custom sets this via tui.setFocus, so the hardware cursor follows CURSOR_MARKER
-		root.addChild(new DynamicBorder());
-		root.addChild(new Spacer(1));
-		root.addChild(new Text(theme.fg("accent", theme.bold(displaySafe(spec.title))), 1, 0));
-		root.addChild(new Spacer(1));
 		let localExpanded = false;
 		const isExpanded = (): boolean => (spec.expansion ? spec.expansion.get() : localExpanded);
 		const toggle = (): void => {
 			if (spec.expansion) spec.expansion.toggle();
 			else localExpanded = !localExpanded;
 		};
-		const blocks = dialogViewBlocks(spec, getLanguageFromPath);
+		const blocks = dialogViewBlocks(spec, langFromPath);
 		const expandable = blocks.some((b) => b.full !== b.collapsed);
 		const viewable = spec.variant !== "grant" && blocks.length > 0;
-		blocks.forEach((b, i) => {
-			if (i > 0) root.addChild(new Spacer(1));
-			const collapsedMd = new Markdown(b.collapsed, 1, 0, getMarkdownTheme());
-			const fullMd = new Markdown(b.full, 1, 0, getMarkdownTheme());
-			root.addChild(new Text(theme.fg("toolTitle", theme.bold(b.header)), 1, 0));
-			// Picks the view at render time: the host may flip its expansion state without going through handleInput (omp).
-			root.addChild({
-				render: (w: number) => (isExpanded() ? fullMd : collapsedMd).render(w),
-				invalidate() {
-					fullMd.invalidate();
-					collapsedMd.invalidate();
-				},
-			});
-		});
-		if (blocks.length === 0) root.addChild(new Text(displaySafe(spec.action), 1, 0));
-		root.addChild(new Spacer(1));
 		const jev = spec.jev;
-		if (jev) {
-			root.addChild({ render: (w: number) => renderJevBar(jev, spec.minConfidence, w - 2, theme, spec.nerdFont).map((l) => ` ${l}`), invalidate() {} });
-			if (jev.concern) root.addChild(new Text(theme.fg("muted", "concern: ") + jev.concern, 1, 0));
-			if (jev.rest) root.addChild(new Text(theme.fg("muted", displaySafe(jev.rest)), 1, 0));
-		} else {
-			root.addChild(new Text(displaySafe(spec.reasonLine), 1, 0));
-		}
-		if (spec.detail !== undefined) root.addChild(new Text(displaySafe(`Protected path: ${spec.detail}`), 1, 0));
-		for (const line of spec.scope ? grantScopeLines(spec.scope) : []) root.addChild(new Text(displaySafe(line), 1, 0));
-		if (spec.explanation) {
-			root.addChild(new Spacer(1));
-			root.addChild(new Text(theme.fg("accent", theme.bold(`${EXPLAIN_GATE_ROLE} (model-generated, advisory)`)), 1, 0));
-			root.addChild(new Markdown(displaySafe(spec.explanation), 1, 0, getMarkdownTheme()));
-		}
-		root.addChild(new Spacer(1));
-		root.addChild(new Text(theme.fg("text", spec.question), 1, 0));
 		const grant = spec.variant === "grant";
 		const choices: AskOption[] = grant ? ["yes", "reject", "no"] : ["yes", ...(spec.remember ? ["always" as const] : []), ...(spec.invite ? ["invite" as const] : []), "no", ...(spec.explain ? ["explain" as const] : [])];
 		const labelOf = (c: AskOption): string => (grant ? GRANT_LABELS[c] : undefined) ?? ASK_LABELS[c];
-		const rowLabel = grant ? GRANT_LABELS.no! : "No";
-		const rowPrefix = grant ? `${GRANT_LABELS.no}: ` : "No, ";
 		const reasonLabel = grant ? "Clarification" : "Reason for No";
 		const radio = radioGlyphs(theme);
 		const rowPlaceholder = grant ? GRANT_CLARIFY_PLACEHOLDER : NO_PLACEHOLDER;
 		let index = 0;
-		// Single-line editor for the inline No reason (editing keys, bracketed paste, scrolling, fake cursor).
-		const noInput = new Input();
-		const noReason = (): string | undefined => noInput.getValue().trim() || undefined;
+		// Single-line editor for the inline No reason.
+		const noInput = new LineInput();
+		const noReason = (): string | undefined => noInput.value.trim() || undefined;
 		const resolve = (c: AskOption): void => {
 			if (c === "yes") done({ allow: true });
 			else if (c === "always") done({ allow: true, remember: true });
@@ -5902,143 +5676,36 @@ export function buildApproveDialog(
 				done({ allow: false, reason });
 			} else done("explain");
 		};
-		const list = new Container();
-		const updateList = (): void => {
-			list.clear();
-			choices.forEach((c, i) => {
-				const selected = i === index;
-				if (c !== "no") {
-					list.addChild(new Text(selected ? theme.fg("accent", "→ ") + theme.fg("accent", labelOf(c)) : `  ${theme.fg("text", labelOf(c))}`, 1, 0));
-					return;
-				}
-				list.addChild({
-					render: (w: number): string[] => {
-						const value = noInput.getValue();
-						if (!selected) {
-							const line = value === "" ? `  ${theme.fg("text", rowLabel)}` : `  ${theme.fg("text", rowPrefix)}${theme.fg("muted", value)}`;
-							return new Text(line, 1, 0).render(w);
-						}
-						let line = theme.fg("accent", "→ ") + theme.fg("accent", rowPrefix);
-						if (value === "") {
-							line += (root.focused ? CURSOR_MARKER : "") + "\x1b[7m \x1b[27m" + " " + theme.fg("dim", rowPlaceholder);
-						} else {
-							noInput.focused = root.focused;
-							const inner = w - 2 - visibleWidth(`→ ${rowPrefix}`);
-							// Input.render prepends its own "> " prompt; strip it.
-							if (inner > 0) line += noInput.render(inner + 2)[0]!.slice(2);
-						}
-						return [` ${line}`];
-					},
-					invalidate() {},
-				});
-			});
-		};
-		updateList();
-		root.addChild(list);
-		root.addChild(new Spacer(1));
-		// Rebuilt at render time so the label follows host-native toggles that never reach handleInput.
-		root.addChild({
-			render: (w: number) => {
-				const expandHint = expandable ? `  ${rawKeyHint("ctrl+o", isExpanded() ? "collapse" : "expand")}` : "";
-				const viewHint = viewable ? `  ${rawKeyHint("v", "view code")}` : "";
-				return new Text(`${rawKeyHint("↑↓", "navigate")}${expandHint}${viewHint}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`, 1, 0).render(w);
-			},
-			invalidate() {},
-		});
-		root.addChild(new Spacer(1));
-		root.addChild(new DynamicBorder());
-		// Record which choice each rendered line belongs to, so a click row can be mapped back to an option.
-		let lastWidth: number | undefined;
-		let optionAtLine: (number | undefined)[] = [];
-		(root as { render(w: number): string[] }).render = (width: number): string[] => {
-			const lines: string[] = [];
-			const map: (number | undefined)[] = [];
-			for (const child of root.children) {
-				if (child === list) {
-					list.children.forEach((opt, j) => {
-						for (const l of opt.render(width)) {
-							lines.push(l);
-							map.push(j);
-						}
-					});
-				} else {
-					for (const l of child.render(width)) {
-						lines.push(l);
-						map.push(undefined);
-					}
-				}
-			}
-			lastWidth = width;
-			optionAtLine = map;
-			return lines;
-		};
-		let armed: number | undefined; // choice highlighted by the immediately preceding mouse click
-		const onMouse = (button: number, y: number, press: boolean): void => {
-			if (!press || (button & ~(4 | 8 | 16)) !== 0) return; // left button only (modifiers ok); no release/motion/wheel
-			if (lastWidth === undefined) return;
-			const line = dialogLineAtRow(tui, root, lastWidth, y - 1);
-			const choice = line === null ? undefined : optionAtLine[line];
-			if (choice === undefined) return;
-			if (armed === choice && index === choice) {
-				resolve(choices[choice]);
-				return;
-			}
-			index = choice;
-			armed = choice;
-			updateList();
+		const moveTo = (to: number): void => {
+			index = Math.max(0, Math.min(choices.length - 1, to));
 			tui.requestRender();
 		};
-		root.handleInput = (data: string): void => {
-			const m = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
-			if (m) {
-				onMouse(Number(m[1]), Number(m[3]), m[4] === "M");
-				return;
-			}
-			if (data.startsWith("\x1b[M")) return; // legacy X10 mouse: ignore, never treat as keys
-			armed = undefined;
-			// ctrl+o reaches the focused dialog, never the host's own expand binding
-			if (expandable && (typeof mods.tui.matchesKey === "function" ? mods.tui.matchesKey(data, "ctrl+o") : data === "\x0f")) {
+		const handleKey = (key: KeyEvent): void => {
+			const id = key.id;
+			// shortcut: default keys only, user remaps of tui.select.* are ignored; read the factory's keybindings arg if users ask
+			if (expandable && id === "ctrl+o") {
 				toggle();
 				tui.requestRender();
-				return;
-			}
-			const kb = getKeybindings();
-			if (kb.matches(data, "tui.select.up")) {
-				index = Math.max(0, index - 1);
-				updateList();
-				tui.requestRender();
-			} else if (kb.matches(data, "tui.select.down")) {
-				index = Math.min(choices.length - 1, index + 1);
-				updateList();
-				tui.requestRender();
-			} else if (kb.matches(data, "tui.select.confirm") || data === "\n") {
-				resolve(choices[index]);
-			} else if (kb.matches(data, "tui.select.cancel")) {
-				done({ allow: false });
-			} else if (data === "v" && viewable && choices[index] !== "no") {
-				done({ view: 0 });
-			} else if (choices[index] === "no") {
+			} else if (id === "up") moveTo(index - 1);
+			else if (id === "down") moveTo(index + 1);
+			else if (id === "enter") resolve(choices[index]!);
+			else if (id === "escape") done({ allow: false });
+			else if (id === "v" && viewable && choices[index] !== "no") done({ view: 0 });
+			else if (choices[index] === "no") {
 				// On the No row every other key is text for the inline field (including j/k).
-				noInput.handleInput(data);
+				noInput.handleKey(key);
 				tui.requestRender();
-			} else if (data === "k") {
-				index = Math.max(0, index - 1);
-				updateList();
-				tui.requestRender();
-			} else if (data === "j") {
-				index = Math.min(choices.length - 1, index + 1);
-				updateList();
-				tui.requestRender();
-			}
+			} else if (id === "k") moveTo(index - 1);
+			else if (id === "j") moveTo(index + 1);
 		};
-		// Tern-native card (used instead of render() while TSP is live): same content and order, pointer events take the key paths.
-		// omp's Input shows `placeholder` natively; earendil's Input has no such field and ignores it.
-		const placeholderInput: typeof noInput & { placeholder?: string } = noInput;
-		placeholderInput.placeholder = rowPlaceholder;
-		// The question is the overlay title (Tern draws it in its sans face); body prose carries `PROSE_ROLE` (sans), only code and paths stay monospace.
-		root.nativeOverlay = { role: "pi-verdict.ask", head: displaySafe(spec.question), anchor: "center" };
-		root.describe = (cx: DescribeCtx): TspNode => {
-			const kids: (TspNode | object)[] = [];
+		const handlePaste = (text: string): void => {
+			if (choices[index] !== "no") return;
+			noInput.paste(text);
+			tui.requestRender();
+		};
+		// The question is the dialog title; body prose carries `PROSE_ROLE` (sans), only code and paths stay monospace.
+		const describe = (cx: DescribeCtx): TspNode => {
+			const kids: TspNode[] = [tnHeading(displaySafe(spec.question), "head")];
 			if (grant) {
 				kids.push(...grantScopeNodes(spec.action, spec.scope ?? { paths: [], rules: [] }));
 				kids.push(tnProse([{ t: displaySafe(spec.reasonLine), s: "muted" }], undefined, "lifetime"));
@@ -6113,7 +5780,7 @@ export function buildApproveDialog(
 					"choices",
 				),
 			);
-			if (choices[index] === "no") kids.push(tn("col", { gap: "xs" }, [tnProse([{ t: reasonLabel, s: "muted" }]), noInput], "reason"));
+			if (choices[index] === "no") kids.push(tn("col", { gap: "xs" }, [tnProse([{ t: reasonLabel, s: "muted" }]), noInput.node({ key: "input", focused: true, placeholder: rowPlaceholder })], "reason"));
 			kids.push(
 				tnBar([
 					...(expandable ? [tnButton(isExpanded() ? "Less" : "Details", "expand", { keys: "ctrl+o" })] : []),
@@ -6125,19 +5792,17 @@ export function buildApproveDialog(
 			);
 			return tn("col", { role: "pi-verdict.ask", gap: "md" }, [tnFramed(kids, "md")]);
 		};
-		root.handleNativeEvent = (e: NativeEvent): void => {
+		const handleNativeEvent = (e: UiEvent): void => {
 			if (e.type === "select" || e.type === "activate") {
 				// Cards are not list items: the host sends the clicked node's id (`r.choices/no`), not its key.
 				const picked = choices.includes(e.item as AskOption) ? e.item : leafKey(e.item);
 				const at = picked === "explain" ? -1 : choices.indexOf(picked as AskOption);
 				if (at < 0) return;
 				index = at;
-				armed = undefined;
 				if (e.type === "activate") {
-					resolve(choices[index]);
+					resolve(choices[index]!);
 					return;
 				}
-				updateList();
 				tui.requestRender();
 			} else if (e.type === "action") {
 				if (e.act === "confirm") resolve(choices[index]);
@@ -6156,10 +5821,10 @@ export function buildApproveDialog(
 				}
 			}
 		};
-		return root;
+		return { describe, handleKey, handlePaste, handleNativeEvent };
 	} catch {
 		done(undefined);
-		return new Container();
+		return { describe: () => null, handleKey() {} };
 	}
 }
 
@@ -6168,26 +5833,22 @@ export function buildApproveDialog(
  *  `signal` closes a shown dialog (custom has no signal option, so cancellation goes through
  *  the factory's `done`). */
 async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSignal): Promise<AskPick | undefined> {
-	if (typeof ui.custom !== "function") return undefined;
-	const mods = await loadDialogModules();
-	if (!mods || signal?.aborted) return undefined;
+	if (typeof ui.custom !== "function" || signal?.aborted) return undefined;
 	let finish: ((r: AskPick | undefined) => void) | undefined;
 	const onAbort = (): void => finish?.(undefined);
 	signal?.addEventListener("abort", onAbort, { once: true });
-	// ctrl+o expands/collapses the dialog's own code view. pi delivers the key to the focused dialog (expansion.toggle);
-	// omp toggles tool expansion natively in a global input listener before the dialog sees it, and the dialog reads
-	// expansion.get() at render time, so both hosts expand the dialog's code. The transcript's expansion state is restored on close.
+	// ctrl+o expands/collapses the dialog's own code view: the dialog gets the key itself (expansion.toggle) and reads
+	// expansion.get() when it describes itself. The transcript's expansion state is restored on close.
 	const canToggle = typeof ui.getToolsExpanded === "function" && typeof ui.setToolsExpanded === "function";
 	const initialExpanded = canToggle ? ui.getToolsExpanded() : undefined;
 	const shown: ApproveDialogSpec = canToggle ? { ...spec, expansion: { get: () => ui.getToolsExpanded(), toggle: () => ui.setToolsExpanded(!ui.getToolsExpanded()) } } : spec;
 	try {
 		const r = await ui.custom<AskPick | undefined>((tui, theme, _kb, done) => {
-			noteHostTui(tui);
 			finish = done;
-			const dialog = buildApproveDialog(mods, tui, theme, shown, done);
+			const view = mountDialog(tui, (t) => buildApproveDialog(t, theme, shown, done));
 			if (signal?.aborted) queueMicrotask(() => done(undefined));
-			return dialog;
-		}, nativeLive() ? NATIVE_WIDE_OVERLAY : undefined);
+			return view;
+		}, NATIVE_WIDE_OVERLAY);
 		return isAskPick(r) ? r : undefined;
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
@@ -6195,72 +5856,41 @@ async function pickAsk(ui: UiContext, spec: ApproveDialogSpec, signal?: AbortSig
 	}
 }
 
-/** Full-size, scrollable code viewer over the ask dialog's code blocks: ANSI inline view, or a full-pane Tern `screen` surface (TSP; no `nativeOverlay`, so omp's backend uses `describeScreen`). Shows the formatted text (`pretty`) by default, `r` toggles the exact text. Esc/q/Enter close it; Tab switches block. */
+/** Full-pane code viewer over the ask dialog's code blocks. Shows the formatted text (`pretty`) by default, `r` toggles the exact text. Esc/q/Enter close it; Tab switches block; arrows/PgUp/PgDn/Home/End scroll. */
 export function buildCodeViewer(
-	mods: DialogModules,
 	tui: { requestRender(): void },
 	blocks: ReadonlyArray<{ header: string; markdown: string; pretty: string | null }>,
 	start: number,
 	done: () => void,
-): PiTui.Component & { handleInput(data: string): void; focused: boolean } & NativeHooks {
-	const { Markdown, truncateToWidth } = mods.tui;
-	const { getMarkdownTheme } = mods.agent;
-	const RAW = { up: "\x1b[A", down: "\x1b[B", pageUp: "\x1b[5~", pageDown: "\x1b[6~", home: "\x1b[H", end: "\x1b[F", tab: "\t", "shift+tab": "\x1b[Z", escape: "\x1b" } as const;
-	const is = (data: string, key: keyof typeof RAW): boolean => (typeof mods.tui.matchesKey === "function" ? mods.tui.matchesKey(data, key) : data === RAW[key]);
+): DialogRoot {
 	const n = blocks.length;
-	const mds = blocks.map((b) => new Markdown(b.markdown, 1, 0, getMarkdownTheme()));
-	const prettyMds = blocks.map((b) => (b.pretty === null ? null : new Markdown(b.pretty, 1, 0, getMarkdownTheme())));
 	let i = Math.min(Math.max(0, start), n - 1);
 	let exact = false;
-	let offset = 0;
-	let total = 0;
-	let height = 5;
+	let scrollReq: { by: "line-up" | "line-down" | "page-up" | "page-down" | "start" | "end"; n: number } | undefined;
+	let scrollN = 0;
 	const hasPretty = (): boolean => blocks[i]!.pretty !== null;
 	const showPretty = (): boolean => !exact && hasPretty();
-	const rows = (): number => {
-		if (typeof tui !== "object" || tui === null || !("terminal" in tui)) return 40;
-		const t = tui.terminal;
-		return typeof t === "object" && t !== null && "rows" in t && typeof t.rows === "number" ? t.rows : 40;
-	};
-	const scrollTo = (to: number): void => {
-		offset = Math.max(0, Math.min(to, Math.max(0, total - height)));
+	const scrollBy = (by: NonNullable<typeof scrollReq>["by"]): void => {
+		scrollReq = { by, n: ++scrollN };
 		tui.requestRender();
 	};
 	const switchTo = (to: number): void => {
 		i = (to + n) % n;
-		offset = 0;
+		scrollReq = undefined;
 		tui.requestRender();
 	};
 	const toggleExact = (): void => {
 		exact = !exact;
-		offset = 0;
+		scrollReq = undefined;
 		tui.requestRender();
 	};
-	const viewer = {
-		focused: false,
-		invalidate() {
-			for (const m of mds) m.invalidate();
-			for (const m of prettyMds) m?.invalidate();
-		},
-		render(w: number): string[] {
-			height = Math.max(5, rows() - 4);
-			const all = (showPretty() ? prettyMds[i]! : mds[i]!).render(w);
-			total = all.length;
-			offset = Math.min(offset, Math.max(0, total - height));
-			const toggle = hasPretty() ? (exact ? " · r formatted" : " · r exact text") : "";
-			return [
-				truncateToWidth(`\x1b[1m${blocks[i]!.header}\x1b[22m  (${i + 1}/${n})${showPretty() ? " · formatted" : ""}`, w),
-				...all.slice(offset, offset + height),
-				truncateToWidth(`↑↓ PgUp/PgDn scroll · Tab next block${toggle} · Esc close`, w),
-			];
-		},
-		describeScreen: () => ({ role: "pi-verdict.view", main: [viewer] }),
+	return {
 		describe(): TspNode {
 			return tn("col", { role: "pi-verdict.view", gap: "md" }, [
 				tnFramed(
 					[
 						tnHeading(`${blocks[i]!.header}${showPretty() ? " · formatted" : ""}`, "head"),
-						tn("md", { text: showPretty() ? blocks[i]!.pretty! : blocks[i]!.markdown }, undefined, `view${i}`),
+						tn("md", { text: showPretty() ? blocks[i]!.pretty! : blocks[i]!.markdown, scroll: scrollReq }, undefined, `view${i}`),
 						tnBar([
 							...(n > 1 ? [tnButton("Previous", "prev"), tnButton("Next", "next", { keys: "tab" })] : []),
 							...(hasPretty() ? [tnButton(exact ? "Formatted" : "Exact text", "exact", { keys: "r" })] : []),
@@ -6272,45 +5902,41 @@ export function buildCodeViewer(
 				),
 			]);
 		},
-		handleNativeEvent(e: NativeEvent): void {
+		handleNativeEvent(e: UiEvent): void {
 			if (e.type !== "action") return;
 			if (e.act === "close") done();
 			else if (e.act === "next") switchTo(i + 1);
 			else if (e.act === "prev") switchTo(i - 1);
 			else if (e.act === "exact" && hasPretty()) toggleExact();
 		},
-		handleInput(data: string): void {
-			if (data.startsWith("\x1b[M") || /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data)) return; // mouse: ignored
-			if (is(data, "up")) scrollTo(offset - 1);
-			else if (is(data, "down")) scrollTo(offset + 1);
-			else if (is(data, "pageUp")) scrollTo(offset - height);
-			else if (is(data, "pageDown")) scrollTo(offset + height);
-			else if (is(data, "home")) scrollTo(0);
-			else if (is(data, "end")) scrollTo(total);
-			else if (is(data, "tab") && n > 1) switchTo(i + 1);
-			else if (is(data, "shift+tab") && n > 1) switchTo(i - 1);
-			else if (data === "r" && hasPretty()) toggleExact();
-			else if (is(data, "escape") || data === "q" || data === "\r" || data === "\n") done();
+		handleKey(key: KeyEvent): void {
+			const id = key.id;
+			if (id === "up") scrollBy("line-up");
+			else if (id === "down") scrollBy("line-down");
+			else if (id === "pageUp") scrollBy("page-up");
+			else if (id === "pageDown") scrollBy("page-down");
+			else if (id === "home") scrollBy("start");
+			else if (id === "end") scrollBy("end");
+			else if (id === "tab" && n > 1) switchTo(i + 1);
+			else if (id === "shift+tab" && n > 1) switchTo(i - 1);
+			else if (id === "r" && hasPretty()) toggleExact();
+			else if (id === "escape" || id === "q" || id === "enter") done();
 		},
 	};
-	return viewer;
 }
 
 /** Opens the viewer over `blocks` starting at `start`; resolves when it closes (also when `signal` aborts). A host without `ui.custom` shows nothing. */
 async function viewCode(ui: UiContext, blocks: ReadonlyArray<{ header: string; markdown: string; pretty: string | null }>, start: number, signal?: AbortSignal): Promise<void> {
-	if (typeof ui.custom !== "function" || blocks.length === 0) return;
-	const mods = await loadDialogModules();
-	if (!mods || signal?.aborted) return;
+	if (typeof ui.custom !== "function" || blocks.length === 0 || signal?.aborted) return;
 	let finish: (() => void) | undefined;
 	const onAbort = (): void => finish?.();
 	signal?.addEventListener("abort", onAbort, { once: true });
 	try {
 		await ui.custom<undefined>((tui, _theme, _kb, done) => {
-			noteHostTui(tui);
 			finish = () => done(undefined);
 			if (signal?.aborted) queueMicrotask(() => done(undefined));
-			return buildCodeViewer(mods, tui, blocks, start, () => done(undefined));
-		}, nativeLive() ? NATIVE_SCREEN_OVERLAY : undefined);
+			return mountDialog(tui, (t) => buildCodeViewer(t, blocks, start, () => done(undefined)));
+		}, NATIVE_SCREEN_OVERLAY);
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
 	}
@@ -6339,13 +5965,11 @@ export interface ChoiceScreenSpec {
 }
 
 export function buildChoiceScreen(
-	mods: DialogModules,
 	tui: { requestRender(): void },
 	spec: ChoiceScreenSpec,
 	done: (id: string | undefined) => void,
 	radio: RadioGlyphs,
-): PiTui.Component & { handleInput(data: string): void; focused: boolean } & NativeHooks {
-	const { getKeybindings, truncateToWidth } = mods.tui;
+): DialogRoot {
 	const { choices } = spec;
 	let index = 0;
 	const move = (to: number): void => {
@@ -6353,27 +5977,14 @@ export function buildChoiceScreen(
 		tui.requestRender();
 	};
 	return {
-		focused: false,
-		invalidate() {},
-		render: (w: number): string[] => [
-			truncateToWidth(`\x1b[1m${displaySafe(spec.head)}\x1b[22m`, w),
-			...spec.lines.map((l) => truncateToWidth(l, w)),
-			"",
-			...choices.map((c, i) => truncateToWidth(`${i === index ? "→ " : "  "}${displaySafe(c.label)}`, w)),
-		],
-		nativeOverlay: {
-			role: spec.role,
-			head: spec.head,
-			anchor: "center",
-			...(spec.presentation.kind === "buttons" && spec.presentation.size === "sm" ? { size: "sm" as const } : {}),
-		},
-		nativeSheet: (cx: DescribeCtx): boolean => spec.presentation.kind === "picker" && cx.supports("picker"),
 		describe(cx: DescribeCtx): TspNode {
 			const { presentation } = spec;
+			const head = tnHeading(displaySafe(spec.head), "head");
 			if (presentation.kind === "buttons") {
 				return tn("col", { gap: "lg", role: spec.role }, [
 					tnFramed(
 						[
+							head,
 							...spec.body,
 							tnBar([
 								null,
@@ -6415,6 +6026,7 @@ export function buildChoiceScreen(
 			return tn("col", { gap: "md", role: spec.role }, [
 				tnFramed(
 					[
+						head,
 						...spec.body,
 						tn(
 							"list",
@@ -6430,7 +6042,7 @@ export function buildChoiceScreen(
 				),
 			]);
 		},
-		handleNativeEvent(e: NativeEvent): void {
+		handleNativeEvent(e: UiEvent): void {
 			if (e.type === "select" || e.type === "activate") {
 				const at = choices.findIndex((c) => c.id === e.item);
 				if (at < 0) return;
@@ -6445,25 +6057,23 @@ export function buildChoiceScreen(
 				else if (choices.some((c) => c.id === e.act)) done(e.act);
 			}
 		},
-		handleInput(data: string): void {
-			const kb = getKeybindings();
-			if (kb.matches(data, "tui.select.up") || data === "k") move(index - 1);
-			else if (kb.matches(data, "tui.select.down") || data === "j") move(index + 1);
-			else if (kb.matches(data, "tui.select.confirm") || data === "\n") done(choices[index]?.id);
-			else if (kb.matches(data, "tui.select.cancel")) done(spec.cancelId);
+		handleKey(key: KeyEvent): void {
+			// shortcut: default keys only, user remaps of tui.select.* are ignored; read the factory's keybindings arg if users ask
+			if (key.id === "up" || key.id === "k") move(index - 1);
+			else if (key.id === "down" || key.id === "j") move(index + 1);
+			else if (key.id === "enter") done(choices[index]?.id);
+			else if (key.id === "escape") done(spec.cancelId);
 		},
 	};
 }
 
 /**
  * Opens `spec` as a native overlay and resolves the chosen id (`undefined` = dismissed, also when `signal` aborts). Returns `null` when
- * the native screen is unavailable (no live Tern surface, no `ui.custom`, modules missing, host never ran the factory): the caller then
+ * the screen is unavailable (no `ui.custom`, host never ran the factory): the caller then
  * uses its host dialog.
  */
 async function pickNative(ui: UiContext, spec: ChoiceScreenSpec, signal?: AbortSignal): Promise<string | undefined | null> {
-	if (!nativeLive() || typeof ui.custom !== "function") return null;
-	const mods = await loadDialogModules();
-	if (!mods) return null;
+	if (typeof ui.custom !== "function") return null;
 	if (signal?.aborted) return undefined;
 	let ran = false;
 	let finish: ((id: string | undefined) => void) | undefined;
@@ -6474,10 +6084,9 @@ async function pickNative(ui: UiContext, spec: ChoiceScreenSpec, signal?: AbortS
 			(tui, theme, _kb, done) => {
 				ran = true;
 				finish = done;
-				noteHostTui(tui);
-				return buildChoiceScreen(mods, tui, spec, done, radioGlyphs(theme));
+				return mountDialog(tui, (t) => buildChoiceScreen(t, spec, done, radioGlyphs(theme)));
 			},
-			spec.presentation.kind === "buttons" && spec.presentation.size === "sm" ? { overlay: true } : NATIVE_MD_OVERLAY,
+			NATIVE_MD_OVERLAY,
 		);
 		return ran ? picked : null;
 	} finally {
@@ -6798,8 +6407,7 @@ async function confirmAsk(ui: UiContext, spec: ApproveDialogSpec, opts: { signal
 				return ok ? { allow: true } : { allow: false };
 			}
 			if (typeof pick === "object" && "view" in pick) {
-				const mods = await loadDialogModules();
-				const viewBlocks = mods ? dialogViewBlocks(spec, mods.agent.getLanguageFromPath).map((b) => ({ header: b.header, markdown: b.full, pretty: b.pretty })) : [];
+				const viewBlocks = dialogViewBlocks(spec, langFromPath).map((b) => ({ header: b.header, markdown: b.full, pretty: b.pretty }));
 				await viewCode(ui, viewBlocks, pick.view, signal);
 				continue;
 			}
@@ -6855,7 +6463,7 @@ interface RuleProgressHandle {
 	close(): void;
 }
 /** Waiting panel for the `/rule` generate → check → review loop: attempt counter, current phase, earlier failures; Escape cancels.
- *  Rich `ui.custom` panel (not awaited: the loop runs meanwhile); hosts without it, unavailable TUI modules, or an RPC `custom()` that never
+ *  Rich `ui.custom` panel (not awaited: the loop runs meanwhile); hosts without it, or an RPC `custom()` that never
  *  runs the factory fall back to the status widget. Shows phase/model id/request only, never rule text or config. `signal` aborts on Escape or `parentSignal`.
  *  `step` (only /verdict-debug passes it) adds a "Next" button / Enter binding to the rich panel so a preview can be advanced by hand. */
 async function openRuleProgress(ui: UiContext, heading: string, title: string, request: string, parentSignal: AbortSignal | undefined, step?: () => void): Promise<RuleProgressHandle> {
@@ -6873,8 +6481,7 @@ async function openRuleProgress(ui: UiContext, heading: string, title: string, r
 		else status = `Attempt ${p.attempt}/${p.max} · ${p.phase === "generating" ? `generating via ${title}` : p.phase === "checking" ? "checking against history" : "reviewing"}…`;
 	};
 	apply({ attempt: 1, max: RULE_MAX_ATTEMPTS, phase: "generating" });
-	const mods = typeof ui.custom === "function" ? await loadDialogModules() : null;
-	if (mods) {
+	if (typeof ui.custom === "function") {
 		useWidget = false;
 		let factoryRan = false;
 		const settled = (): void => {
@@ -6883,76 +6490,42 @@ async function openRuleProgress(ui: UiContext, heading: string, title: string, r
 			paintWidget();
 		};
 		void ui
-			.custom<undefined>((tui, theme, _kb, done) => {
-				noteHostTui(tui);
+			.custom<undefined>((tui, _theme, _kb, done) => {
 				factoryRan = true;
-				const { Container, Loader, Text, getKeybindings } = mods.tui;
-				const { DynamicBorder } = mods.agent;
-				const root = new Container() as PiTui.Container & { handleInput(data: string): void } & NativeHooks;
-				const failuresText = new Text("", 1, 0);
-				let setStatus: (s: string) => void;
-				let stopSpinner: () => void = () => {};
-				try {
-					const loader = new Loader(tui, (s) => theme.fg("accent", s), (s) => theme.fg("muted", s), status);
-					setStatus = (s) => loader.setMessage(s);
-					stopSpinner = () => loader.stop();
-					root.addChild(new DynamicBorder());
-					root.addChild(new Text(theme.fg("accent", theme.bold(heading)), 1, 0));
-					root.addChild(new Text(theme.fg("muted", displaySafe(request).slice(0, 200)), 1, 0));
-					root.addChild(loader);
-				} catch {
-					// Loader unavailable (stubbed/foreign tui): plain status line, same update path
-					const line = new Text(theme.fg("muted", status), 1, 0);
-					setStatus = (s) => line.setText(theme.fg("muted", s));
-					root.addChild(new DynamicBorder());
-					root.addChild(new Text(theme.fg("accent", theme.bold(heading)), 1, 0));
-					root.addChild(new Text(theme.fg("muted", displaySafe(request).slice(0, 200)), 1, 0));
-					root.addChild(line);
-				}
-				root.addChild(failuresText);
-				root.addChild(new Text(theme.fg("dim", step ? "enter next · esc cancel" : "esc cancel"), 1, 0));
-				root.addChild(new DynamicBorder());
-				const paint = (): void => {
-					setStatus(status);
-					failuresText.setText(failures.slice(-3).map((f) => theme.fg("warning", f)).join("\n"));
-					tui.requestRender();
-				};
-				paint();
-				repaintRich = paint;
-				closeRich = () => {
-					stopSpinner();
-					done(undefined);
-				};
-				root.handleInput = (data: string): void => {
-					const kb = getKeybindings();
-					if (step && (kb.matches(data, "tui.select.confirm") || data === "\n")) {
-						step();
-						return;
-					}
-					if (!kb.matches(data, "tui.select.cancel")) return;
-					ac.abort();
-					closeRich?.();
-				};
-				root.describe = (): TspNode =>
-					tn(
-						"card",
-						{ head: heading, role: "pi-verdict.progress" },
-						[
-							tnText([{ t: displaySafe(request).slice(0, 200), s: "muted" }]),
-							tn("row", { gap: "sm", align: "center" }, [tn("spinner", { style: "dots" }), tnText(status)]),
-							...failures.slice(-3).map((f) => tnText(f, { tone: "warning" })),
-							tnBar([null, tnButton("Cancel", "cancel", { keys: "escape" }), ...(step ? [tnButton("Next", "next", { keys: "enter", tone: "accent" })] : [])]),
-						],
-						"progress",
-					);
-				root.handleNativeEvent = (e: NativeEvent): void => {
-					if (e.type === "action" && e.act === "next") step?.();
-					else if (e.type === "action" && e.act === "cancel") {
-						ac.abort();
-						closeRich?.();
-					}
-				};
-				return root;
+				return mountDialog(tui, (t) => {
+					repaintRich = () => t.requestRender();
+					closeRich = () => done(undefined);
+					return {
+						describe: (): TspNode =>
+							tn(
+								"card",
+								{ head: heading, role: "pi-verdict.progress" },
+								[
+									tnText([{ t: displaySafe(request).slice(0, 200), s: "muted" }]),
+									tn("row", { gap: "sm", align: "center" }, [tn("spinner", { style: "dots" }), tnText(status)]),
+									...failures.slice(-3).map((f) => tnText(f, { tone: "warning" })),
+									tnBar([null, tnButton("Cancel", "cancel", { keys: "escape" }), ...(step ? [tnButton("Next", "next", { keys: "enter", tone: "accent" })] : [])]),
+								],
+								"progress",
+							),
+						handleKey(key: KeyEvent): void {
+							if (step && key.id === "enter") {
+								step();
+								return;
+							}
+							if (key.id !== "escape") return;
+							ac.abort();
+							closeRich?.();
+						},
+						handleNativeEvent(e: UiEvent): void {
+							if (e.type === "action" && e.act === "next") step?.();
+							else if (e.type === "action" && e.act === "cancel") {
+								ac.abort();
+								closeRich?.();
+							}
+						},
+					};
+				});
 			})
 			.then(settled, settled);
 	}
@@ -6979,6 +6552,11 @@ async function openRuleProgress(ui: UiContext, heading: string, title: string, r
 // ============================================================================
 
 type UiContext = ExtensionContext["ui"];
+
+/** Abort signal of the running tool call, when the host context carries one (it is not in omp's typed ExtensionContext). */
+function ctxSignal(ctx: ExtensionContext): AbortSignal | undefined {
+	return (ctx as { signal?: AbortSignal }).signal;
+}
 
 /** Widget key of the live classifier-status row. */
 const STATUS_WIDGET_KEY = "verdict";
@@ -7130,9 +6708,10 @@ export interface FooterInfo {
 	remembered: number;
 }
 
-type ThemeBg = Parameters<Theme["bg"]>[0];
+type ThemeBg = string;
 
-type FooterTheme = Pick<Theme, "fg" | "bold"> & Partial<Pick<Theme, "getBgAnsi" | "getFgAnsi">>;
+/** `getBgAnsi`/`getFgAnsi` are optional: the theme may not expose raw SGR (the footer then falls back to tinted text). */
+type FooterTheme = Pick<Theme, "fg" | "bold"> & { getBgAnsi?(color: string): string; getFgAnsi?(color: string): string };
 
 // Nerd Font (nf-fa) code points
 const NF_SEP = "\uE0B0"; // powerline right arrow
@@ -7594,12 +7173,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	// Footer status: full = powerline blocks, compact = plain line, off = cleared; see renderFooter.
 	// omp strips every ANSI escape from setStatus text (sanitizeStatusText), which would reduce the colored blocks to plain
-	// text, so on omp the footer is a below-editor widget (rendered through Text, SGR preserved). pi keeps setStatus.
-	const isOmpHost = "logger" in pi && "typebox" in pi;
-	/** Publish one footer rendering: omp widget (native node in a live Tern surface) or the setStatus line. */
+	// text, so the footer is a below-editor widget; setStatus stays the fallback when the host has no widgets.
+	/** Publish one footer rendering: the widget node, or the setStatus line when the host has no widgets. */
 	function publishFooter(ctx: ExtensionContext, info: FooterInfo, style: "full" | "compact" | "off"): void {
 		const text = style === "off" ? undefined : renderFooter(info, ctx.ui.theme, style);
-		if (isOmpHost && typeof ctx.ui.setWidget === "function") {
+		if (typeof ctx.ui.setWidget === "function") {
 			ctx.ui.setStatus("auto-mode", undefined);
 			setWidgetNative(ctx.ui, FOOTER_WIDGET_KEY, text === undefined ? undefined : [text], () => footerNode(info), { placement: "belowEditor" });
 			return;
@@ -7608,7 +7186,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 	function refreshStatus(ctx: ExtensionContext): void {
 		const style = state.userRules.footer;
-		const footerAsWidget = isOmpHost && typeof ctx.ui.setWidget === "function";
+		const footerAsWidget = typeof ctx.ui.setWidget === "function";
 		// The mode chip rides the prompt status bar (omp: the status line's `status` segment) when modeStatus is on, except while the
 		// footer itself is rendered into that bar (pi, footer on): there the footer's lead chip already shows the mode.
 		const footerInStatusBar = style !== "off" && !footerAsWidget;
@@ -7627,8 +7205,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		const err = recordTrust(root, "trusted", hash);
 		if (err) ctx.ui.notify(`pi-verdict: trust decision not saved (${err}) — applies to this session only`, "warning");
 	};
-	/** Bumped on session_start/shutdown so a late dialog-module load never republishes into a stale session. */
-	let sessionEpoch = 0;
 
 	/** UI this factory instance published as the root's (see the registry at module level);
 	 *  session_shutdown clears the registry only if it still holds this one. */
@@ -7709,25 +7285,9 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	// session_start: reset the shadow cache (in-session memory state, settled in #5) + reload user rules (config changes take effect in a new session)
 	pi.on("session_start", async (_event, ctx) => {
-		const epoch = ++sessionEpoch;
 		// Project trust prompt: any await stays inside the prompt branch so the no-project path remains synchronous
 		liveCtx = null;
 		sessionTrustedRoot = null;
-		// TUI probe (omp only): setWidget factories run synchronously with the host TUI, whose `nativeRendering` says whether TSP is live.
-		// Runs before the trust prompt so that prompt can already be native; a failure leaves native mode off.
-		if (isOmpHost && ctx.hasUI && typeof ctx.ui.setWidget === "function") {
-			try {
-				ctx.ui.setWidget(TUI_PROBE_KEY, ((tui: unknown) => {
-					noteHostTui(tui);
-					return { render: (): string[] => [], invalidate(): void {} };
-				}) as never);
-				ctx.ui.setWidget(TUI_PROBE_KEY, undefined);
-			} catch {
-				/* native stays off */
-			}
-			// Not awaited (the no-project path stays synchronous); once the modules are in, re-publish so the footer becomes a native-capable component.
-			if (nativeCapable()) void loadDialogModules().then((m) => { if (m && epoch === sessionEpoch) refreshStatus(ctx); });
-		}
 		const pp = findProjectConfig(ctx.cwd, agentDirPath());
 		if (pp) {
 			const root = projectRootOf(pp);
@@ -7791,7 +7351,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	});
 
 	pi.on("session_shutdown", () => {
-		sessionEpoch++;
 		liveCtx = null;
 		if (ownRootUi !== null && rootUi === ownRootUi) rootUi = null;
 		ownRootUi = null;
@@ -7800,9 +7359,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		ownProbe = null;
 	});
 
-	pi.on("model_select", (_e, ctx) => refreshStatus(ctx));
-
-	// Master toggle shortcut (#15): binding taken from the user rules loaded first (fixed within a session - after changing config,
+		// Master toggle shortcut (#15): binding taken from the user rules loaded first (fixed within a session - after changing config,
 	// /reload the extension or start a new session); the handler is semantically equivalent to /automode, toggles silently,
 	// the always-visible footer is the only feedback
 	const registeredToggleKey = state.userRules.toggleShortcut;
@@ -7933,8 +7490,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	/** /automode panel: the approval settings at global / local / session scope (opens at session). */
 	async function openQuickPanel(ctx: ExtensionContext): Promise<void> {
-		const mods = typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
-		if (!mods) {
+		if (typeof ctx.ui.custom !== "function") {
 			ctx.ui.notify("pi-verdict: the settings panel needs an interactive TUI — use /automode status|auto|unattended|supervised|off|forget", "warning");
 			return;
 		}
@@ -8036,20 +7592,18 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			hotkeyHint: "a all modes · r root rule · f forget approvals",
 		};
 		await ctx.ui.custom<"closed" | undefined>(
-			(tui, theme, _kb, done) => {
-				noteHostTui(tui);
+			(tui, _theme, _kb, done) => {
 				closeMenu = () => done("closed");
-				return buildSettingsMenu(mods, tui, theme, ctl, closeMenu);
+				return mountDialog(tui, (t) => buildSettingsMenu(t, ctl, () => done("closed")));
 			},
-			nativeLive() ? { overlay: true } : undefined,
+			NATIVE_MD_OVERLAY,
 		);
 		if (openRoot) await openRootRuleMenu(ctx);
 	}
 
 	/** /automode-setup menu: the root rule's generator inputs (strictness, history, codebase, clarifications) and the generate / edit / remove actions, at global / local / session scope. Generation and editing run after the menu closes, then it reopens. */
 	async function openRootRuleMenu(ctx: ExtensionContext, initial?: MenuScope): Promise<void> {
-		const mods = ctx.hasUI && typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
-		if (!mods) {
+		if (!ctx.hasUI || typeof ctx.ui.custom !== "function") {
 			ctx.ui.notify("pi-verdict: /automode-setup needs an interactive TUI", "warning");
 			return;
 		}
@@ -8115,7 +7669,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 			/** One generate → check → review loop under the waiting panel. `initialFeedback`/`previous` carry a human amendment. */
 			const generate = async (initialFeedback?: string, previous?: string): Promise<RootRuleLoopResult> => {
-				const progress = await openRuleProgress(ctx.ui, "🛡️ pi-verdict /automode-setup", model.id, `root rule · ${cfg.strictness}`, ctx.signal);
+				const progress = await openRuleProgress(ctx.ui, "🛡️ pi-verdict /automode-setup", model.id, `root rule · ${cfg.strictness}`, ctxSignal(ctx));
 				try {
 					return await generateRootRuleReviewed({
 						host: ctx.sessionManager,
@@ -8303,12 +7857,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				hotkeyHint: "g generate",
 			};
 			await ctx.ui.custom<"closed" | undefined>(
-				(tui, theme, _kb, done) => {
-					noteHostTui(tui);
+				(tui, _theme, _kb, done) => {
 					closeMenu = () => done("closed");
-					return buildSettingsMenu(mods, tui, theme, ctl, closeMenu);
+					return mountDialog(tui, (t) => buildSettingsMenu(t, ctl, () => done("closed")));
 				},
-				nativeLive() ? { overlay: true } : undefined,
+				NATIVE_MD_OVERLAY,
 			);
 			const pending = takePending();
 			if (!pending) return;
@@ -8378,8 +7931,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 	/** /verdict menu: list pages (allow/deny/tools/denyPaths/classifier rules), the builtinDenyFloor / gateOmpDir / footer / modeStatus / grantStatus switches and omp custom roles, at global / local / session scope. */
 	async function openVerdictMenu(ctx: ExtensionContext, initial: MenuScope): Promise<void> {
-		const mods = typeof ctx.ui.custom === "function" ? await loadDialogModules() : null;
-		if (!mods) {
+		if (typeof ctx.ui.custom !== "function") {
 			ctx.ui.notify("pi-verdict: /verdict needs an interactive TUI", "warning");
 			return;
 		}
@@ -8695,11 +8247,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			},
 		};
 		await ctx.ui.custom<"closed" | undefined>(
-			(tui, theme, _kb, done) => {
-				noteHostTui(tui);
-				return buildSettingsMenu(mods, tui, theme, ctl, () => done("closed"));
+			(tui, _theme, _kb, done) => {
+				return mountDialog(tui, (t) => buildSettingsMenu(t, ctl, () => done("closed")));
 			},
-			nativeLive() ? { overlay: true } : undefined,
+			NATIVE_MD_OVERLAY,
 		);
 		await Promise.all(pendingOps);
 	}
@@ -8817,7 +8368,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 			/** One generate → check → review loop under the waiting panel. `initialFeedback`/`previous` carry a human amendment. */
 			async function generate(initialFeedback?: string, previous?: { kind: EditableListKey; value: string }): Promise<RuleLoopResult> {
-				const progress = await openRuleProgress(ctx.ui, "🛡️ pi-verdict /rule", model!.id, request, ctx.signal);
+				const progress = await openRuleProgress(ctx.ui, "🛡️ pi-verdict /rule", model!.id, request, ctxSignal(ctx));
 				try {
 					return await generateRuleReviewed({
 						host: ctx.sessionManager,
@@ -9007,7 +8558,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		promptSnippet: "Read pi-verdict gate settings or propose a change (every change needs the user's approval)",
 		promptGuidelines: ["Before telling the user that a pi-verdict built-in rule (a danger rule like gh-release, or a path tier) blocks an operation, check its current action with verdict_settings get (key dangerRules or pathRules)."],
 		parameters: settingsToolParameters,
-		...(isOmpHost ? { approval: "write" } : {}),
+		approval: "write",
 		execute: async (_toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) => {
 			if (subagentIdentity(ctx) !== null) throw new Error("verdict_settings is not available in subagents — ask the user to make the change in the main session");
 			const action = params.action as (typeof SETTINGS_TOOL_ACTIONS)[number];
@@ -9178,7 +8729,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		promptSnippet: "Request an explicit, session-long permission grant from the user for an operation (deploys, blocked commands); release it when done",
 		promptGuidelines: ["If an operation you need is set to deny or ask by a pi-verdict built-in rule, or was blocked by one, request a grant with verdict_grant (list the rule ids in rules, protected paths in paths) instead of refusing or asking the user to run it themselves."],
 		parameters: grantToolParameters,
-		...(isOmpHost ? { approval: "write" } : {}),
+		approval: "write",
 		execute: async (_toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) => {
 			const rules = state.userRules;
 			if (rules.mode === "off") return settingsToolText("NA: the pi-verdict permission gate is disabled (approval mode off) — tool calls are not gated, so no permission grant is needed or recorded.");
@@ -9245,7 +8796,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				widgetUi?.setWidget(STATUS_WIDGET_KEY, ["🛡️ verdict: reviewing permission grant…"]);
 				let review: GrantConsensus;
 				try {
-					review = await grantConsensus(state, { ...pipelineEnv(ctx), signal: signal ?? ctx.signal }, actionLine, { ...classifierPolicy(state), grantPaths: true, task: GRANT_REVIEW_TASK }, ["allow", "deny"]);
+					review = await grantConsensus(state, { ...pipelineEnv(ctx), signal: signal ?? ctxSignal(ctx) }, actionLine, { ...classifierPolicy(state), grantPaths: true, task: GRANT_REVIEW_TASK }, ["allow", "deny"]);
 				} finally {
 					widgetUi?.setWidget(STATUS_WIDGET_KEY, undefined);
 				}
@@ -9314,7 +8865,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		promptSnippet: "Pre-clear a call that runs local scripts by giving the gate the files it depends on",
 		promptGuidelines: ["When a command runs a local script you wrote (bun x.ts, python tool.py), or the gate blocked a call for lack of file context, call execute_gated_tool first with the scripts and files it depends on, then make the real call with exactly the same input."],
 		parameters: gatedToolParameters,
-		...(isOmpHost ? { approval: "write" } : {}),
+		approval: "write",
 		execute: async (toolCallId: string, params: Record<string, unknown>, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) => {
 			if (state.userRules.mode === "off") return settingsToolText("NA: the pi-verdict permission gate is disabled (approval mode off) — call the tool directly.");
 			const { tool, input, files = [], explanation } = params;
@@ -9364,7 +8915,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			details: { ids: revoked.map((g) => g.id) },
 		};
 		try {
-			void Promise.resolve(sender.call(pi, message, { deliverAs: isOmpHost ? "aside" : "nextTurn" })).catch(() => {}); // omp returns a Promise; a failed notice never blocks the revoke
+			void Promise.resolve(sender.call(pi, message, { deliverAs: "aside" })).catch(() => {}); // omp returns a Promise; a failed notice never blocks the revoke
 		} catch {
 			/* the revoke already took effect */
 		}
@@ -9439,8 +8990,6 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 				}
 				const needsTui = (): void => ctx.ui.notify("pi-verdict: /verdict-debug needs an interactive TUI", "warning");
 				if (!ctx.hasUI || typeof ctx.ui.custom !== "function") return needsTui();
-				const mods = await loadDialogModules();
-				if (!mods) return needsTui();
 				const report = (id: string, outcome: string): void => ctx.ui.notify(`🛡️ debug ${id}: ${outcome}`, "info");
 				const pickOrSelect = async (spec: ChoiceScreenSpec): Promise<string | undefined> => {
 					const native = await pickNative(ctx.ui, spec);
@@ -9721,11 +9270,10 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 								},
 							};
 							await ctx.ui.custom<"closed" | undefined>(
-								(tui, theme, _kb, done) => {
-									noteHostTui(tui);
-									return buildSettingsMenu(mods, tui, theme, ctl, () => done("closed"));
+								(tui, _theme, _kb, done) => {
+									return mountDialog(tui, (t) => buildSettingsMenu(t, ctl, () => done("closed")));
 								},
-								nativeLive() ? { overlay: true } : undefined,
+								NATIVE_MD_OVERLAY,
 							);
 							report("prefs", "closed");
 						},
@@ -9828,10 +9376,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 							];
 							try {
 								for (const [n, sample] of samples.entries()) {
-									ctx.ui.setWidget(DEBUG_WIDGET_KEY, ((tui: unknown, theme: Theme) => {
-										noteHostTui(tui);
-										return labelComponent(sample, theme) ?? { render: (): string[] => [], invalidate(): void {} };
-									}) as never);
+									ctx.ui.setWidget(DEBUG_WIDGET_KEY, () => labelNode(sample));
 									if (!(await nextOrDone("Verdict label", n + 1, samples.length))) break;
 								}
 							} finally {
@@ -10079,7 +9624,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		if (!role) return { ok: false, error: "no model available" };
 		return explainGate({
 			host: ctx.sessionManager,
-			signal: ctx.signal,
+			signal: ctxSignal(ctx),
 			complete: completeForClassifier(ctx.modelRegistry, deps),
 			model: role.model,
 			thinking: role.thinking,
@@ -10096,27 +9641,18 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 	}
 
 	// Verdict label sink: a separate transcript row after the tool block. Rule-allow labels (`how: "rule"`) are recorded but never rendered (noise); other labels render.
-	// pi: TUI-only custom entry (persisted, not in LLM context). omp: `aside` custom message (model-visible, drained at the next step boundary; steer would abort the in-flight tool batch).
-	type LabelComponent = { render(width: number): string[]; invalidate(): void; describe?(): TspNode };
-	type LabelRenderer = (data: unknown, theme: Theme) => LabelComponent | undefined;
-	const labelComponent: LabelRenderer = (data, theme) => {
-		const l = asVerdictLabel(data);
-		return l && l.how !== "rule" ? { render: (w: number) => renderVerdictLabel(l, theme, state.userRules.footer === "full", w), invalidate() {}, describe: () => verdictLabelNode(l) } : undefined;
-	};
-	type OmpSendMessage = (message: { customType: string; content: string; display: boolean; details: VerdictLabel }, options: { deliverAs: "aside" }) => void;
-	const labelHost = pi as unknown as {
-		registerEntryRenderer?: (type: string, renderer: (entry: { data?: unknown }, options: unknown, theme: Theme) => LabelComponent | undefined) => void;
-		appendEntry?: (type: string, data: unknown) => void;
-		registerMessageRenderer?: (type: string, renderer: (message: { details?: unknown }, options: unknown, theme: Theme) => LabelComponent | undefined) => void;
-		sendMessage?: OmpSendMessage;
-	};
+	// An `aside` custom message (model-visible, drained at the next step boundary; steer would abort the in-flight tool batch).
+	const labelNode = (l: VerdictLabel): JSXNode => verdictLabelNode(l);
 	let labelSink: ((l: VerdictLabel) => void) | null = null;
-	if (typeof labelHost.registerEntryRenderer === "function" && typeof labelHost.appendEntry === "function") {
-		labelHost.registerEntryRenderer(VERDICT_LABEL_TYPE, (entry, _o, theme) => labelComponent(entry.data, theme));
-		labelSink = (l) => labelHost.appendEntry?.call(pi, VERDICT_LABEL_TYPE, l);
-	} else if (isOmpHost && typeof labelHost.sendMessage === "function" && typeof labelHost.registerMessageRenderer === "function") {
-		labelHost.registerMessageRenderer(VERDICT_LABEL_TYPE, (message, _o, theme) => labelComponent(message.details, theme));
-		labelSink = (l) => labelHost.sendMessage?.call(pi, { customType: VERDICT_LABEL_TYPE, content: verdictLabelText(l), display: l.how !== "rule", details: l }, { deliverAs: "aside" });
+	if (typeof pi.sendMessage === "function" && typeof pi.registerMessageRenderer === "function") {
+		pi.registerMessageRenderer(VERDICT_LABEL_TYPE, (message) => {
+			const l = asVerdictLabel(message.details);
+			return l && l.how !== "rule" ? labelNode(l) : undefined;
+		});
+		labelSink = (l) => void pi.sendMessage(
+			{ customType: VERDICT_LABEL_TYPE, content: verdictLabelText(l), display: l.how !== "rule", details: l },
+			{ deliverAs: "aside" },
+		);
 	}
 
 	// Verdict label after the block: a separate transcript row (pi: TUI-only custom entry; omp: aside custom message, model-visible). Rule-allow labels are recorded but not rendered (pi: renderer yields nothing; omp: display:false).
@@ -10129,19 +9665,11 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 		return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text" as const, text: invite }] };
 	});
 
-	// GR-7: brief the acting agent on the gate every turn (pi: systemPrompt string; omp: string[] of sections, chained).
+	// GR-7: brief the acting agent on the gate every turn (systemPrompt is the string[] of sections, chained).
 	pi.on("before_agent_start", (event, ctx) => {
 		const section = gateBriefing(state.userRules, subagentIdentity(ctx) !== null, planModeActive(ctx));
 		if (section === null) return undefined;
-		// pi types systemPrompt as string, omp passes string[]: widen to unknown and narrow at runtime.
-		const sp: unknown = event.systemPrompt;
-		if (Array.isArray(sp)) {
-			// omp's result is { systemPrompt: string[] }; pi's type says string, so the cast bridges the host type difference only.
-			const ompResult = { systemPrompt: [...sp, section] } as unknown as BeforeAgentStartEventResult;
-			return ompResult;
-		}
-		if (typeof sp === "string") return { systemPrompt: `${sp}\n\n${section}` };
-		return undefined;
+		return { systemPrompt: [...event.systemPrompt, section] };
 	});
 
 	/** Per-call pipeline environment shared by the tool_call gate and the verdict_grant tool. */
@@ -10152,7 +9680,7 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 			getModel: () => resolveClassifier(ctx),
 			complete: completeForClassifier(ctx.modelRegistry, deps),
 			host: ctx.sessionManager,
-			signal: ctx.signal,
+			signal: ctxSignal(ctx),
 			getFallbackModel: () => resolveFallbackClassifier(ctx),
 		};
 	}
@@ -10280,14 +9808,15 @@ export default function autoMode(pi: ExtensionAPI, deps: AutoModeDeps = {}) {
 
 		if (mode === "normal" && ui !== null) {
 			const deadline = AbortSignal.timeout(state.userRules.subagentAskTimeoutMs);
-			const signal = ctx.signal ? AbortSignal.any([deadline, ctx.signal]) : deadline;
+			const parent = ctxSignal(ctx);
+			const signal = parent ? AbortSignal.any([deadline, parent]) : deadline;
 			const r = await present(signal);
 			if (r !== "aborted") {
 				finalize({ ...answerAudit(r), subagent: { ...sub, resolution: "human" } });
 				if (r === undefined) noteAllowed(verdictLabelFor(labelTool, "user", verdict.reason));
 				return r;
 			}
-			if (ctx.signal?.aborted) {
+			if (ctxSignal(ctx)?.aborted) {
 				finalize({ subagent: { ...sub, resolution: "timeout" } });
 				return { block: true, reason: blockedReason("subagent-cancelled", "subagent run was cancelled while awaiting approval") };
 			}

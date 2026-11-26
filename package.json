@@ -1,7 +1,7 @@
 {
 	"name": "@frapetti-dev/pi-verdict",
-	"version": "1.0.0",
-	"description": "A minimal permission gate for Pi in the style of Claude Code's auto mode",
+	"version": "2.0.0",
+	"description": "A minimal permission gate for omp in the style of Claude Code's auto mode",
 	"author": "frapetti-dev (https://github.com/frapetti-dev)",
 	"type": "module",
 	"main": "extensions/pi-verdict.ts",
@@ -49,16 +49,11 @@
 		"typecheck": "tsc --noEmit -p tsconfig.json",
 		"test": "bun test"
 	},
-	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.84.0"
-	},
-	"peerDependenciesMeta": {
-		"@earendil-works/pi-coding-agent": {
-			"optional": true
-		}
-	},
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "0.84.3",
+		"@oh-my-pi/pi-ai": "19.2.1",
+		"@oh-my-pi/pi-coding-agent": "19.2.1",
+		"@oh-my-pi/pi-tui": "19.2.1",
+		"@oh-my-pi/pi-wire": "19.2.1",
 		"@types/node": "^26.3.0",
 		"typescript": "^7.0.2"
 	}
